@@ -2000,6 +2000,31 @@ def main():
                          "than two FILE flags for the same reason: the pair is "
                          "one model, and one flag is what lets the error "
                          "message name the pair.")
+    ap.add_argument("--ocr-onnx", metavar="DIR", default=None,
+                    help="pack a PaddleOCR ONNX pair (arch=9) from DIR, the "
+                         "root of a monkt/paddleocr-onnx checkout. THREE files "
+                         "are needed and they are ONE MODEL: a detector finds "
+                         "text and cannot read it, and a recogniser reads a "
+                         "crop and cannot find one, so a container holding only "
+                         "one of them answers 'no text here' to every image. "
+                         "DIR is searched the way the upstream repository is "
+                         "laid out -- detection/<version>/det.onnx and "
+                         "languages/<language>/rec.onnx with its dict.txt -- and "
+                         "a directory with more than one of either is refused "
+                         "BY NAME, because picking the wrong detector is a "
+                         "different network and picking the wrong dictionary "
+                         "is text that is confidently wrong. --ocr-det, "
+                         "--ocr-rec and --ocr-dict name the three files "
+                         "directly when they are somewhere else.")
+    ap.add_argument("--ocr-det", metavar="FILE", default=None,
+                    help="the detector ONNX for an --ocr-onnx pack, when it is "
+                         "not the one under DIR/detection/.")
+    ap.add_argument("--ocr-rec", metavar="FILE", default=None,
+                    help="the recogniser ONNX for an --ocr-onnx pack, when it "
+                         "is not the one under DIR/languages/.")
+    ap.add_argument("--ocr-dict", metavar="FILE", default=None,
+                    help="the character dictionary for an --ocr-onnx pack, "
+                         "when it is not the dict.txt beside the recogniser.")
     ap.add_argument("--npu", action="store_true",
                     help="arch=6 and arch=8 only: also stage the pre-tiled bf16 B panel "
                          "for every convolution, and record the array stream "
@@ -2102,11 +2127,11 @@ def main():
     # aie.iron, so a NEW design set still cannot be exported here -- the panels
     # below are written for the set that exists.
     if args.npu and not (args.pose_onnx or args.mppose_onnx or
-                         args.hands_onnx):
+                         args.hands_onnx or args.ocr_onnx):
         raise SystemExit(
-            "--npu stages the pre-tiled array panels, and only the pose, mppose "
-            "and hands packers write them (--pose-onnx FILE, --mppose-onnx DIR, "
-            "--hands-onnx DIR). "
+            "--npu stages the pre-tiled array panels, and only the pose, mppose, "
+            "hands and ocr packers write them (--pose-onnx FILE, --mppose-onnx DIR, "
+            "--hands-onnx DIR, --ocr-onnx DIR). "
             "Every other architecture here "
             "targets the array by construction -- its containers carry no host "
             "path at all -- so on those this flag would be a no-op that looks "
@@ -2272,6 +2297,99 @@ def main():
                                       if pose_group_typed is None
                                       else pose_group_typed)
                           if dtype == "i4" else None)
+
+    if args.ocr_onnx:
+        # THE THREE FILES, AND WHERE EACH OF THEM COMES FROM.
+        #
+        # The upstream repository is laid out as
+        #     detection/<version>/det.onnx
+        #     languages/<language>/rec.onnx
+        #     languages/<language>/dict.txt
+        # and a checkout of it holds SEVERAL detectors and SEVERAL languages.
+        # Picking one of each silently is exactly the mistake this refuses:
+        # the v3 and v5 detectors are different networks with different
+        # accuracies, and the dictionaries are different alphabets -- and a
+        # recogniser read with the wrong one transcribes English text into
+        # confidently wrong characters.
+        #
+        # So the search finds them and, if there is more than one candidate,
+        # the error names the candidates and asks for the file. A directory
+        # with exactly one of each needs no argument at all.
+        d = args.ocr_onnx
+        det = args.ocr_det
+        rec = args.ocr_rec
+        dic = args.ocr_dict
+        if det is None:
+            cands = sorted(glob.glob(os.path.join(d, "detection", "*", "det.onnx")))
+            if not cands:
+                cands = sorted(glob.glob(os.path.join(d, "detection", "det.onnx")))
+            if not cands:
+                raise SystemExit(
+                    f"--ocr-onnx {d} holds no detector. The layout this looks "
+                    f"for is detection/<version>/det.onnx, and the file can "
+                    f"also be named directly with --ocr-det FILE.")
+            if len(cands) > 1:
+                raise SystemExit(
+                    f"--ocr-onnx {d} holds {len(cands)} detectors: "
+                    f"{[os.path.relpath(c, d) for c in cands]}. They are "
+                    f"different networks -- the v3 and the v5 detector find "
+                    f"different text -- so one is not picked for you. Name it "
+                    f"with --ocr-det FILE.")
+            det = cands[0]
+        if rec is None or dic is None:
+            cands = sorted(glob.glob(os.path.join(d, "languages", "*", "rec.onnx")))
+            if not cands:
+                cands = sorted(glob.glob(os.path.join(d, "languages", "rec.onnx")))
+            if not cands:
+                raise SystemExit(
+                    f"--ocr-onnx {d} holds no recogniser. The layout this "
+                    f"looks for is languages/<language>/rec.onnx, and the "
+                    f"file can also be named directly with --ocr-rec FILE.")
+            if len(cands) > 1:
+                raise SystemExit(
+                    f"--ocr-onnx {d} holds {len(cands)} recognisers: "
+                    f"{[os.path.relpath(c, d) for c in cands]}. Each one has "
+                    f"its own dictionary and its own alphabet, so one is not "
+                    f"picked for you. Name it with --ocr-rec FILE, and its "
+                    f"dictionary with --ocr-dict FILE.")
+            rec = cands[0]
+            if dic is None:
+                dc = os.path.join(os.path.dirname(rec), "dict.txt")
+                if not os.path.isfile(dc):
+                    raise SystemExit(
+                        f"--ocr-onnx {d}: the recogniser {rec} has no dict.txt "
+                        f"beside it. The dictionary is not decoration: the "
+                        f"recogniser emits one logit per CLASS, and the "
+                        f"classes are the dictionary's characters. Name it "
+                        f"with --ocr-dict FILE.")
+                dic = dc
+        for p, what in ((det, "detector"), (rec, "recogniser"), (dic, "dictionary")):
+            if not os.path.isfile(p):
+                raise SystemExit(f"--ocr-onnx: the {what} {p} does not exist.")
+        if not typed:
+            dtype = "f32"
+            print("  dtype f32 -- the default for an ocr pack, and NOT the "
+                  "'bf16' default the rest of this file uses: an UNSTATED dtype "
+                  "has to mean the precision the checkpoint itself holds, and "
+                  "these two graphs are float. --dtype bf16, i8 or i4 if you "
+                  "want a smaller file.")
+        # The int4 group is the MediaPipe family's own default of ONE -- the
+        # only point that keeps a detection on those gates -- and it is used
+        # here for the same reason: the OCR graphs are small enough that a
+        # group per weight costs more bytes than the four bits it replaces.
+        if dtype == "i4" and pose_group_typed is None:
+            print("  dtype i4 -- group 1, this architecture's measured "
+                  "default, the same one the MediaPipe pair uses: a group per "
+                  "weight is lossless and LARGER than f32. --int4-group N "
+                  "overrides.")
+        from packers.ocr import pack_ocr  # noqa: E402
+        return pack_ocr(det, rec, dic, args.out, dry_run=args.dry_run,
+                        npue_args=args,
+                        device=args.device, npu=args.npu, dtype=dtype,
+                        int4_group=(POSE_I4_GROUP_MEDIAPIPE
+                                    if pose_group_typed is None
+                                    else pose_group_typed)
+                        if dtype == "i4" else None)
 
     if args.mppose_onnx:
         # THE WEIGHT PRECISION IS THE CALLER'S here too, with f32 as the

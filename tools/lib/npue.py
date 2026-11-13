@@ -239,6 +239,31 @@ ARCH_MEDIAPIPE_HANDS_PALM_SSD_LM_HEATMAP = 7
 # such reformulation and is emitted as its own node.
 ARCH_MEDIAPIPE_POSE_DET_SSD_LM_REGRESS = 8
 
+# arch=9, OCR (PaddleOCR's PP-OCRv3/PP-OCRv5 detector + recogniser, from
+# https://huggingface.co/monkt/paddleocr-onnx). The first container in this
+# format that holds a RECOGNISER next to a detector, and the first whose graph
+# is not a convolution walk: the recogniser's SVTR backbone ends in attention
+# blocks whose matmuls and layer norms are not convolutions, and the detector's
+# DB head upsamples with two transposed convolutions.
+#
+# Two graphs, so two op lists, and one dictionary: a text detector cannot read
+# the text it finds and a text recogniser cannot find text, so a container per
+# network could not express the dependency. The container therefore carries
+# `det_graph`, `rec_graph` and the character table, and the runtime's `ocr`
+# mode runs the detector, the DB post-process, the crop and the recogniser.
+#
+# Its convolution vocabulary is PaddleOCR's: BatchNormalization as a SEPARATE
+# node (folded into the convolution at pack time, exactly, because an
+# inference-mode normalisation is an affine map of the convolution's output),
+# HardSwish and HardSigmoid, depthwise convolutions, nearest-neighbour
+# Resizes, and ConvTranspose in the DB head.
+#
+# The `kind` string is "ocr". It rides the SAME gemm_rtp directory as every
+# other array-backed architecture, exactly as "pose" does, and it brings its
+# own stream set: the two graphs between them ask for more padded (K, N) pairs
+# than any architecture before them (see geometry.py's OCR_CONV_SHAPES).
+ARCH_PADDLEOCR_DB_SVTR_CTC = 9
+
 FLAG_PRETILED = 1 << 0
 
 # A COMPILATED DESIGN SET, carried inside the container.

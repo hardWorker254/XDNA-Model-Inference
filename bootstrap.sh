@@ -114,10 +114,55 @@ fetch() {  # $1=URL  $2=expected sha256
     echo "    verified $name"
 }
 
+# fetch_optional: like fetch, but a wheel that is NOT OFFERED ANY MORE is not a
+# failure. It says so and returns non-zero, and the caller decides what a
+# missing optional wheel means.
+#
+# This exists for exactly one wheel, mlir-air, whose pinned asset was deleted
+# from its (mutable) release tag after this tree was built against it. The pin
+# is kept -- a pin is the record of what was built -- and the wheel is optional
+# because nothing here imports `air`: no module in tools/ imports it, the
+# mlir_aie_no_rtti wheel does not ship it, and the Peano aie-opt/aiecc compile
+# the AIE and AIEEX dialects this tree emits without the AIR dialect
+# registered. requirements.amd.txt spells the whole argument out.
+fetch_optional() {  # $1=URL  $2=expected sha256
+    local url="$1" want="$2" name path
+    name="$(basename "$url")"
+    name="$(urldecode "$name")"
+    path="$CACHE/$name"
+
+    if [ -f "$path" ]; then
+        if [ "$(sha_of "$path")" = "$want" ]; then
+            echo "    cached   $name"
+            return 0
+        fi
+        rm -f "$path"
+    fi
+
+    echo "    downloading $name"
+    if ! curl -fsSL -o "$path" "$url"; then
+        rm -f "$path"
+        echo "    ABSENT   $name -- this release tag no longer serves it."
+        echo "             Optional: nothing in this tree imports it, and the"
+        echo "             exporters compile without it. See requirements.amd.txt."
+        return 1
+    fi
+
+    local got; got="$(sha_of "$path")"
+    if [ "$got" != "$want" ]; then
+        rm -f "$path"
+        echo "    stale    $name -- digest mismatch, discarding"
+        return 1
+    fi
+    echo "    verified $name"
+    return 0
+}
+
 echo "==> fetching AMD/Xilinx wheels (sha256-verified)"
 fetch "$MLIR_AIE_NO_RTTI_URL" "$MLIR_AIE_NO_RTTI_SHA256"
 fetch "$LLVM_AIE_URL"         "$LLVM_AIE_SHA256"
-fetch "$MLIR_AIR_URL"         "$MLIR_AIR_SHA256"
+HAVE_AIR=0
+fetch_optional "$MLIR_AIR_URL" "$MLIR_AIR_SHA256" && HAVE_AIR=1
 # triton-xdna was the fourth, and is gone: nothing in this tree imports triton,
 # and every aie.* symbol the exporters use comes from mlir_aie_no_rtti. Note that
 # it was what PULLED IN mlir-air, so mlir-air is fetched in its own right above --
@@ -127,8 +172,11 @@ fetch "$MLIR_AIR_URL"         "$MLIR_AIR_SHA256"
 echo "==> installing the toolchain (--no-deps: every requirement is already in the lock)"
 "$PY" -m pip install --quiet --no-deps --no-index --no-input \
     "$CACHE"/mlir_aie_no_rtti-*.whl \
-    "$CACHE"/llvm_aie-*.whl \
-    "$CACHE"/mlir_air-*.whl
+    "$CACHE"/llvm_aie-*.whl
+if [ "$HAVE_AIR" = "1" ]; then
+    "$PY" -m pip install --quiet --no-deps --no-index --no-input \
+        "$CACHE"/mlir_air-*.whl
+fi
 
 # --- verify --------------------------------------------------------------
 echo
@@ -141,8 +189,15 @@ import importlib.util as u, importlib.metadata as m, sys
 mods = ["numpy", "torch", "transformers", "scipy", "PIL", "openai",
         "aie.iron", "aie.helpers.taplib", "aie.utils", "onnx"]
 bad = [n for n in mods if u.find_spec(n) is None]
-for n in ("mlir-aie-no-rtti", "mlir-air", "llvm-aie"):
+for n in ("mlir-aie-no-rtti", "llvm-aie"):
     print(f"    {n:<18} {m.version(n)}")
+# mlir-air is REPORTED, not required: nothing in this tree imports it, and the
+# pinned asset has been deleted from its release tag. If it is here, it came
+# from a cache or from a tag that still serves it.
+try:
+    print(f"    {'mlir-air':<18} {m.version('mlir-air')}  (optional, unused)")
+except m.PackageNotFoundError:
+    print(f"    {'mlir-air':<18} absent  (optional, unused)")
 if bad:
     sys.exit("error: missing " + ", ".join(bad))
 print("    imports OK")

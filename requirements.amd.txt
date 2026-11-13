@@ -7,6 +7,9 @@
 # what would silently change what you build, so every line is pinned by
 # sha256. bootstrap.sh refuses a wheel whose digest does not match.
 #
+# ONE OF THEM HAS NOW DISAPPEARED, and the header below records how that was
+# handled rather than how it was papered over.
+#
 # The dependency chain, verbatim from the wheels' own METADATA, as it was when
 # this list still carried four wheels:
 #
@@ -29,6 +32,37 @@
 # installs all three with --no-deps precisely so no wheel's absence can be
 # papered over by another one's metadata.
 #
+# ... and then mlir-air itself stopped being published, which is the second
+# half of the same story. The asset
+#
+#   mlir_air-0.0.1.2026091604+12e6f9f.no.rtti-cp314-cp314-linux_x86_64.whl
+#
+# was on `latest-air-wheels-no-rtti` (and on `latest-air-wheels`) on the day
+# this pin was written, and by the day the OCR work needed the toolchain it was
+# GONE from both: the tag now carries a rolling window of ~289 assets, all
+# newer than the pin, and the pinned one is a 404. The pin is KEPT, verbatim,
+# because a pin is a statement about what this tree was built against, and
+# replacing it with "whatever is newest" is exactly the silent change the
+# sha256 exists to prevent.
+#
+# What the tree actually needs from mlir-air is: nothing. `air` is the AIR
+# dialect's Python bindings, and:
+#
+#   * no module in this tree imports it (`grep -rn "import air" tools/` is
+#     empty),
+#   * the mlir_aie_no_rtti wheel does not ship it either -- its aie/dialects/
+#     has no air.py, and its _mlir_libs/ has no libMLIRAIR,
+#   * the Peano `aie-opt`/`aiecc` in the llvm-aie wheel compile the AIE and
+#     AIEEX dialects this tree emits without the AIR dialect registered,
+#   * `import aie.iron` works with mlir-air absent, which is the import every
+#     exporter makes.
+#
+# So bootstrap.sh fetches it if the pinned asset is still served, installs it if
+# it got there, and CARRIES ON if the asset is gone -- with a line saying so,
+# because a bootstrap that fails on a wheel nothing uses is a bootstrap that
+# stops people building the thing they came for. The check below is therefore
+# reported, not required.
+#
 # `aie.iron` -- what tools/export/* actually import -- comes from
 # mlir_aie_no_rtti's `mlir_aie/python` tree, exposed through its aie.pth.
 #
@@ -47,6 +81,9 @@ MLIR_AIE_NO_RTTI_URL=https://github.com/Xilinx/mlir-aie/releases/download/latest
 MLIR_AIE_NO_RTTI_SHA256=1a6890b16ac3ca37c2b11b7f83a3d5f52df387fcbe606bac0c9f94634de2e173
 
 # sha256 / 242 MB / Name: mlir-air 0.0.1.2026091604+12e6f9f.no.rtti
+# NO LONGER PUBLISHED -- see the header. The pin is kept as the record of what
+# this tree was built against; bootstrap.sh treats a 404 on this ONE wheel as
+# "not offered any more" rather than as a failure, and says so out loud.
 MLIR_AIR_URL=https://github.com/Xilinx/mlir-air/releases/download/latest-air-wheels-no-rtti/mlir_air-0.0.1.2026091604%2B12e6f9f.no.rtti-cp314-cp314-linux_x86_64.whl
 MLIR_AIR_SHA256=d88044f2add4ba8a9adf68264adacd110b2cf1ec84bf94d228077f75205bf647
 
