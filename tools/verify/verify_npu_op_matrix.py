@@ -66,7 +66,8 @@ VERB_BIN = {"embed": "npuembeddings", "list": "npuembeddings",
             "add": "npuembeddings", "tokenize": "npuembeddings",
             "transcribe": "npuaudio",
             "classify": "npuimage", "pose": "npuimage",
-            "hands": "npuimage", "mppose": "npuimage"}
+            "hands": "npuimage", "mppose": "npuimage",
+            "ocr": "npuimage"}
 
 
 def bin_for(spec: dict) -> Path:
@@ -84,9 +85,9 @@ DOCS = (REPO / "NPU_OPS.md", REPO / "NPU_OPS.ru.md")
 # cell's reason in the registry). Changing one means a cell's status changed,
 # which is a behaviour change -- so this gate should have to be edited on purpose
 # rather than a number quietly moving under a document that still says 14.
-EXPECTED_COUNTS = {"honours": 26, "on_array": 0, "unimplemented": 0,
-                   "blocked": 3, "absent": 34}
-# 9 codes x 7 rows = 63, and the tally moved from 56 in two steps:
+EXPECTED_COUNTS = {"honours": 27, "on_array": 0, "unimplemented": 0,
+                   "blocked": 3, "absent": 42}
+# 9 codes x 8 rows = 72, and the tally moved from 56 in three steps:
 #
 #   +7   one cell per row for the code `gemm`: honours for the four
 #        transformer rows, absent for the three whose every weighted
@@ -215,6 +216,18 @@ FIXTURES = {
                    container="models/mediapipe-pose.npue",
                    artifacts="runtime/artifacts/mediapipe-pose",
                    argv=["mppose"], input="image"),
+    # arch=9, the OCR. The verb is `ocr` and not a second spelling of `pose`,
+    # for the same reason `mppose` is not: two architectures can both find
+    # things in a photograph and share no flag, no threshold and no head. The
+    # fixture is its OWN image and not the bus photograph, because the gate
+    # asserts the exit code and the bus has no text in it -- a run that finds
+    # nothing is a valid run, but it is not a run that says anything about
+    # this architecture, and a fixture that cannot tell the difference is not
+    # one.
+    "ocr": dict(kind="ocr", target=None,
+                container="models/paddleocr-onnx.npue",
+                artifacts="runtime/artifacts/paddleocr-onnx",
+                argv=["ocr"], input="ocr_image"),
 }
 # Reported as skipped, not silently absent. `hands` is the first entry and it is
 # NOT one of the two kinds of skip this file used to have: every other row has a
@@ -286,6 +299,11 @@ def fixtures():
         "txt": Path("/tmp/opencode/t.txt"),
         "wav": Path("/home/prof/jfk.wav"),
         "image": Path("/tmp/opencode/bus.jpg"),
+        # The OCR's own picture, and it is IN THE REPOSITORY rather than in
+        # /tmp because it is a fixture that has to be there for this gate to
+        # check anything at all: docs/ocr_text.png is the frame the OCR gate
+        # reads, and it carries three lines of text.
+        "ocr_image": REPO / "docs" / "ocr_text.png",
     }
 
 
@@ -321,9 +339,9 @@ def main() -> int:
           f"architectures = {len(npu_ops.OPS) * len(arches)} cells")
 
     # --- 1. the registry's own shape ---------------------------------------
-    if len(arches) != 7 or len(npu_ops.OPS) != 9:
+    if len(arches) != 8 or len(npu_ops.OPS) != 9:
         print(f"  FAIL  {len(npu_ops.OPS)} codes x {len(arches)} architectures "
-              f"is not the 8 x 7 the document is built around. Adding a row here "
+              f"is not the 9 x 8 the document is built around. Adding a row here "
               f"means adding it to npu_ops.KINDS, to the model's kind in "
               f"tools/data/npu_targets.json and to ARCHES below, and every one "
               f"of those is a place the row can be half-added.")

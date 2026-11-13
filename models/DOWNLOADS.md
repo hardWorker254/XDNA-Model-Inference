@@ -9,7 +9,7 @@ Every model in this repository, where its files come from, and -- the part
 that matters -- whether the graph comes from the model's own repository or
 from somebody else's, and what that costs you.
 
-Of 18 models, **8 publish an ONNX export in their own repository** and
+Of 19 models, **9 publish an ONNX export in their own repository** and
 **10 are served by a third party's** (`onnx-community/*`, and one Xenova
 repository). Every model in this table has a download; what differs is whose
 repository it is in, and that has three consequences worth a section each.
@@ -22,9 +22,9 @@ onnx-community exports exist, they are what most people actually download,
 and a document that tells a reader there is nothing to fetch sends them to
 write their own exporter.
 
-Checked on **2026-10-06**. 9 rows had their files downloaded and
+Checked on **2026-10-06**. 10 rows had their files downloaded and
 hashed; 9 are listed by size from a `HEAD` request, and the row says
-which. Hashed is not the same as agreed: for **`whisper-tiny`, `yolov8n-pose`** the
+which. Hashed is not the same as agreed: for **`paddleocr-onnx`, `whisper-tiny`, `yolov8n-pose`** the
 file was downloaded, packed, and the **container** came out identical to the one
 this tree built -- which for a mirror is the stronger claim and a different one, and
 is why those rows say *packed output identical* rather than *matched*.
@@ -61,6 +61,9 @@ pin with the wrong convention fails on a correct file and passes on nothing.
 | `mediapipe-pose` | [`opencv/person_detection_mediapipe`](https://huggingface.co/opencv/person_detection_mediapipe) | own | [`person_detection_mediapipe_2023mar.onnx`](https://huggingface.co/opencv/person_detection_mediapipe/resolve/main/person_detection_mediapipe_2023mar.onnx) | 11,990,159 | `47fd5599d6fa1760…` | yes — downloaded 11,990,159 B, hashed, matched the local file |
 | `mediapipe-pose` | [`opencv/pose_estimation_mediapipe`](https://huggingface.co/opencv/pose_estimation_mediapipe) | own | [`pose_estimation_mediapipe_2023mar.onnx`](https://huggingface.co/opencv/pose_estimation_mediapipe/resolve/main/pose_estimation_mediapipe_2023mar.onnx) | 5,557,238 | `9d89c599319a18fb…` | yes — downloaded 5,557,238 B, hashed, matched the local file |
 | `nomic-embed-text-v1.5` | [`nomic-ai/nomic-embed-text-v1.5`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) | own | [`onnx/model.onnx`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx) | 547,310,275 | `147d5aa88c210123…` | yes — downloaded 547,310,275 B, hashed, matched the local file |
+| `paddleocr-onnx` | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | own | [`detection/v3/det.onnx`](https://huggingface.co/monkt/paddleocr-onnx/resolve/main/detection/v3/det.onnx) | 2,429,873 | `ee40e80071ba3a32…` | yes — downloaded 2,429,873 B, hashed, matched the local file |
+| `paddleocr-onnx` | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | own | [`languages/english/rec.onnx`](https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/english/rec.onnx) | 7,830,888 | `4e16deb22c4da646…` | yes — downloaded 7,830,888 B, hashed, matched the local file |
+| `paddleocr-onnx` | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | own | [`languages/english/dict.txt`](https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/english/dict.txt) | 1,416 | `e025a66d31f327ba…` | yes — downloaded 1,416 B, hashed, matched the local file |
 | `vit-base-patch16-224` | [`onnx-community/vit-base-patch16-224-ONNX`](https://huggingface.co/onnx-community/vit-base-patch16-224-ONNX) | **mirror** | [`onnx/model.onnx`](https://huggingface.co/onnx-community/vit-base-patch16-224-ONNX/resolve/main/onnx/model.onnx) | 346,471,546 | — | **listed only, bytes unproven** |
 | `whisper-base` | [`onnx-community/whisper-base`](https://huggingface.co/onnx-community/whisper-base) | **mirror** | [`onnx/encoder_model.onnx`](https://huggingface.co/onnx-community/whisper-base/resolve/main/onnx/encoder_model.onnx) | 82,468,078 | — | **listed only, bytes unproven** |
 | `whisper-base` | [`onnx-community/whisper-base`](https://huggingface.co/onnx-community/whisper-base) | **mirror** | [`onnx/decoder_model.onnx`](https://huggingface.co/onnx-community/whisper-base/resolve/main/onnx/decoder_model.onnx) | 208,289,724 | — | **listed only, bytes unproven** |
@@ -87,7 +90,7 @@ curl -L -o models/<name>/onnx/model.onnx \
 sha256sum models/<name>/onnx/model.onnx   # compare with the table above
 ```
 
-**8 of these 18 rows have NOT been downloaded**: `embeddinggemma-300m`, `gte-multilingual-base`, `vit-base-patch16-224`, `whisper-base`, `whisper-large-v3`, `whisper-large-v3-turbo`, `whisper-medium`, `whisper-small`. For those, `sha256` is empty and the only thing measured is the size, which comes from a `HEAD` request. Treat the size as evidence the file exists and the hash as absent, not as unverified-because-missing.
+**8 of these 19 rows have NOT been downloaded**: `embeddinggemma-300m`, `gte-multilingual-base`, `vit-base-patch16-224`, `whisper-base`, `whisper-large-v3`, `whisper-large-v3-turbo`, `whisper-medium`, `whisper-small`. For those, `sha256` is empty and the only thing measured is the size, which comes from a `HEAD` request. Treat the size as evidence the file exists and the hash as absent, not as unverified-because-missing.
 
 ## The mirrors, and what one costs you
 
@@ -164,6 +167,7 @@ two rows in this table with a measured claim, and the rows say which they are.
 | `mediapipe-hands` | Apache-2.0 | models/mediapipe-hands/CHECKPOINT.json -- NOT the repository, which carries no license: tag at all | TWO checkpoints in one container, and they are not interchangeable: the landmark network is given a hand's RoI by the palm detector and cannot find a hand in a frame by itself, so shipping only it answers 'no hand here' to every image. Both files are 2023feb; the 2023feb_int8 and 2023feb_int8bq variants are in the same repositories and are DELIBERATELY NOT used -- see CHECKPOINT.json, which measures what they do to the output. |
 | `mediapipe-pose` | Apache-2.0 | models/mediapipe-pose/CHECKPOINT.json -- NOT the repository, which carries no license: tag at all | TWO checkpoints, same reason as mediapipe-hands: the pose regressor needs a person's box from the detector. The 2023mar_int8bq variants exist upstream and are NOT used -- CHECKPOINT.json measures them putting the 33 keypoints a mean 64.0 px apart. |
 | `nomic-embed-text-v1.5` | apache-2.0 | huggingface license: tag | models/nomic-embed-text-v1.5/CHECKPOINT.json has `sha256: null`, but the pin is NOT absent: models/nomic-embed-text-v1.5.npue carries `source_sha256` = 12ce232f57cfbc0ab9258835dec6e5a105b88c7405dcefeec70facf3a3549b29, which is model_digest() of models/nomic-embed-text-v1.5/onnx/model.onnx -- and the downloaded export hashed byte for byte against that local file. So this model is pinned twice over, in two files, by two different mechanisms. |
+| `paddleocr-onnx` | Apache-2.0 | models/paddleocr-onnx/CHECKPOINT.json -- and the repository's own model card states the same thing | — |
 | `vit-base-patch16-224` | apache-2.0 (asserted, NOT stated) | the MIRROR carries NO license: tag; the original repository's tag says apache-2.0 | — |
 | `whisper-base` | apache-2.0 (asserted, NOT stated) | the MIRROR carries NO license: tag; the original openai/whisper-* tag says apache-2.0 | — |
 | `whisper-large-v3` | apache-2.0 (asserted, NOT stated) | the MIRROR carries NO license: tag; the original openai/whisper-large-v3 tag says apache-2.0 | — |

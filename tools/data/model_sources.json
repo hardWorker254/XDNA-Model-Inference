@@ -504,6 +504,41 @@
       "two_files_note": "TWO checkpoints, same reason as mediapipe-hands: the pose regressor needs a person's box from the detector. The 2023mar_int8bq variants exist upstream and are NOT used -- CHECKPOINT.json measures them putting the 33 keypoints a mean 64.0 px apart.",
       "byte_evidence": "hashed",
       "packed": false
+    },
+    "paddleocr-onnx": {
+      "repo": [
+        "monkt/paddleocr-onnx"
+      ],
+      "license": "Apache-2.0",
+      "license_source": "models/paddleocr-onnx/CHECKPOINT.json -- and the repository's own model card states the same thing",
+      "digest_kind": "file_sha256",
+      "onnx": [
+        {
+          "repo": "monkt/paddleocr-onnx",
+          "file": "detection/v3/det.onnx",
+          "bytes": 2429873
+        },
+        {
+          "repo": "monkt/paddleocr-onnx",
+          "file": "languages/english/rec.onnx",
+          "bytes": 7830888
+        },
+        {
+          "repo": "monkt/paddleocr-onnx",
+          "file": "languages/english/dict.txt",
+          "bytes": 1416
+        }
+      ],
+      "onnx_source": "own",
+      "verified": "downloaded and hashed, all three files. Every value in CHECKPOINT.json -- the three sha256s and all three sizes -- matches the bytes HuggingFace serves today, and they match the local files.",
+      "sha256_file": {
+        "detection/v3/det.onnx": "ee40e80071ba3a320d4efda75f3e22047a7d049e9bf7bcaaf9daea23fc21b935",
+        "languages/english/rec.onnx": "4e16deb22c4da6468bdca539b2cd3c8687825538b67109177c47d359ab994cd7",
+        "languages/english/dict.txt": "e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6"
+      },
+      "three_files_note": "THREE files and they are ONE model: a detector finds text and cannot read it, a recogniser reads a crop and cannot find one, and the dictionary is what gives the recogniser's 438 classes their letters. The repository also ships a SECOND detector, detection/v5/det.onnx (88030804 bytes, sha256 61824840edf6e74581898930b8091b1b2318f4b2705a2e8a40ad3de7ac480133), which is a different network rather than a variant of this one: its boxes are 8 to 12 px wider and its detector takes 11253 ms against this one's 800 ms on docs/ocr_text.png, with the same three transcriptions. It is NOT in the table because the container does not hold it -- the packer refuses a directory with two detectors by name. Name it with --ocr-det to pack it.",
+      "byte_evidence": "hashed",
+      "packed": true
     }
   }
 }

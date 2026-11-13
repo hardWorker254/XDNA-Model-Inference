@@ -26,7 +26,7 @@ it takes no op flag at all -- `--npu-ops`, `--npu-extra-ops` and
 `--npu-eltwise` are refused by name there, each with its own message. The
 table below is what it reads.
 
-There are 9 codes and 7 architectures: 63 cells. Of those, 26 run on the array today, 0 are already there without a code, 0 are operations the model has and no array branch reaches, 3 cannot be moved on this board for a stated reason, and 34 do not exist in that model at all.
+There are 9 codes and 8 architectures: 72 cells. Of those, 27 run on the array today, 0 are already there without a code, 0 are operations the model has and no array branch reaches, 3 cannot be moved on this board for a stated reason, and 42 do not exist in that model at all.
 
 ## The nine codes
 
@@ -72,7 +72,7 @@ new code, or does not tile.
 
 ## What each architecture can send to the array
 
-A list per architecture, not a grid of architectures against codes: of 63 cells 34 repeated one absence, and the answer to what can this dispatch came from filtering the empty cells out of a row. There are no empty cells here: one column, and every entry in it names its own status -- `conv` reads `yes` on all three pose rows without a heading. A code that is not listed is not one this architecture has.
+A list per architecture, not a grid of architectures against codes: of 63 cells 42 repeated one absence, and the answer to what can this dispatch came from filtering the empty cells out of a row. There are no empty cells here: one column, and every entry in it names its own status -- `conv` reads `yes` on all three pose rows without a heading. A code that is not listed is not one this architecture has.
 
 | architecture | what can additionally go to the array |
 | --- | --- |
@@ -82,6 +82,7 @@ A list per architecture, not a grid of architectures against codes: of 63 cells 
 | `pose` | `conv` |
 | `hands` | `conv` |
 | `mppose` | `conv` |
+| `ocr` | `conv` |
 | `embeddinggemma-300m` | `gemm`, `gelu` (impossible), `layn` (impossible), `softm`, `attn` |
 
 `already` has no cell of its own any more -- the ninth code took the last one,
@@ -393,6 +394,56 @@ a 400-point transform is part of an an audio front end, and this architecture ha
 ### `logit` -- the vocabulary projection, as a GEMM: **absent**
 
 no vocabulary: the landmark head emits 39 rows of x/y/z/visibility/presence, a confidence, a 256x256 segmentation mask and a 64x64x39 heatmap, and the detector head emits boxes, four keypoints and scores. Nothing anywhere in this architecture projects into a token space.
+
+## `ocr` -- Text recognition (OCR)
+
+PaddleOCR: a text detector and a text recogniser in ONE container, run in that order with the database post-process between them. Eight of this row's nine cells are `absent`, and the ninth is `conv` -- the 81 dense convolutions are every weighted operation the two graphs have.
+
+### `gemm` -- the per-layer GEMMs: **absent**
+
+every weighted operation in these two graphs is a convolution or a matmul inside the graph, so there is no per-layer projection for a tenth code to name. tools/pack/packers/ocr.py refuses a dispatch target whose op_type is not Conv by name, and the graphs are those 112 convolutions plus the recogniser's two attention matmuls and its CTC head's projection. Nothing is missing: `conv` already names every matrix multiply the dense part of this graph contains.
+
+### `gelu` -- GELU: **absent**
+
+the activations are ReLU, sigmoid, hardswish and hardsigmoid, and each is FUSED into its convolution's epilogue or applied as a separate pass over the convolution's output: packers/ocr.py attaches `act` to a Conv and the runtime's apply_act computes the parameterised ones -- the detector's hardsigmoid carries alpha 0.2, which the shared epilogue enum cannot hold. There is nothing for a gelu/ design to take over.
+
+### `layn` -- LayerNorm: **absent**
+
+no normalisation op in either graph. The recogniser's BatchNormalization was FOLDED into the preceding convolution by the packer -- exactly, as an affine on the weights -- so the graph carries no normalisation node at all. The recogniser's own layer normalisation is not an op either: it is a ReduceMean, a Sub, a Sqrt and a Div in the graph, and the runtime walks them as such.
+
+### `softm` -- softmax: **absent**
+
+no softmax over a score matrix between two GEMMs. The detector's probability map is a SIGMOID the graph carries, and the recogniser's CTC head is a softmax over CLASSES that the runtime's own greedy decoder does, because a CTC decode is an argmax over the classes and a collapse of the repeats -- not a matrix multiply between two GEMMs.
+
+### `conv` -- conv1d (Whisper's audio front end): **honours**
+
+It dispatches, and it is 1.35x SLOWER here, and both of those are measured.
+
+The two graphs' 112 convolutions are 81 dense, 29 depthwise and 2 transposed, and the dense ones have distinct raw (K, N) pairs which pad the way gemm_rtp/geometry.py pads pose's -- K to a multiple of tile_k = 64, N to tile_n*cols = 128 -- down to FIFTEEN: nine from the detector, twelve from the recogniser, and six that both of them need. Sharing those six is what the single slot table is for, and it is why the recogniser's small crops and the detector's 960x960 map ride the same design. runtime/artifacts/paddleocr-onnx/artifacts_npu1/gemm_rtp/ carries that set: one design, 15 streams, M = 1024, and tools/verify/verify_pose_streamset.py checks it against geometry.py, npu_targets.json and the packed container in both directions. --npu-ops conv sends the 81 dense convolutions to the array in 1613 dispatches; the other 31 stay on the host.
+
+MEASURED on docs/ocr_text.png, 900x360, three lines of text: the array takes 1647 ms against the host's 1219 ms for the same frame. The split is the interesting part and it is the host's, not the device's: of the array's 1647 ms, 406 ms is the device's own time, 199 ms is repacking A into the design's padded stride and transposing C back, and the detector's 15 depthwise and 2 transposed convolutions (220 ms) and the recogniser's 14 depthwise ones (65 ms) stay on the host. The DETECTOR is where the array loses: its dense convolutions take 641 ms on the device against 167 ms on the host, because they run over a 960x960 map -- 921600 output pixels, 900 chunks of 1024 -- and each chunk is a small GEMM with a wide K. The RECOGNISER, whose crops are 48 pixels tall, is the opposite: 69 ms on the device against 78 ms on the host, and 3 crops cost 401 ms against 439 ms.
+
+AND THE TWO PATHS AGREE ON THE TEXT, which is the claim that matters here and which arch=8's cell cannot make: the recogniser's output is a STRING, and the array's bf16 panels give the same three strings as the host's fp32 -- 'Hello OCR World', 'NpuEmbeddings 12345' and 'PaddleOCR on AMD NPU' -- with the boxes within 4 px. tools/verify/verify_ocr.py checks the array path against the host path on the same frame, and the host path against rapidocr itself.
+
+TWO THINGS A DESIGN SET WILL NOT MOVE. 29 of the container's 112 convolutions are DEPTHWISE, and a depthwise filter reduces within one channel so there is no [M, N] GEMM in it -- those stay on the host whatever a design set says. And the DB head's two TRANSPOSED convolutions are a sum of SHIFTED contributions rather than a matrix product, which is why they stay on the host too.
+
+Design directory: none -- it runs on the stream gemm_rtp already exports, so there is nothing to compile. See `STREAM_ONLY` in `tools/lib/npu_ops.py`.
+
+### `attn` -- attention, as two GEMMs: **absent**
+
+the recogniser's SVTR attention is IN THE GRAPH: two transposed matmuls and a softmax between them, which runtime/src/ocr/net.cpp walks as matmul and elementwise ops and not as the array's attention kernel. The array's attention code is for a transformer's Q|K|V, and this is a batched matmul over a [1, 8, 40, 15] operand.
+
+### `mproj` -- Whisper's mel filter bank, as a GEMM: **absent**
+
+a mel filter bank is part of an an audio front end, and this architecture has none.
+
+### `fft` -- Whisper's 400-point transform, as a GEMM: **absent**
+
+a 400-point transform is part of an an audio front end, and this architecture has none.
+
+### `logit` -- the vocabulary projection, as a GEMM: **absent**
+
+no vocabulary projection: the recogniser's head is a convolution over the frames -- a 320-wide 1x1 filter writing 438 classes -- and the CTC decoder reads its [1, frames, classes] output against the container's own 436-character dictionary. Nothing projects into a token space.
 
 ## `embeddinggemma-300m` -- Gemma
 

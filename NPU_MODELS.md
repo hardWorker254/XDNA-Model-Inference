@@ -5,24 +5,24 @@
      run the script, or tools/verify/verify_npu_op_matrix.py fails.
      Russian version: NPU_MODELS.ru.md -->
 
-9 op codes, 18 models in `tools/data/npu_targets.json`, 162 cells.
+9 op codes, 19 models in `tools/data/npu_targets.json`, 171 cells.
 
 This is the companion to [NPU_OPS.md](NPU_OPS.md), which answers "what does an ARCHITECTURE support" -- one row per architecture. This one answers the question you actually have when you type a model name: "what can THIS model put on the array". Russian: [NPU_MODELS.ru.md](NPU_MODELS.ru.md).
 
-Why a second table rather than a column on the first: a kind's row is almost always the answer, so most of this file repeats the architecture document 18 times. The repetition is still worth printing, because two models do NOT answer with their kind's row:
+Why a second table rather than a column on the first: a kind's row is almost always the answer, so most of this file repeats the architecture document 19 times. The repetition is still worth printing, because two models do NOT answer with their kind's row:
 
 - **gemma** -- its ENCODER differs from its kind's (RMSNorm, GeGLU, and `GemmaNpuEncoder` reads no per-op flag at all). It is the only one.
 - **nomic and gte** -- they have a **gated FFN**, whose activation is part of the gated path between `ffn_up` and `ffn_down` rather than a standalone pass. Their kind says `honours` for `gelu`, and for these two models that is not true.
 
 The second is the actual reason this file exists: `--npu-ops gelu` is **refused** for gemma, and for nomic and gte no `gelu/` design is compiled at all. From the architecture table alone a reader would conclude those three behave alike.
 
-Tally over the 162 cells:
+Tally over the 171 cells:
 
-- **99** **yes** -- runs on the array today
+- **100** **yes** -- runs on the array today
 - **0** already -- the work is already dispatched without a code, and the code is refused
 - **0** no code -- the model has the operation, no array branch reaches it
 - **3** impossible -- cannot be moved on this board; the reason is in NPU_OPS.md
-- **58** no -- the model has no such operation
+- **66** no -- the model has no such operation
 - **2** **gated** -- this model's FFN has no standalone activation pass -- see below
 
 ## What each model can send to the array
@@ -33,7 +33,7 @@ So an embedder's row, four codes and no `conv`, does NOT mean this model never t
 
 And all nine are on the host by default -- that is a rule, not a conclusion, and for the four base GEMMs the measurements say the opposite: `gemm` on the array is 1.80x faster on ViT and 6.9x on gemma (NPU_OPS.md, the `gemm` cells). What follows is about the ELEMENTWISE codes and was measured before `gemm` was split out, when those four GEMM streams went to the array either way -- so its two arms are today's `--npu-ops gemm` and `--npu-ops gemm,<code>`, and the only thing moving between them is the elementwise op. Same two texts on bge-micro-v2, five runs each: 168 ms against 265 / 260 / 252 ms for gelu, layn and softm one at a time, and 330 ms with all three. Dispatch wait grows 6.0 -> 22.5 / 23.3 / 24.1 / 59.2 ms. An elementwise operation on the array is one and a half to two times what it costs on the host here.
 
-A list per model, not a grid of models against operations. In a 162-cell grid, 58 of the cells would say the same absence in the same position, and reading the answer meant filtering the empty ones out of every row -- and the filtering IS the answer. There are no empty cells here at all: one column, and every entry in it names its own status, so `gelu` (gated) reads without a heading to its left. The header carries the absence: a code that is not listed is not an operation this model has.
+A list per model, not a grid of models against operations. In a 171-cell grid, 66 of the cells would say the same absence in the same position, and reading the answer meant filtering the empty ones out of every row -- and the filtering IS the answer. There are no empty cells here at all: one column, and every entry in it names its own status, so `gelu` (gated) reads without a heading to its left. The header carries the absence: a code that is not listed is not an operation this model has.
 
 | model | what can additionally go to the array |
 | --- | --- |
@@ -55,6 +55,7 @@ A list per model, not a grid of models against operations. In a 162-cell grid, 5
 | `yolov8n-pose` | `conv` |
 | `mediapipe-hands` | `conv` |
 | `mediapipe-pose` | `conv` |
+| `paddleocr-onnx` | `conv` |
 
 ## Where these two models differ from their kind
 
@@ -100,8 +101,9 @@ Note what is **absent** from it: the six codes with no design directory of their
 | `yolov8n-pose` | `pose` | _none_ | — | — | — |
 | `mediapipe-hands` | `hands` | _none_ | — | — | — |
 | `mediapipe-pose` | `mppose` | _none_ | — | — | — |
+| `paddleocr-onnx` | `ocr` | _none_ | — | — | — |
 
-## Why 18 rows and six kinds
+## Why 19 rows and six kinds
 
 `npu_targets.json` knows six kinds (`gemm_rtp`, `stt`, `cls`, `pose`, `hands`, `mppose`) and eighteen models, so the model table is three times the length of the architecture table. That is deliberate: a kind is what can be shared, and the reader wants the answer for the name they typed.
 

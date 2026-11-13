@@ -21,6 +21,7 @@ the other generation is refused rather than loaded.
 - [Speech to text](#speech-to-text)
 - [Image classification](#image-classification)
 - [Body pose](#body-pose)
+- [Text recognition (OCR)](#text-recognition-ocr)
 - [Models](#models)
 - [Building design sets](#building-design-sets)
 - [Accuracy](#accuracy)
@@ -1700,6 +1701,142 @@ measures, including i4 group 16.
   that fails when it should. It is also stdlib-only, so it is not covered by the
   gates that check `requirements.txt`.
 - **`npu2`.** No second board was available, as everywhere else in this README.
+
+---
+
+## Text recognition (OCR)
+
+A PaddleOCR container is **two networks and a dictionary**: a text detector
+that finds text in a photograph, a text recogniser that reads the crop, and
+the character table that gives the recogniser's 438 classes their letters. All
+three are in one container, for the same reason the palm detector and the
+person detector are: a detector finds text and cannot read it, and a
+recogniser reads a crop and cannot find one, so a container holding only one
+of them answers *no text here* to every image.
+
+It is not an embedder and not a classifier, and it runs through a mode of its
+own — `npuimage ocr`.
+
+The detector is a DB network (differentiable binarisation) on a 960×960
+letterboxed frame, ending in a probability map; the runtime thresholds it,
+finds the connected components, takes their convex hulls, un-clips them and
+scores them. The recogniser is an SVTR network with a CTC head, run once per
+box on a 48×320 crop warped from the box's quad. Both the thresholds and the
+front-end geometry come **from the container**, not from a flag: a container
+packed with different thresholds is a different model.
+
+**CPU by default.** `--npu-ops conv` moves the 81 dense convolutions of the
+two graphs to the array and nothing else, exactly as it does for the other
+modes.
+
+### Four commands
+
+```bash
+# 1. the container. The three files are named one by one, because the upstream
+#    repository holds SEVERAL detectors and SEVERAL languages and picking one
+#    of each silently is a different network with different accuracy.
+python tools/pack/pack_npue.py \
+    --ocr-det models/paddleocr-onnx/det.onnx \
+    --ocr-rec models/paddleocr-onnx/rec.onnx \
+    --ocr-dict models/paddleocr-onnx/dict.txt \
+    --out models/paddleocr-onnx.npue --device npu1
+#    --ocr-onnx DIR searches a checkout of monkt/paddleocr-onnx instead, and
+#    refuses a directory that holds two detectors or two languages BY NAME.
+#    --dtype bf16 works; --dtype i8 and --dtype i4 are REFUSED by name, and
+#    the reason is a layout: the DB head's two transposed convolutions carry
+#    their weight as [Cin, Cout, kh, kw] and the quantisation path wants
+#    [Cout, Cin, kh, kw]. --npu stages the pre-tiled array panels.
+
+# 2. run it. One image per argument; the result on stdout, the status block on
+#    stderr.
+./runtime/build/npuimage ocr models/paddleocr-onnx.npue photo.png --text
+
+# 3. the machine-readable form: every box's quad, its DB score, its CTC
+#    confidence and its text.
+./runtime/build/npuimage ocr models/paddleocr-onnx.npue photo.png --json
+
+# 4. every graph node's fp32 output, for diffing against an independent
+#    interpreter. This is how the node-by-node parity below was established.
+./runtime/build/npuimage ocr models/paddleocr-onnx.npue photo.png \
+    --ocr-dump /tmp/ocr.bin
+```
+
+### The array path, in two more commands
+
+```bash
+# 5. build the design set: 15 streams, one per distinct padded convolution
+#    shape, nine of them the detector's, twelve the recogniser's, and six that
+#    both graphs need -- the two graphs SHARE their slots, because they run
+#    on the same array at different times.
+python tools/export/export_gemm_rtp.py --target paddleocr-onnx --arch 1 \
+    --cols 4 -n 32
+#    writes runtime/artifacts/paddleocr-onnx/artifacts_npu1/gemm_rtp/
+
+# 6. run it. --artifacts names that set; without it this run would silently be
+#    the host path again and any comparison against it would be trivially equal.
+./runtime/build/npuimage ocr models/paddleocr-onnx.npue photo.png \
+    --npu-ops conv --artifacts runtime/artifacts/paddleocr-onnx/artifacts_npu1 \
+    --text
+```
+
+### What was verified, and what it cost
+
+`tools/verify/verify_ocr.py` is the gate and it has four sections: the packed
+op list against **onnxruntime** op by op (153 detector ops, 334 recogniser
+ops, worst 2.6e-07 of peak), the runtime's walk against an **independent
+reading** of the op list, the runtime end to end against **rapidocr**, and the
+array path against the host path on the same frame.
+
+Measured on `docs/ocr_text.png` (900×360, three lines of text), against
+rapidocr-onnxruntime 1.2.3 — the reference implementation this tree's
+algorithm follows:
+
+| | text | box |
+|---|---|---|
+| this runtime | `Hello OCR World` | — |
+| rapidocr | `Hello OCR World` | within 1 px |
+| this runtime | `NpuEmbeddings 12345` | — |
+| rapidocr | `NpuEmbeddings 12345` | within 4 px |
+| this runtime | `PaddleOCR on AMD NPU` | — |
+| rapidocr | `PaddleOCR on AMD NPU` | within 4 px |
+
+All three transcriptions are **identical** and every box is within 4 px.
+
+The array path is **1.35× slower** than the host on the same frame — 1647 ms
+against 1219 ms, in 1613 dispatches — and the status block says why, per graph,
+on every run. Of the array's 1647 ms, 406 ms is the device's own time, 199 ms
+is the host repacking A into the design's padded stride and transposing C back,
+and the 29 depthwise and 2 transposed convolutions (285 ms) stay on the host:
+neither of those two kinds is a GEMM, and no design set will move them. The
+detector is where the array loses — its dense convolutions take 641 ms on the
+device against 167 ms on the host, because they run over a 960×960 map, 900
+chunks of 1024 rows, each a small GEMM with a wide K. The recogniser, whose
+crops are 48 pixels tall, is the other way round: 69 ms on the device against
+78 ms on the host.
+
+What the array path does **not** cost is correctness: the panels are bf16, and
+the two paths return the same three strings with the boxes within a pixel.
+
+### What has NOT been measured
+
+- **No quantised weights.** `--dtype i8` and `--dtype i4` are refused by name,
+  and the reason is the layout of the DB head's two transposed convolutions
+  rather than a measurement. Quantising them against the transposed view
+  would make the container's layout differ from the checkpoint's for two
+  convolutions; leaving them in f32 inside an int8 container would need a
+  per-convolution dtype the format does not have.
+- **The v5 detector is measured but not shipped.** The upstream repository has
+  a second detector, 84 MB against the v3's 2.3 MB. The same runtime packs it
+  and reads the same three strings, but its boxes are 8 to 12 px wider and its
+  detector takes 11.3 s against the v3's 0.8 s — so the v3 is what this
+  container holds and the v5 is a separate container.
+- **One image.** The gate reads one photograph, and it is a synthetic one
+  with three lines of Latin text. No other script, no rotated page, no
+  photographed page, no low-contrast text.
+- **No load test on an OCR server.** `--serve` is refused by name for this
+  mode: the OCR pipeline is a two-stage one, and a server that read boxes
+  concurrently would have to hold the recogniser's per-box state somewhere
+  this build does not put it.
 
 ---
 

@@ -8,7 +8,7 @@
 Все модели этого дерева, откуда их файлы и — что существенно — какие из них
 можно скачать как ONNX-экспорт.
 
-Из 18 моделей **18 публикуют ONNX-экспорт, который можно скачать**, и
+Из 19 моделей **19 публикуют ONNX-экспорт, который можно скачать**, и
 **0 — нет**. Это не решение этого дерева, это то, что есть в
 репозиториях наверху. У тех, у кого нет, нет каталога `onnx/` вовсе, и
 запрос возвращает 404. Вот настоящая причина того, что в
@@ -18,9 +18,9 @@
 
 (BUILD.md на английском — перевода в дереве нет.)
 
-Проверено **2026-10-06**. Файлы в **9 строках скачаны и захэшированы**;
+Проверено **2026-10-06**. Файлы в **10 строках скачаны и захэшированы**;
 остальные 9 — только листинг по размеру из `HEAD`, и строка говорит,
-какая именно. «Захэшировано» — не то же самое, что «совпало»: у **`whisper-tiny`, `yolov8n-pose`**
+какая именно. «Захэшировано» — не то же самое, что «совпало»: у **`paddleocr-onnx`, `whisper-tiny`, `yolov8n-pose`**
 файл скачан, упакован, и **совпал контейнер** — тот, что собрало это дерево. Для
 зеркала это утверждение сильнее и другое, поэтому такие строки говорят «упакованный результат тот же», а не «совпало».
 
@@ -56,6 +56,9 @@
 | `mediapipe-pose` | [`opencv/person_detection_mediapipe`](https://huggingface.co/opencv/person_detection_mediapipe) | свой | [`person_detection_mediapipe_2023mar.onnx`](https://huggingface.co/opencv/person_detection_mediapipe/resolve/main/person_detection_mediapipe_2023mar.onnx) | 11,990,159 | `47fd5599d6fa1760…` | да — скачано 11,990,159 Б, захэшировано, совпало с локальным файлом |
 | `mediapipe-pose` | [`opencv/pose_estimation_mediapipe`](https://huggingface.co/opencv/pose_estimation_mediapipe) | свой | [`pose_estimation_mediapipe_2023mar.onnx`](https://huggingface.co/opencv/pose_estimation_mediapipe/resolve/main/pose_estimation_mediapipe_2023mar.onnx) | 5,557,238 | `9d89c599319a18fb…` | да — скачано 5,557,238 Б, захэшировано, совпало с локальным файлом |
 | `nomic-embed-text-v1.5` | [`nomic-ai/nomic-embed-text-v1.5`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) | свой | [`onnx/model.onnx`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx) | 547,310,275 | `147d5aa88c210123…` | да — скачано 547,310,275 Б, захэшировано, совпало с локальным файлом |
+| `paddleocr-onnx` | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | свой | [`detection/v3/det.onnx`](https://huggingface.co/monkt/paddleocr-onnx/resolve/main/detection/v3/det.onnx) | 2,429,873 | `ee40e80071ba3a32…` | да — скачано 2,429,873 Б, захэшировано, совпало с локальным файлом |
+| `paddleocr-onnx` | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | свой | [`languages/english/rec.onnx`](https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/english/rec.onnx) | 7,830,888 | `4e16deb22c4da646…` | да — скачано 7,830,888 Б, захэшировано, совпало с локальным файлом |
+| `paddleocr-onnx` | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | свой | [`languages/english/dict.txt`](https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/english/dict.txt) | 1,416 | `e025a66d31f327ba…` | да — скачано 1,416 Б, захэшировано, совпало с локальным файлом |
 | `vit-base-patch16-224` | [`onnx-community/vit-base-patch16-224-ONNX`](https://huggingface.co/onnx-community/vit-base-patch16-224-ONNX) | **зеркало** | [`onnx/model.onnx`](https://huggingface.co/onnx-community/vit-base-patch16-224-ONNX/resolve/main/onnx/model.onnx) | 346,471,546 | — | **только листинг, байты не доказаны** |
 | `whisper-base` | [`onnx-community/whisper-base`](https://huggingface.co/onnx-community/whisper-base) | **зеркало** | [`onnx/encoder_model.onnx`](https://huggingface.co/onnx-community/whisper-base/resolve/main/onnx/encoder_model.onnx) | 82,468,078 | — | **только листинг, байты не доказаны** |
 | `whisper-base` | [`onnx-community/whisper-base`](https://huggingface.co/onnx-community/whisper-base) | **зеркало** | [`onnx/decoder_model.onnx`](https://huggingface.co/onnx-community/whisper-base/resolve/main/onnx/decoder_model.onnx) | 208,289,724 | — | **только листинг, байты не доказаны** |
