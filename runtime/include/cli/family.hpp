@@ -72,7 +72,7 @@ inline bool owns(Family who, const std::string &sub) {
       return sub == "transcribe" || sub == "serve";
     case Family::Image:
       return sub == "classify" || sub == "pose" || sub == "hands" ||
-             sub == "mppose" || sub == "serve";
+             sub == "mppose" || sub == "ocr" || sub == "serve";
     case Family::Embed:
       break;
   }
@@ -85,7 +85,7 @@ inline bool owns(Family who, const std::string &sub) {
 inline Family owner_of(const std::string &sub) {
   if (sub == "transcribe") return Family::Audio;
   if (sub == "classify" || sub == "pose" || sub == "hands" ||
-      sub == "mppose")
+      sub == "mppose" || sub == "ocr")
     return Family::Image;
   return Family::Embed;
 }
@@ -95,7 +95,7 @@ inline Family owner_of(const std::string &sub) {
 inline const char *verbs_of(Family who) {
   switch (who) {
     case Family::Audio: return "transcribe, serve";
-    case Family::Image: return "classify, pose, hands, mppose, serve";
+    case Family::Image: return "classify, pose, hands, mppose, ocr, serve";
     case Family::Embed: break;
   }
   return "embed, list, add, tokenize, serve";
@@ -107,7 +107,7 @@ inline const char *verbs_of(Family who) {
 inline const char *roster() {
   return "    npuembeddings   embed, list, add, tokenize, serve\n"
          "    npuaudio        transcribe, serve\n"
-         "    npuimage        classify, pose, hands, mppose, serve";
+         "    npuimage        classify, pose, hands, mppose, ocr, serve";
 }
 
 // A container's ARCH names its family. Embed is the default and covers every
@@ -116,7 +116,8 @@ inline const char *roster() {
 // path below the check still reports what it found.
 inline Family family_of_arch(const std::string &arch) {
   if (is_stt_arch(arch)) return Family::Audio;
-  if (is_vit_arch(arch) || is_pose_arch(arch)) return Family::Image;
+  if (is_vit_arch(arch) || is_pose_arch(arch) || is_ocr_arch(arch))
+    return Family::Image;
   return Family::Embed;
 }
 

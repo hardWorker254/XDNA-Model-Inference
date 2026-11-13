@@ -79,7 +79,7 @@ std::string resolve_container(const std::string &root, const std::string &arg,
     else path = ensure(root, arg, token);
     // THE FAMILY, ON THE SUBCOMMAND SIDE. resolve_model_path() makes this
     // check for the flag form; this resolver is what every model-taking verb
-    // (serve, embed, transcribe, classify, pose, hands, mppose) goes through,
+    // (serve, embed, transcribe, classify, pose, hands, mppose, ocr) goes through,
     // and one rule applied in two places is the same rule -- two copies of the
     // RULE are what would drift. It lands after a fetch on purpose: the
     // container has to exist to say which arch it is, and refusing by name is
@@ -127,6 +127,13 @@ bool flag_takes_value(const std::string &a) {
         // then reports that it was never given. verify_cli_flags.py's two-tables-
         // agree check is what catches that, and it caught --audio.
         "--mppose", "--max-people", "--mppose-dump",
+        // arch=9, the same three and the same reason: --ocr is the image list
+        // (run_ocr() rewrites positionals into it), and --max-boxes and
+        // --ocr-dump are this mode's own. A flag missing here is dropped
+        // silently by forward_common() and the mode then reports that it was
+        // never given -- which is what verify_cli_flags.py's two-tables-agree
+        // check exists to catch.
+        "--ocr", "--max-boxes", "--ocr-dump",
         // --serve is deliberately NOT here: it is arity 0 in flags.hpp (the port
         // is the next argv entry, and only if it starts with a digit), and it is
         // injected by run_serve rather than forwarded from the user's line. A
@@ -514,6 +521,58 @@ int run_mppose(int argc, char **argv) {
     return launch(argv[0], root, store);
 }
 
+// arch=9. Mirrors run_pose and run_hands exactly: positionals become --ocr,
+// the model name and --root/--token are picked off the front, and everything else
+// is forwarded for forward_common's whitelist to judge.
+//
+// The verb is `ocr` rather than `detect` or `read` ON PURPOSE. The container
+// holds a detector AND a recogniser, and it runs both: the verb that names
+// only one of them would promise half of what the command does.
+int run_ocr(int argc, char **argv) {
+    std::string root = default_root(argv[0]);
+    std::string cli_token;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) == "--root") root = argv[i + 1];
+        if (std::string(argv[i]) == "--token") cli_token = argv[i + 1];
+    }
+    if (argc < 3 || argv[2][0] == '-')
+        throw std::runtime_error(
+            "`ocr` needs a model name or a path to a .npue container");
+    const std::string model_name = argv[2];
+    if (argc < 4 || argv[3][0] == '-')
+        throw std::runtime_error(
+            "`ocr` needs an image:\n"
+            "    npuimage ocr <model> <image.png> [more.png ...]\n"
+            "  (PNG and JPEG; anything else is refused rather than guessed at)\n"
+            "  --max-boxes 1     read at most N boxes\n"
+            "  --text            a human summary instead of JSON\n"
+            "  --ocr-dump FILE   every graph node's output, for the gate\n"
+            "  (every threshold comes from the container -- they are part of the\n"
+            "   checkpoint, so there is no flag for them, and typing one is\n"
+            "   refused rather than ignored)\n"
+            "  `serve` is not an alternative here: arch 9 has no HTTP endpoint,\n"
+            "  which ocr_mode.hpp refuses by name and says why.");
+    if (!is_container_path(model_name)) warn_if_unpinned(model_name);
+    const std::string container = resolve_container(root, model_name, cli_token);
+    std::vector<std::string> store = {"--model", container};
+    bool swallow = false;
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (swallow) {
+            swallow = false;
+            continue;
+        }
+        if (!a.empty() && a[0] == '-') {
+            swallow = flag_takes_value(a);
+            continue;
+        }
+        store.push_back("--ocr");
+        store.push_back(a);
+    }
+    forward_common(argv, argc, store);
+    return launch(argv[0], root, store);
+}
+
 int run_add(int argc, char **argv) {    std::string root = default_root(argv[0]);
     std::string cli_token;
     for (int i = 2; i < argc - 1; ++i) {
@@ -663,6 +722,8 @@ void register_default_subcommands(SubcommandDispatcher &dispatcher) {
     dispatcher.register_handler("hands", run_hands);
     // arch=8, and NOT another spelling of `pose`: see run_mppose's comment.
     dispatcher.register_handler("mppose", run_mppose);
+    // arch=9: the text detector AND the text recogniser, in one command.
+    dispatcher.register_handler("ocr", run_ocr);
 }
 
 }  // namespace app

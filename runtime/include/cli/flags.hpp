@@ -136,6 +136,20 @@ inline int flag_arity(const std::string &a) {
       // node-by-node diff against tools/verify/verify_mppose.py. See
       // mppose_mode.hpp.
       {"--mppose-dump", 1},
+      // -- ocr_mode.hpp (arch=9). Same treatment as the three above and the same
+      // reasons: --ocr is the image list, arity 1, REPEATED, and --max-boxes caps
+      // how many boxes reach the recogniser -- a COUNT, because every box is an
+      // independent STRAIGHTENED crop and the only lever on the second stage is
+      // how many of them to read. No threshold flags again: the detector's
+      // thresholds are in the container, and ocr_mode REFUSES --conf/--iou/--kpt/
+      // --max-det AND arch=6's, arch=7's and arch=8's by name rather than
+      // accepting and ignoring them -- because two different containers called
+      // `pose` and `ocr` answer to those flags with different semantics.
+      {"--ocr", 1},          {"--max-boxes", 1},
+      // Diagnostic: dump every graph node's output of BOTH graphs, for the
+      // node-by-node diff against tools/verify/verify_ocr.py. See
+      // ocr_mode.hpp.
+      {"--ocr-dump", 1},
       {"--token", 1},
       // -- REFUSED BY NAME, not accepted. Listed so that CLI::parse() lets them
       // through to refuse_removed_op_flags / refuse_exporter_only_flags, whose

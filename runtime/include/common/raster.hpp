@@ -82,6 +82,36 @@ Image resize_area(const Image &src, int64_t nh, int64_t nw);
 // there.
 Image warp_affine(const Image &src, const double m[6]);
 
+// cv2.getPerspectiveTransform(src, dst): the homography that maps the four
+// points `src` to the four points `dst`, as a 3x3 row-major matrix with
+// m[8] == 1.
+//
+// The eight points are (x, y) pairs: src[0..1], src[2..3], src[4..5],
+// src[6..7] and the same for dst.
+//
+// False when the four points do not determine a homography -- three of them
+// collinear, or two of them the same -- which is a degenerate box and not a
+// rounding accident.
+bool get_perspective_transform(const double src[8], const double dst[8],
+                               double m[9]);
+
+// cv2.warpPerspective(src, m, (w, h), INTER_LINEAR, border=REPLICATE), where
+// `m` maps the DESTINATION to the SOURCE.
+//
+// THE INVERSE MAP, and that is not a detail: the resampling asks "which
+// source pixel does this destination pixel come from", and a homography given
+// the other way round asks the opposite question and answers it with the
+// whole image somewhere else. cv2's getPerspectiveTransform gives the map
+// from the source to the destination, so the caller inverts it -- by asking
+// for the homography from the destination rectangle to the source quad, which
+// is the same thing without a matrix inversion.
+//
+// THE BORDER IS REPLICATED, not zero: the crop's corners reach outside the
+// image when the box sits at the edge of the frame, and a black border there
+// is a black stripe across the first character.
+Image warp_perspective(const Image &src, const double m[9], int64_t dh,
+                        int64_t dw);
+
 // A copy of the half-open rectangle. The clip is the CALLER's job -- the
 // coordinates are integers by the time they arrive, and the truncation order that
 // produces those integers is part of the model.

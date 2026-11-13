@@ -151,6 +151,19 @@ set(NPUE_SOURCES
   src/mppose/decode.cpp
   src/mppose/net.cpp
   src/mppose/session.cpp
+  # arch=9 (PaddleOCR OCR: the text detector and the text recogniser and the
+  # character dictionary in ONE container). Same file order as the blocks
+  # above: the geometry, then the image front ends, then the graph walk, then
+  # the two post-processes, then the session. src/ocr/net.cpp gets -O3 on its
+  # own for the reason src/pose/net.cpp does -- the host GEMM is the same
+  # nested axpy -- and src/ocr/db.cpp gets it as well, because the DB
+  # post-process's inner loop over a box's pixels is the same shape of work.
+  src/ocr/geometry.cpp
+  src/ocr/frontend.cpp
+  src/ocr/net.cpp
+  src/ocr/db.cpp
+  src/ocr/ctc.cpp
+  src/ocr/session.cpp
   # The array side of a CONVOLUTION, shared by arch=6 and arch=8. Listed once and
   # used twice rather than kept per architecture, because the dangerous parts are
   # the ones with a plausible wrong answer -- the padded-K repack, the widened
@@ -324,6 +337,15 @@ if(NOT MSVC)
   # depthwise, and its three DepthToSpace steps are pure plane copies whose
   # memcpy the compiler emits at -O3 and does not at -O2.
   set_source_files_properties(src/mppose/net.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3")
+  # arch=9 for the same reason, and the DB post-process with it: the
+  # recogniser's 24 dense convolutions and the detector's 57 are the same
+  # nested axpy, and the DB post-process's inner loop over a box's pixels is
+  # a scan over a rectangle that -O3 turns into something better than a
+  # branch per pixel.
+  set_source_files_properties(src/ocr/net.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3")
+  set_source_files_properties(src/ocr/db.cpp PROPERTIES
     COMPILE_OPTIONS "-O3")
 endif()
 

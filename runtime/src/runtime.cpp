@@ -15,6 +15,7 @@
 #include "runtime/pose_mode.hpp"
 #include "runtime/hands_mode.hpp"
 #include "runtime/mppose_mode.hpp"
+#include "runtime/ocr_mode.hpp"
 #include "runtime/model.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -107,6 +108,19 @@ int Runtime::run(int argc, char **argv) {
     if (int mppose_r = app::maybe_mppose_mode(root_, argc, argv, model_path_);
         mppose_r >= 0)
         return mppose_r;
+
+    // arch=9 (PaddleOCR: a text DETECTOR and a text RECOGNISER and the
+    // character dictionary in ONE container) is the seventh architecture with a
+    // pipeline of its own. It is dispatched AFTER arch=8 and beside it rather
+    // than beside arch=6, because the two are not variants: arch=6 runs one
+    // network over one frame, and this runs a second, separate network once
+    // per box on a crop of that same frame -- a crop STRAIGHTENED by a
+    // perspective warp, because the text is rarely square to the frame. Like
+    // both of them its default path opens no device, and the array is an
+    // opt-in (`--npu-ops conv`).
+    if (int ocr_r = app::maybe_ocr_mode(root_, argc, argv, model_path_);
+        ocr_r >= 0)
+        return ocr_r;
 
     RunContext ctx;
     ctx.argc = argc;

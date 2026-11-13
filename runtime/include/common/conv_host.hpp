@@ -351,15 +351,25 @@ inline void transpose_nk_to_kn(const float *src, int64_t N, int64_t K,
 // were zeroing a buffer they then wrote end to end. resize() is a no-op when the
 // buffer is already big enough, and A is reused across convolutions precisely
 // so that it usually is.
-inline void im2col(const Nchw &in, int64_t kh, int64_t kw, int64_t ph,
-                    int64_t pw, int64_t sh, int64_t sw, std::vector<float> &A,
-                    app::Pool &pool, int64_t pb = -1, int64_t pr = -1) {
+// The POINTER form, for a caller whose tensor is not an Nchw of its own.
+//
+// arch=9's graph walk holds a tensor of ANY rank -- the recogniser's CTC head
+// is rank 3 and its attention block's products are rank 4 -- so its
+// convolutions read a rank-4 view of a tensor that is not one. Copying each
+// input into an Nchw to get at the same memory would be a megabyte of copy
+// per convolution, so the arithmetic takes the pointer and the extents
+// instead, and the Nchw version above forwards to it. ONE implementation, two
+// ways in.
+inline void im2col(const float *src, int64_t C, int64_t H, int64_t W,
+                   int64_t kh, int64_t kw, int64_t ph, int64_t pw, int64_t sh,
+                   int64_t sw, std::vector<float> &A, app::Pool &pool,
+                   int64_t pb = -1, int64_t pr = -1) {
   if (pb < 0) pb = ph;
   if (pr < 0) pr = pw;
-  const int64_t H = in.h, W = in.w, C = in.c, K = C * kh * kw;
   const int64_t OH = (H + ph + pb - kh) / sh + 1;
   const int64_t OW = (W + pw + pr - kw) / sw + 1;
   const int64_t M = OH * OW;
+  const int64_t K = C * kh * kw;
   if (M <= 0 || K <= 0) {
     A.clear();
     return;
@@ -385,12 +395,20 @@ inline void im2col(const Nchw &in, int64_t kh, int64_t kw, int64_t ph,
             if (sx < 0 || sx >= W) continue;
             for (int64_t c = 0; c < C; ++c)
               row[(c * kh + i) * kw + j] =
-                  in.chw(c)[static_cast<size_t>(sy) * W + sx];
+                  src[static_cast<size_t>(c) * H * W +
+                      static_cast<size_t>(sy) * W + sx];
           }
         }
       }
     }
   });
+}
+
+inline void im2col(const Nchw &in, int64_t kh, int64_t kw, int64_t ph,
+                    int64_t pw, int64_t sh, int64_t sw, std::vector<float> &A,
+                    app::Pool &pool, int64_t pb = -1, int64_t pr = -1) {
+  im2col(in.d.data(), in.c, in.h, in.w, kh, kw, ph, pw, sh, sw, A, pool, pb,
+         pr);
 }
 
 }  // namespace npue::hostconv

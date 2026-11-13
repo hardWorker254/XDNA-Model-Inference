@@ -198,8 +198,88 @@ Image warp_affine(const Image &src, const double m[6]) {
   return out;
 }
 
-Image crop(const Image &src, int64_t x0, int64_t y0, int64_t x1, int64_t y1) {
-  if (x0 < 0 || y0 < 0 || x1 <= x0 || y1 <= y0)
+// -- the perspective warp ------------------------------------------------------
+
+bool get_perspective_transform(const double src[8], const double dst[8],
+                               double m[9]) {
+  // The homography H maps (u, v) to
+  //
+  //     x = (a*u + b*v + c) / (g*u + h*v + 1)
+  //     y = (d*u + e*v + f) / (g*u + h*v + 1)
+  //
+  // and the eight unknowns come from the four point pairs, each of which
+  // gives two linear equations once the denominators are cleared.
+  double A[8][9];
+  for (int i = 0; i < 4; ++i) {
+    const double u = src[2 * i], v = src[2 * i + 1];
+    const double x = dst[2 * i], y = dst[2 * i + 1];
+    double *r0 = A[2 * i];
+    double *r1 = A[2 * i + 1];
+    for (int k = 0; k < 9; ++k) {
+      r0[k] = 0.0;
+      r1[k] = 0.0;
+    }
+    r0[0] = u; r0[1] = v; r0[2] = 1.0;
+    r0[6] = -u * x; r0[7] = -v * x; r0[8] = x;
+    r1[3] = u; r1[4] = v; r1[5] = 1.0;
+    r1[6] = -u * y; r1[7] = -v * y; r1[8] = y;
+  }
+  // GAUSSIAN ELIMINATION WITH PARTIAL PIVOTING. The matrix is 8x8 plus the
+  // right-hand side, and the pivots are found rather than assumed: a
+  // degenerate box -- three corners collinear, which a very thin rectangle
+  // is -- makes a pivot zero, and dividing by it is how a crop becomes a
+  // picture of NaNs.
+  for (int col = 0; col < 8; ++col) {
+    int piv = col;
+    for (int r = col + 1; r < 8; ++r)
+      if (std::fabs(A[r][col]) > std::fabs(A[piv][col])) piv = r;
+    if (std::fabs(A[piv][col]) < 1e-12) return false;
+    if (piv != col)
+      for (int k = col; k < 9; ++k) std::swap(A[col][k], A[piv][k]);
+    for (int r = 0; r < 8; ++r) {
+      if (r == col) continue;
+      const double f = A[r][col] / A[col][col];
+      if (f == 0.0) continue;
+      for (int k = col; k < 9; ++k) A[r][k] -= f * A[col][k];
+    }
+  }
+  m[0] = A[0][8] / A[0][0];
+  m[1] = A[1][8] / A[1][1];
+  m[2] = A[2][8] / A[2][2];
+  m[3] = A[3][8] / A[3][3];
+  m[4] = A[4][8] / A[4][4];
+  m[5] = A[5][8] / A[5][5];
+  m[6] = A[6][8] / A[6][6];
+  m[7] = A[7][8] / A[7][7];
+  m[8] = 1.0;
+  return true;
+}
+
+Image warp_perspective(const Image &src, const double m[9], int64_t dh,
+                        int64_t dw) {
+  if (src.empty())
+    throw std::runtime_error("warp_perspective: the image is empty");
+  Image out = like(dh, dw);
+  const double a = m[0], b = m[1], c = m[2];
+  const double d = m[3], e = m[4], f = m[5];
+  const double g = m[6], h = m[7];
+  for (int64_t y = 0; y < dh; ++y) {
+    for (int64_t x = 0; x < dw; ++x) {
+      const double den = g * x + h * y + 1.0;
+      if (den == 0.0) continue;
+      const double fx = (a * x + b * y + c) / den;
+      const double fy = (d * x + e * y + f) / den;
+      // BORDER_REPLICATE: the crop's corners reach outside the image when
+      // the box sits at the edge of the frame, and the border is the EDGE
+      // pixel rather than black. A black stripe across the first character
+      // is a character the recogniser cannot read.
+      blend_at(src, fy, fx, out.at(y, x));
+    }
+  }
+  return out;
+}
+
+Image crop(const Image &src, int64_t x0, int64_t y0, int64_t x1, int64_t y1) {  if (x0 < 0 || y0 < 0 || x1 <= x0 || y1 <= y0)
     throw std::runtime_error("crop: " + std::to_string(x0) + "," +
                              std::to_string(y0) + " to " + std::to_string(x1) +
                              "," + std::to_string(y1) +

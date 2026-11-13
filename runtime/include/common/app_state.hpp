@@ -229,7 +229,14 @@ inline bool encoder_implemented(const std::string &arch) {
          // models/mediapipe-pose/, while every table here globs models/*.npue, so
          // one fact hid the other and the missing rows hid the missing entries.
          arch == "mediapipe_hands_palm_ssd_lm_heatmap" ||
-         arch == "mediapipe_pose_det_ssd_lm_regress";
+         arch == "mediapipe_pose_det_ssd_lm_regress" ||
+         // arch=9, PaddleOCR: a text detector, a text recogniser and the
+         // character dictionary in ONE container. The same answer as arch=6
+         // for the first reason -- it is not an embedder, it takes pixels and
+         // returns TEXT -- and the same second reason: every convolution runs
+         // on the host by default, so the container runs as it stands and the
+         // array is an opt-in (`--npu-ops conv`), not a prerequisite.
+         arch == "paddleocr_db_svtr_ctc";
 }
 
 // True for a container this build runs through a mode of its own rather than
@@ -281,6 +288,18 @@ inline bool is_pose_arch(const std::string &arch) {
          arch == "mediapipe_pose_det_ssd_lm_regress";
 }
 
+// True for an OCR container's: arch=9. The fifth architecture in this tree
+// that owns a mode rather than a pipeline.
+//
+// It is NOT a pixel DETECTOR in the sense the predicate above uses -- it has
+// no keypoints and no skeleton -- but it IS a mode of its own, so the tables
+// that say which verb runs a container need it, and the row that would
+// otherwise print "no encoder" for a container that reads text perfectly well
+// is a lie of exactly the shape the whitelist above exists to prevent.
+inline bool is_ocr_arch(const std::string &arch) {
+  return arch == "paddleocr_db_svtr_ctc";
+}
+
 // The SUBCOMMAND for a non-embedder container, from the `kind` the container
 // itself states: "pose" | "hands" | "mppose" | "cls" | "stt". Empty for an
 // embedder, and empty for a kind this build has no verb for -- an empty answer
@@ -293,7 +312,13 @@ inline bool is_pose_arch(const std::string &arch) {
 // come with a new arch AND a new kind, and the two lists are kept apart so that
 // neither can be extended by accident.
 inline bool is_pixel_kind(const std::string &kind) {
-  return kind == "pose" || kind == "hands" || kind == "mppose";
+  // "ocr" is here for the same reason the other three are: the tables that
+  // print a row for a container need to know that this build has a VERB for
+  // it, and the note under the table says which one. It reads a pixel and
+  // returns a string rather than keypoints, but the question the table asks
+  // is the same.
+  return kind == "pose" || kind == "hands" || kind == "mppose" ||
+         kind == "ocr";
 }
 
 // True for a kind this build has a SUBCOMMAND for. An empty answer is a refusal
