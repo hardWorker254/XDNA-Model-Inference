@@ -308,6 +308,10 @@
     "mediapipe-pose": {
       "kind": "mppose",
       "datapath": "bf16"
+    },
+    "paddleocr-onnx": {
+      "kind": "ocr",
+      "datapath": "bf16"
     }
   },
   "kinds": {
@@ -407,6 +411,27 @@
         "conv1152x256"
       ],
       "note": "arch 8, mediapipe_pose_det_ssd_lm_regress. TWO graphs in one container -- a 93-node person detector and a 120-node pose-landmark network -- and the twenty-two `conv{K}x{N}` entries are the union of what their dense convolutions pad to, counted off the packed container rather than written by hand.\n\nThe padding is gemm_rtp/geometry.py's, and the raw count is worth stating next to the padded one: the 99 dense convolutions have 53 distinct RAW (K, N) pairs across the two graphs, of which K up to a multiple of tile_k = 64 and N up to a multiple of tile_n*cols = 128 leaves TWENTY-TWO -- fifteen from the detector and thirteen from the landmark network, which share four. That is more than pose's fourteen and more than hands' twelve, and it is the largest set in this file. It was also the only one of the three that no design set carried, which is what used to decide whether it was worth having -- see the third paragraph for what changed.\n\nA DESIGN SET CARRIES THIS LIST, and that is a CHANGE, not a formality: when this entry was written it said no design set did, and the reason the exporter could not build one was two bugs of its own (common/targets.py demanded a `hidden` width of a kind that has none, and resolve.py routed every non-pose kind to the ENCODER's four streams, so hands and mppose would have exported a set whose slots no convolution names). Both are fixed and runtime/artifacts/mediapipe-pose/artifacts_npu1/gemm_rtp/ carries the twenty-two streams now, verified against the packed container in both directions by tools/verify/verify_pose_streamset.py.\n\nWHAT THE ARRAY PATH COSTS HERE, because `honours` is a statement about where the work runs and not about whether it is worth running. On docs/bus.jpg with one person, `--npu-ops conv` takes 327 ms against the host's 137 ms -- 2.4x SLOWER -- in 447 dispatches. Of the array's 327 ms, 134 ms is the device's GEMM, 56 ms is repacking A into the design's padded stride and 24 ms is transposing C back, so the host shuffling around the dispatch costs more than the array saves. And the two paths do not agree to within a pixel: the bf16 panels move the detector's keypoints by 1.37 px, and since the crop's rotation is decided by two of those keypoints, that becomes a different 565 px rotated crop and landmarks up to 44 px from the host's (median 5.1 px). The OpenCV zoo, given the array path's own detection row, reproduces the array path's pose and not the host's, which is what establishes that the difference is the detector's bf16 noise amplified by the geometry rather than the array network being wrong. The registry cell carries all of it."
+    },
+    "ocr": {
+      "exporter": "export_gemm_rtp",
+      "streams": [
+        "conv64x128",
+        "conv64x256",
+        "conv64x384",
+        "conv128x128",
+        "conv128x256",
+        "conv128x512",
+        "conv256x128",
+        "conv256x256",
+        "conv256x512",
+        "conv384x128",
+        "conv512x128",
+        "conv512x512",
+        "conv896x128",
+        "conv1472x128",
+        "conv2880x128"
+      ],
+      "note": "arch 9, paddleocr_db_svtr_ctc. TWO graphs in one container -- a 154-node text detector and a 334-node text recogniser -- and the fifteen `conv{K}x{N}` entries are what their dense convolutions pad to, counted off the packed container rather than written by hand.\n\nTHE TWO GRAPHS SHARE THE SLOTS, and that is the difference from the two conv-only sets above: the detector runs once per frame and the recogniser once per box, on the same array, so a convolution shape both of them need is ONE slot and not two. The recogniser works on a 48-pixel-tall crop and the detector on a 960x960 frame, and the pairs they share are the small ones.\n\nTHE RAW COUNT is worth stating next to the padded one: the two graphs' 112 convolutions are 81 dense and 31 depthwise or transposed, and the dense ones have distinct RAW (K, N) pairs of which K up to a multiple of tile_k = 64 and N up to a multiple of tile_n*cols = 128 leaves fifteen. The widest is (2880, 128): the detector's head reads a 24-channel 960x960 map and writes a 1-channel one, and the 2880 is 45 tiles of 64.\n\nTHE DEPTHWISE CONVOLUTIONS STAY ON THE HOST, and that is not a choice the exporter makes but a consequence of what the array can do: a depthwise convolution is a per-channel filter and not a GEMM, and the two transposed convolutions at the head of the detector are a sum of SHIFTED contributions and not a matrix product either. The runtime says so in its own status block and dispatches the 81 dense ones."
     }
   }
 }

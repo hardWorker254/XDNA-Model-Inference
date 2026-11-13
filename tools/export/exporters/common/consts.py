@@ -178,7 +178,7 @@ STT_MODEL_KEYS = {"kind", "heads", "head_dim", "enc_layers", "dec_layers",
 # pairs. Registering the kind is what makes that cell exist and be visible; a
 # target absent from KNOWN_KINDS has no row in NPU_OPS.md at all, and a missing
 # row reads as nothing to report rather than as a blocked op.
-KNOWN_KINDS = {"gemm_rtp", "stt", "cls", "pose", "hands", "mppose"}
+KNOWN_KINDS = {"gemm_rtp", "stt", "cls", "pose", "hands", "mppose", "ocr"}
 
 # The kinds whose streams are GEMM PAIRS OF CONVOLUTIONS and which therefore have
 # no hidden width, no FFN and no fused qkv operand. Three of the six kinds are in
@@ -201,7 +201,7 @@ KNOWN_KINDS = {"gemm_rtp", "stt", "cls", "pose", "hands", "mppose"}
 # convolutions. The membership is checked against the stream sets that
 # geometry.py actually has, by verify_pose_streamset.py, so this list and that
 # one cannot drift apart silently.
-CONV_ONLY_KINDS = {"pose", "hands", "mppose"}
+CONV_ONLY_KINDS = {"pose", "hands", "mppose", "ocr"}
 
 DEFAULT_CACHE_ROOT = Path.home() / ".npu" / "cache"
 

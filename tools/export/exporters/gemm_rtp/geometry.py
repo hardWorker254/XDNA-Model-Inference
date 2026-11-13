@@ -279,6 +279,38 @@ MPPOSE_CONV_SHAPES: tuple[tuple[int, int], ...] = (
     (1152, 256),
 )
 
+# arch=9, paddleocr_db_svtr_ctc: FIFTEEN, counted off the packed container --
+# 81 dense convolutions across the detector's and the recogniser's 112
+# convolutions, and the fifteen padded pairs they share.
+#
+# THE TWO GRAPHS SHARE THE SLOTS, and that is the difference from the other
+# two sets: the detector and the recogniser are two networks that run at
+# different times on the same array, so a convolution shape that both of them
+# need is ONE slot and not two. The recogniser's own shapes are the small
+# ones -- a 48-pixel-tall crop -- and the detector's are the wide ones, and
+# the four they share are the ones both a 3x3 stem and a 1x1 head want.
+#
+# THE WIDEST PAIR IS (2880, 128), and it is the reason this set is the
+# farthest from the array of the four: a 2880-wide K is 45 tiles of 64, and
+# the detector's last 1x1 convolution writes 24 channels of a 960x960 map.
+OCR_CONV_SHAPES: tuple[tuple[int, int], ...] = (
+    (64, 128),
+    (64, 256),
+    (64, 384),
+    (128, 128),
+    (128, 256),
+    (128, 512),
+    (256, 128),
+    (256, 256),
+    (256, 512),
+    (384, 128),
+    (512, 128),
+    (512, 512),
+    (896, 128),
+    (1472, 128),
+    (2880, 128),
+)
+
 # One table so the three lists cannot be consulted in one place and missed in
 # another. Keyed by the `kind` in npu_targets.json, because that is the spelling
 # the caller uses, and it is what common/consts.CONV_ONLY_KINDS must equal.
@@ -286,6 +318,7 @@ CONV_ONLY_SHAPES: dict[str, tuple[tuple[int, int], ...]] = {
     "pose": POSE_CONV_SHAPES,
     "hands": HANDS_CONV_SHAPES,
     "mppose": MPPOSE_CONV_SHAPES,
+    "ocr": OCR_CONV_SHAPES,
 }
 
 # AND THE ASSERTION THAT MAKES THE IMPORT ABOVE MEAN SOMETHING. Two tables, two

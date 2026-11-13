@@ -495,7 +495,13 @@ class Tracer:
             return
 
         if t in ("MaxPool", "AveragePool"):
-            self._pool(n, t.lower())
+            # The op's name in the container is the RUNTIME's name, not
+            # ONNX's: "avgpool", and not "averagepool". The vocabulary above
+            # lists one spelling per op and the runtime walks exactly that
+            # list, so a second spelling here would be a name the runtime
+            # refuses -- with a message that says the container is from a
+            # different day, which it is not.
+            self._pool(n, "maxpool" if t == "MaxPool" else "avgpool")
             return
 
         if t == "GlobalAveragePool":
@@ -1695,6 +1701,38 @@ def pack_ocr(det_onnx, rec_onnx, dict_path, out_path, dry_run=False,
     the same reason arch=8 carries a person detector beside a pose net.
     """
     wdtype = conv_quant.conv_weight_dtype(dtype)
+    # THE QUANTISED DTYPES ARE REFUSED HERE, BY NAME, AND NOT BECAUSE THEY
+    # WOULD BE SLOW.
+    #
+    # The quantisation path stores a convolution's weight as an [N, K] VIEW --
+    # N output channels, K = Cin*kh*kw -- and the scale is per output channel.
+    # A TRANSPOSED convolution's weight is not in that view: ONNX lays it out as
+    # [Cin, Cout, kh, kw], the INPUT channels first, which is the opposite of
+    # a dense convolution's [Cout, Cin, kh, kw]. So the DB head's two
+    # upsampling convolutions would be quantised as if they had 24 output
+    # channels when they have one, and the scale sidecar would carry 24
+    # numbers for a 1-channel weight -- which the runtime refuses to load, by
+    # name, with a message about the scale count.
+    #
+    # Two ways out, and both are worse than refusing: quantising them against
+    # the transposed view would make the container's layout differ from the
+    # checkpoint's for two convolutions and every reader of it, and leaving
+    # them in f32 inside an int8 container would need a per-convolution dtype
+    # that the format does not have (one `conv_weight_dtype` for the whole
+    # container).
+    #
+    # So this says no. The FLOAT container is the one this architecture ships,
+    # and the reason is a layout, not a preference.
+    if wdtype in ("i8", "i4"):
+        _die(f"--dtype {wdtype} is not supported for an ocr pack. The "
+             "quantisation path stores a convolution's weight as an [N, K] view "
+             "with one scale per output channel, and the DB head's two "
+             "TRANSPOSED convolutions are laid out the other way round -- "
+             "[Cin, Cout, kh, kw], the input channels first -- so their scale "
+             "sidecar would carry 24 numbers for a 1-channel weight. The "
+             "float container is the one this architecture ships, and the "
+             "reason is the layout, not the precision: --dtype f32 (the "
+             "default) and --dtype bf16 both work.")
     if wdtype == "i4":
         if int4_group is not None and int(int4_group) < 0:
             _die(f"--int4-group {int4_group} is negative. 0 means one group over "

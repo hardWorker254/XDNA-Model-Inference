@@ -54,6 +54,10 @@ STREAM_SET_DIRS: dict[str, str] = {
     # kind cannot be added to geometry.py without also being exported.
     "hands": "gemm_rtp",
     "mppose": "gemm_rtp",
+    # arch=9 writes to `gemm_rtp` for the same reason and the same runtime
+    # lookup: runtime/src/ocr/session.cpp looks for
+    # `<artifacts>/gemm_rtp/design.json`.
+    "ocr": "gemm_rtp",
 }
 # Every conv-only kind exports to `gemm_rtp`, and the pair of tables above and in
 # geometry.py cannot disagree about WHICH kinds exist.

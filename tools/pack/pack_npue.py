@@ -2126,12 +2126,20 @@ def main():
     # tools/verify/verify_pose_streamset.py checks, and that this machine has no
     # aie.iron, so a NEW design set still cannot be exported here -- the panels
     # below are written for the set that exists.
+    # The OCR pack takes its three files EITHER as a directory (--ocr-onnx
+    # DIR) or one by one (--ocr-det/--ocr-rec/--ocr-dict), and the test below
+    # has to know about both spellings: a check that names only the
+    # directory form refuses a pack that names the three files, which is the
+    # other way of saying the same thing and is what the help text offers
+    # first.
     if args.npu and not (args.pose_onnx or args.mppose_onnx or
-                         args.hands_onnx or args.ocr_onnx):
+                         args.hands_onnx or args.ocr_onnx or
+                         args.ocr_det or args.ocr_rec or args.ocr_dict):
         raise SystemExit(
             "--npu stages the pre-tiled array panels, and only the pose, mppose, "
             "hands and ocr packers write them (--pose-onnx FILE, --mppose-onnx DIR, "
-            "--hands-onnx DIR, --ocr-onnx DIR). "
+            "--hands-onnx DIR, --ocr-onnx DIR, or the three --ocr-det/--ocr-rec/"
+            "--ocr-dict files). "
             "Every other architecture here "
             "targets the array by construction -- its containers carry no host "
             "path at all -- so on those this flag would be a no-op that looks "
@@ -2298,7 +2306,7 @@ def main():
                                       else pose_group_typed)
                           if dtype == "i4" else None)
 
-    if args.ocr_onnx:
+    if args.ocr_onnx or args.ocr_det or args.ocr_rec or args.ocr_dict:
         # THE THREE FILES, AND WHERE EACH OF THEM COMES FROM.
         #
         # The upstream repository is laid out as
@@ -2315,10 +2323,35 @@ def main():
         # So the search finds them and, if there is more than one candidate,
         # the error names the candidates and asks for the file. A directory
         # with exactly one of each needs no argument at all.
+        #
+        # THE THREE FLAGS ALSO STAND ALONE. They are the way to pack a pair
+        # that was fetched file by file -- which is what a checkout of the
+        # upstream repository is NOT, because it holds sixteen models -- and
+        # the help text says so. The branch used to require --ocr-onnx even
+        # when all three files were named, so a pack that named all three and
+        # no directory fell through to the NEXT architecture's branch and was
+        # packed as that one, with this architecture's files ignored.
         d = args.ocr_onnx
         det = args.ocr_det
         rec = args.ocr_rec
         dic = args.ocr_dict
+        if d is None:
+            # NO DIRECTORY AND NO FILE: there is nothing to pack, and saying
+            # so is better than looking for a checkpoint in the models tree
+            # and packing that.
+            if det is None and rec is None and dic is None:
+                raise SystemExit(
+                    "--ocr-det, --ocr-rec and --ocr-dict need at least one of "
+                    "them, or --ocr-onnx DIR to search.")
+            missing = [n for n, v in (("--ocr-det", det), ("--ocr-rec", rec),
+                                      ("--ocr-dict", dic)) if v is None]
+            if missing:
+                raise SystemExit(
+                    f"an ocr pack needs all three files -- the detector, the "
+                    f"recogniser and the dictionary -- and {missing} is not "
+                    f"named. The three are ONE MODEL: a detector finds text "
+                    f"and cannot read it, and a recogniser reads a crop and "
+                    f"cannot find one.")
         if det is None:
             cands = sorted(glob.glob(os.path.join(d, "detection", "*", "det.onnx")))
             if not cands:
