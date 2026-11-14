@@ -10,7 +10,7 @@
 //! Usage:
 //!   whisper_features <model.npum> <audio.wav>
 
-use npum_cpu::whisper;
+use npum_cpu::whisper_features;
 use std::path::Path;
 
 fn main() {
@@ -27,7 +27,7 @@ fn main() {
     let d_model = config.get_i64("d_model").expect("d_model") as usize;
     let n_mels = config.get_i64("num_mel_bins").expect("num_mel_bins") as usize;
 
-    let samples = match whisper::read_wav(audio) {
+    let samples = match whisper_features::read_wav(audio) {
         Ok(a) => a.samples,
         Err(e) => {
             eprintln!("{}", e.0);
@@ -36,7 +36,7 @@ fn main() {
     };
     println!("samples {} {}", samples.len(), to_hex(&samples));
 
-    let (mel, _used) = whisper::log_mel_30s(&samples, n_mels);
+    let (mel, _used) = whisper_features::log_mel_30s(&samples, n_mels);
     println!(
         "mel {} {} {}",
         mel.n_mels,
@@ -48,8 +48,8 @@ fn main() {
     let b1 = tensor_f32(&container, "frontend.conv1.bias");
     let w2 = tensor_f32(&container, "frontend.conv2.weight");
     let b2 = tensor_f32(&container, "frontend.conv2.bias");
-    let emb = whisper::conv_front_end(&mel, &w1, &b1, &w2, &b2, d_model);
-    println!("conv {} {} {}", whisper::ENCODER_POSITIONS, d_model, to_hex(&emb));
+    let emb = whisper_features::conv_front_end(&mel, &w1, &b1, &w2, &b2, d_model);
+    println!("conv {} {} {}", whisper_features::ENCODER_POSITIONS, d_model, to_hex(&emb));
 }
 
 /// A tensor's bytes, as f32.
