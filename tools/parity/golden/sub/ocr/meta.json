@@ -11,8 +11,9 @@
   "why": "the boxes, the text and the confidences",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:00",
+  "recorded_at": "2026-11-14T16:00:33",
   "rules": [
+    "field-padding",
     "timing-ms",
     "timing-s",
     "timing-split",

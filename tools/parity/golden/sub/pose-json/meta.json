@@ -12,8 +12,9 @@
   "why": "the object the server's /v1/pose returns",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:20:58",
+  "recorded_at": "2026-11-14T16:00:30",
   "rules": [
+    "field-padding",
     "timing-ms",
     "timing-s",
     "timings-json"

@@ -489,6 +489,8 @@ version = "0.1.0"
 dependencies = [
  "npum-format",
  "npum-model",
+ "npum-tokenizers",
+ "serde_json",
  "thiserror",
  "tracing",
 ]

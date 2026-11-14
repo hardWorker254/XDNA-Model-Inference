@@ -11,10 +11,12 @@
   "why": "liveness, and what the model accepts",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:02",
+  "recorded_at": "2026-11-14T16:00:34",
   "rules": [
+    "buffer-alignment",
     "container-extension",
     "container-extension-path",
-    "port"
+    "port",
+    "runtime-name"
   ]
 }

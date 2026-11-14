@@ -1,3 +1,3 @@
 [
-  {"image": "<FIXTURE>/bus.jpg", "label": 654, "name": "minibus", "p": 0.636255443, "front_end_s": 0.019683422, "encoder_s": 1.05818588, "head_s": 0.000494251, "dispatches": 0, "elt_dispatches": 0}
+  {"image": "<FIXTURE>/bus.jpg", "label": 654, "name": "minibus", "p": 0.636255443, "front_end_s": <MS>, "encoder_s": <MS>, "head_s": <MS>, "dispatches": 0, "elt_dispatches": 0}
 ]

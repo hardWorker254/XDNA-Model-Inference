@@ -13,6 +13,6 @@
   "why": "the generation is CARRIED into the design lookup, not defaulted: the refusal names `device npu3`, where a default would have named npu1 and a misspelling would have looked like a working command",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:01",
+  "recorded_at": "2026-11-14T16:00:33",
   "rules": []
 }

@@ -12,8 +12,9 @@
   "why": "the OpenAI-shaped object: the body the server also returns",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:20:54",
+  "recorded_at": "2026-11-14T16:00:24",
   "rules": [
+    "field-padding",
     "timing-s"
   ]
 }

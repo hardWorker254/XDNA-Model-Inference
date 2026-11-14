@@ -4,7 +4,7 @@
   !! To pin it:  npuembeddings add nomic-ai/nomic-embed-text-v1.5 <sha256>
 
   artifacts  <ROOT>/runtime/artifacts/nomic-embed-text-v1.5/artifacts_npu1 (picked from the container's geometry; no --artifacts given)
-NpuEmbeddings C++ runtime -- full encode
+NpuEmbeddings runtime -- full encode
   bo-mode    host_only (data-buffer allocation)
   model      nomic-embed-text-v1.5: 150 tensors, 548.54 MB, checkpoint 12ce232f57cfbc0a
   shape      nomic-ai/nomic-embed-text-v1.5: 12 layers, hidden 768, 12 heads x 64, ffn 3072, mean pooling
@@ -18,6 +18,6 @@ NpuEmbeddings C++ runtime -- full encode
   softm  softmax    on the HOST (fp32) -- 12 fewer NPU dispatches
   layn   LayerNorm  on the HOST (fp32) -- 25 fewer NPU dispatches
   attn   attention, as two GEMMs on the HOST (fp32) -- QK^T and softmax.V as host passes, no attn_qk/attn_av dispatches
-  bo-align   last data buffer aligned to 2097152 B (>= 2 MB)
+  bo-align   last data buffer aligned to <ALIGN> B (>= 2 MB)
   weights    0.00 MB staged on the device once, not per call
   pipeline   4 concurrent encodes of 16, one NPU mutex, 6 host threads per lane

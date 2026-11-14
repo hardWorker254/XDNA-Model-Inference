@@ -3,7 +3,7 @@
   "width": 810,
   "height": 1080,
   "letterbox": {"scale": 0.177777778, "pad_x": 135, "pad_y": 0},
-  "timings_ms": {"total": <MS>, "front_end": <MS>, "palm": 92.037, "nms": 0.346, "crop": <MS>, "landmarks": 61.450, "postprocess": 0.002},
+  "timings_ms": {"total": <MS>, "front_end": <MS>, "palm": 139.552, "nms": 0.611, "crop": <MS>, "landmarks": 84.341, "postprocess": 0.007},
   "detections": [
     {"score": 0.707924, "box": [252.263, 643.611, 284.255, 675.549], "keypoints": [[272.577, 647.902], [263.275, 664.714], [266.259, 665.184], [268.921, 665.683], [271.159, 666.427], [269.764, 651.924], [265.273, 658.317]]}
   ],

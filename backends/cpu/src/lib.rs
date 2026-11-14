@@ -13,32 +13,36 @@
 //!
 //! # The kernels
 //!
-//! `kernels.rs` holds the arithmetic. The rules it follows:
+//! `kernels.rs` holds the arithmetic, and it is a PORT of the C++ runtime's
+//! host kernels rather than a fresh implementation of the mathematics. The
+//! reasons are in `kernels.rs` itself; the short version is that the golden
+//! transcripts are a contract, and a contract is a number, not a shape.
 //!
-//! * **No FMA contraction.** Rust does not contract `a * b + c` into an FMA
-//!   by default, and the C++ host kernels did not either -- and the gate
-//!   `runtime/tests/test_int8_host_kernels.cpp` proved that the scalar
-//!   path and the AVX2 path agree bit for bit under exactly that rule. A
-//!   contraction would change the last bit of every dot product and every
-//!   tolerance measured against this backend would be measuring the wrong
-//!   thing.
+//! The rules the port follows:
 //!
-//! * **AVX2 and scalar must agree bit for bit.** They are two spellings of
-//!   the same arithmetic, and a difference between them is a bug in one of
-//!   them, not a rounding difference. The AVX2 path is an optimisation; the
-//!   scalar path is the definition.
+//! * **The FMA is explicit.** The C++'s AVX2 paths contract the multiply
+//!   and the add into ONE rounding, and `f32::mul_add` is the Rust spelling
+//!   of exactly that. A contraction the compiler does on its own is not
+//!   relied upon, because a compiler is free to stop doing it.
+//!
+//! * **The summation orders are the C++'s.** Floating-point addition is not
+//!   associative, so "sum the row" is not a function until the order is
+//!   named. The orders are named in `kernels.rs`.
 //!
 //! * **bf16 rounding is explicit.** Round-to-nearest-even, implemented here,
 //!   not taken from `std::bf16` until a gate has confirmed that the standard
 //!   library's semantics are the hardware's. The ties rule matters:
 //!   round-half-to-even and round-half-away differ on every exact .5.
 
+pub mod bert;
 pub mod kernels;
 
 use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 use npum_model::caps::Precision as CapsPrecision;
 
-pub use kernels::{gelu_f32, layernorm_f32, softmax_f32};
+pub use bert::BertModel;
+
+pub use kernels::{gelu_f32, layernorm_row, softmax_row};
 
 /// The CPU backend.
 pub struct CpuBackend {

@@ -11,10 +11,11 @@
   "why": "the speech endpoint's body",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:06",
+  "recorded_at": "2026-11-14T16:00:39",
   "rules": [
     "container-extension",
     "container-extension-path",
+    "field-padding",
     "port",
     "timing-s"
   ]

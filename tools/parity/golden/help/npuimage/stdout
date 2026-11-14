@@ -60,7 +60,7 @@ XDNA2/npu2; --dev selects the generation)
         splitting each onto its faster side measured <MS> ms -- <PCT>%.
         The status block prints both sides, per image.
         MEASURED on the CPU path, 640x640 input, i8: <MS> ms front end,
-        <MS> ms network of which <MS> ms is the GEMM, <MS> ms im2col, <MS> ms
+ <MS> ms network of which <MS> ms is the GEMM, <MS> ms im2col, <MS> ms
         the weight transpose and <MS> ms the output transpose, <MS> ms decode.
 
         The same model over HTTP: `npuimage serve <model>`, which

@@ -32,12 +32,14 @@
 //! * a pin that can never match is refused rather than stored;
 //! * a container of another family names the program that runs it.
 
+pub mod embed;
 pub mod families;
 pub mod flags;
 pub mod help;
 pub mod list;
 pub mod root;
 pub mod serve;
+pub mod status;
 
 use flags::{parse, Args, ParseError};
 use npum_families::registry::{owns, refuse_other_family, refuse_subcommand, ROSTER};

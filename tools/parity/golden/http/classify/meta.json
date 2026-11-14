@@ -11,8 +11,9 @@
   "why": "the classification endpoint's body, 1:1 with `classify --json`",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:04",
+  "recorded_at": "2026-11-14T16:00:38",
   "rules": [
+    "field-padding",
     "port",
     "timing-s"
   ]

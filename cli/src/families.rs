@@ -32,11 +32,16 @@ use std::path::{Path, PathBuf};
 pub type Outcome = i32;
 
 /// `embed`.
+///
+/// The vectors come from the CPU backend, and they are the C++'s vectors:
+/// the same container through the same arithmetic gives the same bytes, and
+/// `backends/cpu/tests/exact.rs` is the gate that says so.
 pub fn embed(args: &Args, root: &Path) -> Outcome {
     let Some((model, input)) = args.positional.first().zip(args.positional.get(1)) else {
         return crate::needs_a_model("embed");
     };
     let prefix = args.value("--prefix").map(|s| s.to_string());
+    let allow_truncation = args.switch("--allow-truncation");
     with_model(model, npum_families::Family::Embed, root, |path, arch| {
         if let Some(prefix) = prefix.as_deref() {
             if let Some(reason) = refuse_unknown_prefix(path, prefix) {
@@ -44,17 +49,28 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
                 return crate::EXIT_REFUSED;
             }
         }
-        let texts = match std::fs::read_to_string(input) {
+        let texts = match crate::embed::read_texts(input) {
             Ok(t) => t,
-            Err(e) => {
-                eprintln!("error: cannot read {input}: {e}");
+            Err(reason) => {
+                eprintln!("error: {reason}");
                 return crate::EXIT_REFUSED;
             }
         };
-        eprintln!("  model      {}: {}", path.display(), arch);
-        let n = texts.lines().filter(|l| !l.trim().is_empty()).count();
-        eprintln!("  inputs     {n} line(s)");
-        0
+        match crate::embed::run(
+            path,
+            arch,
+            &texts,
+            prefix.as_deref(),
+            crate::embed::wants_out_file(args).as_deref(),
+            allow_truncation,
+            root,
+        ) {
+            Ok(_) => 0,
+            Err(refusal) => {
+                eprintln!("error: {}", refusal.message);
+                refusal.code
+            }
+        }
     })
 }
 

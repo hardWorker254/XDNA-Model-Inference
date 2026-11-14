@@ -12,8 +12,10 @@
   "why": "the object the server's /v1/classify returns: the endpoint and the CLI must not drift",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:20:57",
+  "recorded_at": "2026-11-14T16:00:28",
   "rules": [
-    "timing-s"
+    "field-padding",
+    "timing-s",
+    "timings-json"
   ]
 }

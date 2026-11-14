@@ -1,5 +1,5 @@
   artifacts  <ROOT>/runtime/artifacts/all-MiniLM-L6-v2/artifacts_npu1 (picked from the container's geometry; no --artifacts given)
-NpuEmbeddings C++ runtime -- full encode
+NpuEmbeddings runtime -- full encode
   bo-mode    host_only (data-buffer allocation)
   model      all-MiniLM-L6-v2: 78 tensors, 90.23 MB, checkpoint 75ba77256ecf2dbf
   shape      sentence-transformers/all-MiniLM-L6-v2: 6 layers, hidden 384, 12 heads x 32, ffn 1536, mean pooling
@@ -13,7 +13,7 @@ NpuEmbeddings C++ runtime -- full encode
   softm  softmax    on the HOST (fp32) -- 6 fewer NPU dispatches
   layn   LayerNorm  on the HOST (fp32) -- 13 fewer NPU dispatches
   attn   attention, as two GEMMs on the HOST (fp32) -- QK^T and softmax.V as host passes, no attn_qk/attn_av dispatches
-  bo-align   last data buffer aligned to 4096 B
+  bo-align   last data buffer aligned to <ALIGN> B
   weights    0.00 MB staged on the device once, not per call
   pipeline   4 concurrent encodes of 16, one NPU mutex, 6 host threads per lane
   tokenizer  30522 tokens, from the .npum
@@ -21,21 +21,21 @@ NpuEmbeddings C++ runtime -- full encode
   embedded   4 texts in <S> s  ->  <RATE> seq/s
 
   time split (summed over 4 lanes; wall was <MS> ms)
-    gemm + epilogue             <MS> ms    <PCT>%
-      A upload (sync)           <MS> ms    <PCT>%
-      dispatch (wait)           <MS> ms    <PCT>%
-      C download                <MS> ms    <PCT>%
-    attention (all)             <MS> ms   <PCT>%
-      QK^T (of attention)       <MS> ms   <PCT>%
-      A*V (of attention)        <MS> ms   <PCT>%
-    host LayerNorm              <MS> ms   <PCT>%
-    host softmax                <MS> ms   <PCT>%
-    host GELU                   <MS> ms   <PCT>%
-    bias epilogue               <MS> ms    <PCT>%
-    t_npu                       <MS> ms   (whole attention block as counted by the NPU path)
-    busy                        <MS> ms   (sum of the rows above)
+    gemm + epilogue <MS> ms <PCT>%
+      A upload (sync) <MS> ms <PCT>%
+      dispatch (wait) <MS> ms <PCT>%
+      C download <MS> ms <PCT>%
+    attention (all) <MS> ms <PCT>%
+      QK^T (of attention) <MS> ms <PCT>%
+      A*V (of attention) <MS> ms <PCT>%
+    host LayerNorm <MS> ms <PCT>%
+    host softmax <MS> ms <PCT>%
+    host GELU <MS> ms <PCT>%
+    bias epilogue <MS> ms <PCT>%
+    t_npu <MS> ms   (whole attention block as counted by the NPU path)
+    busy <MS> ms   (sum of the rows above)
     dispatches                    0     (count, not a time)
-    busy / wall                <RATIO> x   (sum of passes / wall -- the pipelining achieved)
+    busy / wall <RATIO> x   (sum of passes / wall -- the pipelining achieved)
 
   [0] -0.0724 +0.0001 -0.0214 -0.0435 -0.0389 +0.1308 ...
   [1] +0.0122 +0.0324 +0.1048 +0.0001 -0.0272 +0.0266 ...

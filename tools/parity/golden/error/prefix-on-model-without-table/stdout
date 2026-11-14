@@ -1,5 +1,5 @@
   artifacts  <ROOT>/runtime/artifacts/all-MiniLM-L6-v2/artifacts_npu1 (picked from the container's geometry; no --artifacts given)
-NpuEmbeddings C++ runtime -- full encode
+NpuEmbeddings runtime -- full encode
   bo-mode    host_only (data-buffer allocation)
   model      all-MiniLM-L6-v2: 78 tensors, 90.23 MB, checkpoint 75ba77256ecf2dbf
   shape      sentence-transformers/all-MiniLM-L6-v2: 6 layers, hidden 384, 12 heads x 32, ffn 1536, mean pooling
@@ -13,6 +13,6 @@ NpuEmbeddings C++ runtime -- full encode
   softm  softmax    on the HOST (fp32) -- 6 fewer NPU dispatches
   layn   LayerNorm  on the HOST (fp32) -- 13 fewer NPU dispatches
   attn   attention, as two GEMMs on the HOST (fp32) -- QK^T and softmax.V as host passes, no attn_qk/attn_av dispatches
-  bo-align   last data buffer aligned to 4096 B
+  bo-align   last data buffer aligned to <ALIGN> B
   weights    0.00 MB staged on the device once, not per call
   pipeline   4 concurrent encodes of 16, one NPU mutex, 6 host threads per lane

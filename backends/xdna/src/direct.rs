@@ -87,7 +87,13 @@ pub fn read_generation() -> Option<Generation> {
         dev_type: DRM_AMDXDNA_INFO_DEVINFO,
         arg: (&mut device_info as *mut DeviceInfo) as u64,
     };
-    let rc = unsafe { libc_ioctl(file.as_raw_fd(), AMDXDNA_INFO, &mut info) };
+    let rc = unsafe {
+        libc_ioctl(
+            file.as_raw_fd(),
+            AMDXDNA_INFO,
+            &mut info as *mut Info as *mut std::ffi::c_void,
+        )
+    };
     if rc < 0 {
         return None;
     }

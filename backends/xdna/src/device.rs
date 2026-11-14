@@ -163,7 +163,7 @@ pub fn current_transport() -> Transport {
 fn read_generation_from_device() -> Option<Generation> {
     #[cfg(feature = "direct")]
     {
-        direct::read_generation()
+        crate::direct::read_generation()
     }
     #[cfg(not(feature = "direct"))]
     {

@@ -65,6 +65,18 @@ def _rule(name, pattern, replacement, why, streams=()):
 # path and leave `.npue` behind as a fragment of a replaced path.
 RULES: list[Rule] = [
     _rule(
+        "field-padding",
+        re.compile(r"  +(?=\d+(?:\.\d+)? (?:ms|s)\b|\d+\.\d+ ?%|\d+\.\d+(?= x\b))"),
+        " ",
+        "the padding of a fixed-width numeric field, in front of a DURATION, "
+        "a SHARE or a RATIO. The status block prints those with %8.1f and "
+        "%5.1f, so the padding depends on how many digits the value has -- "
+        "and the value is a measurement, which differs between two runs of "
+        "the same binary. The lookahead is what keeps this rule off the "
+        "aligned TABLES, whose columns are a contract of their own: a table "
+        "cell is padded too, and padding it here would flatten the table",
+    ),
+    _rule(
         "root",
         re.compile(r"(?m)^(\s*(?:Models \(root |root ))(/[^\s)]*)"),
         r"\1<ROOT>",
@@ -92,13 +104,17 @@ RULES: list[Rule] = [
         "a duration; it differs between two runs of the same binary. The "
         "integer form is here because a whole number of milliseconds is "
         "still a duration: 'wall was 132 ms' moves just as much as "
-        "'0.13 s' does",
+        "'0.13 s' does. TWO OR MORE SPACES in front of it are absorbed: the "
+        "status block prints its numbers with %8.1f, so the padding depends "
+        "on how many digits the value has, and the value is a measurement",
     ),
     _rule(
         "timing-s",
         re.compile(r"\b\d+\.\d+ s\b"),
         "<S> s",
-        "a duration; it differs between two runs of the same binary",
+        "a duration; it differs between two runs of the same binary. Two or "
+        "more spaces in front of it are absorbed, for the reason the "
+        "timing-ms rule gives",
     ),
     _rule(
         "timing-split",
@@ -108,10 +124,14 @@ RULES: list[Rule] = [
     ),
     _rule(
         "timings-json",
-        re.compile(r'("(?:total|front_end|detector|db|crop|recogniser|setup)"'
+        re.compile(r'("(?:total|front_end|front_end_s|encoder_s|head_s|'
+                   r'network|decode|detector|db|crop|recogniser|setup)"'
                    r':\s*)\d+\.\d+'),
         r"\1<MS>",
-        "the timings block of a JSON answer; same reason as timing-ms",
+        "the timings block of a JSON answer; same reason as timing-ms. The "
+        "key list is the WHOLE set of measured fields the answers carry: a "
+        "field that is a measurement and is not on the list is a golden that "
+        "cannot be reproduced by the binary that recorded it",
     ),
     _rule(
         "throughput",
@@ -125,14 +145,16 @@ RULES: list[Rule] = [
         re.compile(r"\b\d+\.\d+ ?%"),
         "<PCT>%",
         "a share of a duration; same reason as timing-ms, and it moves "
-        "whenever the durations it is a share of move",
+        "whenever the durations it is a share of move. Two or more spaces "
+        "in front of it are absorbed: %5.1f pads the share to a fixed width "
+        "and the padding depends on the value's digits",
     ),
     _rule(
         "ratio",
         re.compile(r"\b\d+\.\d+(?= x\b)"),
         "<RATIO>",
         "a ratio of two durations -- the pipelining achieved. Same reason as "
-        "timing-ms",
+        "timing-ms, padding included",
     ),
     _rule(
         "port",
@@ -146,6 +168,25 @@ RULES: list[Rule] = [
         re.compile(r"/tmp/[A-Za-z0-9._-]+"),
         "<TMP>",
         "a temporary path; the harness names one per run",
+    ),
+    _rule(
+        "buffer-alignment",
+        re.compile(r"(?m)(bo-align\s+last data buffer aligned to )\d+( B)"),
+        r"\1<ALIGN>\2",
+        "the alignment of a buffer's ADDRESS. It is not a number the runtime "
+        "computed about the model: it is where the allocator happened to put "
+        "a buffer, and the ORACLE'S OWN RUNS disagree with each other -- "
+        "4096, 8192, 16384 and 2097152 bytes for the same command, in the "
+        "same tree, on the same machine",
+    ),
+    _rule(
+        "runtime-name",
+        re.compile(r"(?m)^(NpuEmbeddings )(?:C\+\+|Rust) runtime"),
+        r"\1runtime",
+        "the implementation word in the runtime's own banner. The C++ tree "
+        "says 'C++ runtime' and this tree says 'Rust runtime', because a "
+        "runtime that calls itself C++ is lying about what it is. The word "
+        "names the implementation and not the contract",
     ),
     _rule(
         "pid",

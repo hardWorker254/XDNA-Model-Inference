@@ -12,6 +12,6 @@
   "why": "the removed flags are refused by name, with the replacement named; a stale command line must not look like it worked",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:00",
+  "recorded_at": "2026-11-14T16:00:33",
   "rules": []
 }

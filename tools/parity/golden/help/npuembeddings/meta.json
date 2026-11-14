@@ -9,7 +9,7 @@
   "why": "the help text names every flag and every verb this binary owns; a reader who typed the wrong binary learns it here",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:20:49",
+  "recorded_at": "2026-11-14T16:00:15",
   "rules": [
     "container-extension",
     "container-extension-path",

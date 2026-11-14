@@ -11,8 +11,9 @@
   "why": "the pose endpoint's body, 1:1 with `pose --json`",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:05",
+  "recorded_at": "2026-11-14T16:00:39",
   "rules": [
+    "field-padding",
     "port",
     "timing-s"
   ]

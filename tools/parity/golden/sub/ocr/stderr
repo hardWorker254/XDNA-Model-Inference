@@ -7,7 +7,7 @@ NpuEmbeddings -- ocr (PaddleOCR text det + rec) on the CPU
              24 x conv + 14 x dwconv    host  text recogniser, once per box
              2 x convtranspose          host  the DB head's two upsampling convolutions: a sum of SHIFTED contributions, not a GEMM
              db, ctc                    host  host-side by construction: a list of boxes and a string
-  setup      <S> s (both graphs read, weights transposed once)
-  <FIXTURE>/ocr_text.png 900x360  3 boxes -> 3 read  <MS> ms (front <MS> / det <MS> / db <MS> / crop <MS> / rec 658.4)
+  setup <S> s (both graphs read, weights transposed once)
+  <FIXTURE>/ocr_text.png 900x360  3 boxes -> 3 read <MS> ms (front <MS> / det <MS> / db <MS> / crop <MS> / rec 864.2)
              split  det: 57 convs on the host (<MS> ms: <MS> ms of GEMM, <MS> ms of transpose back), 15 dwconv + 2 convtranspose on the host (<MS> ms), im2col <MS> ms
              split  rec: 72 convs on the host (<MS> ms: <MS> ms of GEMM, <MS> ms of transpose back), 42 dwconv + 0 convtranspose on the host (<MS> ms), im2col <MS> ms

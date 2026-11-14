@@ -13,6 +13,6 @@
   "why": "a flag may follow the positional arguments: the output is truncated to 8 tokens and says how many lines were truncated",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:21:01",
+  "recorded_at": "2026-11-14T16:00:34",
   "rules": []
 }
