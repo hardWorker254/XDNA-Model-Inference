@@ -90,6 +90,51 @@ impl Family {
         }
     }
 
+    /// The refusal for a family this runtime does not run yet.
+    ///
+    /// The families arrive in the plan's order -- embed, stt, cls, pose,
+    /// hands, mppose, ocr -- and the ones that have not arrived yet say so
+    /// BY NAME instead of exiting 0 with nothing on the stdout. A run that
+    /// printed nothing and exited 0 is a lie about the answer: a script
+    /// would read it as "the model said nothing".
+    ///
+    /// `None` for the families that are here.
+    pub fn not_ported_refusal(self) -> Option<String> {
+        let needs = self.not_ported_reason()?;
+        Some(format!(
+            "the {} family is not ported yet. The container was recognised and \
+             routed to it, but {} are not in this runtime -- and exiting 0 with \
+             no answer would be a lie about the answer.",
+            self.as_str(),
+            needs
+        ))
+    }
+
+    /// What this family needs, for the refusal that says it is not here.
+    ///
+    /// The families arrive in the plan's order -- embed, stt, cls, pose,
+    /// hands, mppose, ocr -- and the ones that have not arrived yet say so
+    /// BY NAME instead of exiting 0 with nothing on the stdout. A run that
+    /// printed nothing and exited 0 is a lie about the answer: a script
+    /// would read it as "the model said nothing".
+    ///
+    /// `None` for the families that are here.
+    pub fn not_ported_reason(self) -> Option<&'static str> {
+        match self {
+            Family::Embed => None,
+            Family::Stt => {
+                Some("the mel front end, the encoder and the autoregressive decoder")
+            }
+            Family::Cls => {
+                Some("the image front end, the patch embedding and the classification head")
+            }
+            Family::Pose => Some("the YOLOv8n-pose network, the NMS and the keypoint decoding"),
+            Family::Hands => Some("the MediaPipe hand network and its decoding"),
+            Family::MpPose => Some("the MediaPipe pose network and its decoding"),
+            Family::Ocr => Some("the text detector, the recogniser and the box merging"),
+        }
+    }
+
     /// The family's arch string, as the container spells it.
     ///
     /// A container's arch names its family. `embed` is the default and covers
@@ -99,10 +144,14 @@ impl Family {
     pub fn from_arch(arch: &str) -> Option<Self> {
         match arch {
             "whisper_encdec_gelu" | "whisper_encdec" => Some(Family::Stt),
-            "vit_cls" | "vit" => Some(Family::Cls),
-            "yolov8_pose" | "pose" => Some(Family::Pose),
-            "mediapipe_hands" | "hands" => Some(Family::Hands),
-            "mediapipe_pose" | "mppose" => Some(Family::MpPose),
+            "vit_patch16_prenorm_gelu" | "vit_cls" | "vit" => Some(Family::Cls),
+            "yolov8_pose_c2f_silu_dfl" | "yolov8_pose" | "pose" => Some(Family::Pose),
+            "mediapipe_hands_palm_ssd_lm_heatmap" | "mediapipe_hands" | "hands" => {
+                Some(Family::Hands)
+            }
+            "mediapipe_pose_det_ssd_lm_regress" | "mediapipe_pose" | "mppose" => {
+                Some(Family::MpPose)
+            }
             "paddleocr_db_svtr_ctc" | "ocr" => Some(Family::Ocr),
             _ => Some(Family::Embed),
         }

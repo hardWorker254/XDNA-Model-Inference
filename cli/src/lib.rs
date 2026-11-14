@@ -40,6 +40,7 @@ pub mod list;
 pub mod root;
 pub mod serve;
 pub mod status;
+pub mod vit;
 
 use flags::{parse, Args, ParseError};
 use npum_families::registry::{owns, refuse_other_family, refuse_subcommand, ROSTER};

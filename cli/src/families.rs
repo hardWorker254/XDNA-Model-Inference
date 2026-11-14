@@ -140,6 +140,16 @@ fn warn_if_unpinned(name: &str) {
     println!();
 }
 
+/// The refusal for a family this runtime does not run yet.
+///
+/// The families arrive in the plan's order, and the ones that have not
+/// arrived say so BY NAME. Exiting 0 with nothing on the stdout would be
+/// a lie about the answer: a script would read it as "the model said
+/// nothing", and the model's answer is a sentence.
+fn refuse_not_ported(family: npum_families::Family) -> Option<String> {
+    family.not_ported_refusal()
+}
+
 /// The refusal for an operation this architecture does not have.
 ///
 /// The check lives in the FAMILY's path and not in the global gate,
@@ -271,6 +281,10 @@ pub fn transcribe(args: &Args, root: &Path) -> Outcome {
             return crate::EXIT_REFUSED;
         }
         eprintln!("  model      {}: {}", path.display(), arch);
+        if let Some(reason) = refuse_not_ported(npum_families::Family::Stt) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         0
     })
 }
@@ -285,7 +299,31 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        eprintln!("  model      {}: {}", path.display(), arch);
+        // The ViT's own block, on the stderr: the geometry, the design set,
+        // and where every operation runs.
+        let started = std::time::Instant::now();
+        let container = match npum_format::Container::open(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {}: {e}", path.display());
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let Some(geometry) = crate::vit::read_geometry(&container, path) else {
+            eprintln!(
+                "error: {}: the container does not carry the ViT's geometry",
+                path.display()
+            );
+            return crate::EXIT_REFUSED;
+        };
+        let designs = crate::vit::find_designs(root, &geometry.model_name)
+            .unwrap_or_else(|| root.join("runtime").join("artifacts").join(&geometry.model_name));
+        crate::vit::print_block(&geometry, &designs, started.elapsed().as_secs_f64());
+        if let Some(reason) = refuse_not_ported(npum_families::Family::Cls) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        let _ = arch;
         0
     })
 }
@@ -301,6 +339,10 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
             return crate::EXIT_REFUSED;
         }
         eprintln!("  model      {}: {}", path.display(), arch);
+        if let Some(reason) = refuse_not_ported(npum_families::Family::Pose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         0
     })
 }
@@ -316,6 +358,10 @@ pub fn hands(args: &Args, root: &Path) -> Outcome {
             return crate::EXIT_REFUSED;
         }
         eprintln!("  model      {}: {}", path.display(), arch);
+        if let Some(reason) = refuse_not_ported(npum_families::Family::Hands) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         0
     })
 }
@@ -331,6 +377,10 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
             return crate::EXIT_REFUSED;
         }
         eprintln!("  model      {}: {}", path.display(), arch);
+        if let Some(reason) = refuse_not_ported(npum_families::Family::MpPose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         0
     })
 }
@@ -346,6 +396,10 @@ pub fn ocr(args: &Args, root: &Path) -> Outcome {
             return crate::EXIT_REFUSED;
         }
         eprintln!("  model      {}: {}", path.display(), arch);
+        if let Some(reason) = refuse_not_ported(npum_families::Family::Ocr) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         0
     })
 }

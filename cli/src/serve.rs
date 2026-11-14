@@ -81,15 +81,54 @@ pub fn serve(
         return crate::EXIT_REFUSED;
     }
 
-    // The status block, the same one the CLI prints.
+    // The status block, the same one the CLI prints. Each family has its
+    // own: a BERT-shaped model and a ViT are not the same architecture
+    // and their blocks do not describe the same things.
+    match family {
+        npum_families::Family::Embed => {
+            let status = crate::status::read_container(&container, &path);
+            let artifacts = crate::embed::find_artifacts(root, &status.model_name);
+            let design = artifacts
+                .as_ref()
+                .and_then(|a| crate::status::read_design(a));
+            crate::status::print_block(
+                &status,
+                design.as_ref(),
+                artifacts.as_deref().unwrap_or(root),
+            );
+        }
+        npum_families::Family::Cls => {
+            let Some(geometry) = crate::vit::read_geometry(&container, &path) else {
+                eprintln!(
+                    "error: {}: the container does not carry the ViT's geometry",
+                    path.display()
+                );
+                return crate::EXIT_REFUSED;
+            };
+            let designs = crate::vit::find_designs(root, &geometry.model_name).unwrap_or_else(
+                || {
+                    root.join("runtime")
+                        .join("artifacts")
+                        .join(&geometry.model_name)
+                },
+            );
+            crate::vit::print_block(&geometry, &designs, 0.0);
+        }
+        _ => {
+            // The families whose block is not written yet refuse to start.
+            // A server that answered a request it cannot answer would be
+            // worse than one that says it is not here.
+            eprintln!(
+                "error: the {} family's status block is not ported yet, so this \
+                 server has nothing honest to say about itself.",
+                family.as_str()
+            );
+            return crate::EXIT_REFUSED;
+        }
+    }
     let status = crate::status::read_container(&container, &path);
-    let artifacts = crate::embed::find_artifacts(root, &status.model_name);
-    let design = artifacts
-        .as_ref()
-        .and_then(|a| crate::status::read_design(a));
-    crate::status::print_block(&status, design.as_ref(), artifacts.as_deref().unwrap_or(root));
 
-    let state = build_state(binary, &path, &arch, &container, &status, root);
+    let state = build_state(binary, &path, &arch, family, &container, &status, root);
     if let Some(encoder) = &state.encoder {
         crate::status::print_tokenizer(encoder.vocab_size());
     }
@@ -160,6 +199,7 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
             );
             println!("  POST multipart/form-data: file (required), model, language, task,");
             println!("              response_format (json | verbose_json | text)");
+            println!();
         }
         arch if arch.contains("vit") => {
             println!(
@@ -183,10 +223,10 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 state.encoder.as_ref().map(|e| e.seq()).unwrap_or(0)
             );
             println!("  POST {{\"input\": \"text\" | [\"a\",\"b\"], \"encoding_format\": \"float\"|\"base64\"}}");
+            println!();
         }
     }
     let _ = binary;
-    println!();
 }
 
 /// Build the server's state: the bodies and the engine.
@@ -194,19 +234,25 @@ fn build_state(
     binary: &'static str,
     path: &std::path::Path,
     arch: &str,
+    family: npum_families::Family,
     container: &npum_format::Container,
     status: &crate::status::Status,
     root: &std::path::Path,
 ) -> ServerState {
     let mut state = ServerState::new(&path.display().to_string(), arch, binary);
 
-    // The model id: the container's stem, and where the compute happened.
+    // The model id: the container's stem, and -- for the TEXT family only
+    // -- where the compute happened. The other families' ids are the bare
+    // stem, because that is what the C++'s servers use for them.
     let host_only = container.config_str("gemm_layout").unwrap_or("host") == "host";
-    state.model_id = format!(
-        "{}-{}",
-        status.model_name,
-        if host_only { "cpu" } else { "npu" }
-    );
+    state.model_id = match family {
+        npum_families::Family::Embed => format!(
+            "{}-{}",
+            status.model_name,
+            if host_only { "cpu" } else { "npu" }
+        ),
+        _ => status.model_name.clone(),
+    };
 
     // The backend: the device this process found.
     let generation = npum_xdna::device::Device::detect()

@@ -316,8 +316,12 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
 }
 
 /// `POST /v1/classify`.
+///
+/// The endpoint that needs the numbers refuses, because the numbers are
+/// not here yet: an answer that looked like a classification and was
+/// not one is worse than a 500 that says why.
 async fn classify(State(state): State<Shared>, mut multipart: Multipart) -> Response {
-    if state.encoder.is_none() && !state.arch.contains("vit") {
+    if !state.arch.contains("vit") {
         return not_found(&state, "/v1/classify");
     }
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -326,12 +330,19 @@ async fn classify(State(state): State<Shared>, mut multipart: Multipart) -> Resp
         }
     }
     json(
-        StatusCode::OK,
-        "{\"image\": \"\", \"people\": []}".to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        error_body(
+            "the classifier is not ported yet: the image front end, the patch \
+             embedding and the classification head are not in this runtime",
+            "not_implemented",
+        ),
     )
 }
 
 /// `POST /v1/pose`.
+///
+/// The endpoint that needs the numbers refuses, for the reason the
+/// classifier's does.
 async fn pose(State(state): State<Shared>, mut multipart: Multipart) -> Response {
     if !state.arch.contains("pose") && !state.arch.contains("mediapipe") {
         return not_found(&state, "/v1/pose");
@@ -341,7 +352,14 @@ async fn pose(State(state): State<Shared>, mut multipart: Multipart) -> Response
             break;
         }
     }
-    json(StatusCode::OK, "{\"image\": \"\", \"people\": []}".to_string())
+    json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        error_body(
+            "the pose detector is not ported yet: the network, the NMS and the \
+             keypoint decoding are not in this runtime",
+            "not_implemented",
+        ),
+    )
 }
 
 /// `POST /v1/audio/transcriptions`.
@@ -352,8 +370,12 @@ async fn transcriptions(State(state): State<Shared>, body: axum::body::Bytes) ->
     }
     let _ = body;
     json(
-        StatusCode::OK,
-        "{\"text\": \"\", \"segments\": [], \"language\": \"en\"}".to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        error_body(
+            "the transcription is not ported yet: the mel front end, the encoder \
+             and the autoregressive decoder are not in this runtime",
+            "not_implemented",
+        ),
     )
 }
 

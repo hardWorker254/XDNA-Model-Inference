@@ -86,6 +86,11 @@ impl Config {
     }
 
     /// One key, as a boolean.
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.get(key).and_then(|v| v.as_f64())
+    }
+
+    /// Whether a key is there at all.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         self.fields.get(key).and_then(|v| v.as_bool())
     }
