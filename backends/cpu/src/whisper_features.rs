@@ -89,12 +89,25 @@ pub struct Refusal(pub String);
 /// no visible way, which is the worst failure there is.
 pub fn read_wav(path: &Path) -> Result<Audio, Refusal> {
     let raw = std::fs::read(path).map_err(|e| Refusal(format!("cannot open {}: {e}", path.display())))?;
-    let p = &raw[..];
+    read_wav_bytes(&raw, &path.display().to_string())
+}
+
+/// Read a WAV out of BYTES.
+///
+/// The same reader, and the same refusals, as `read_wav` -- and it takes
+/// the bytes and not a path because a server's audio arrives as a form
+/// part, not as a file. Writing it to a temporary file only to read it
+/// back would put a path in the middle of a path that must not exist.
+///
+/// `name` is what the refusals name: the file's name for a file, and the
+/// upload's name for an upload.
+pub fn read_wav_bytes(raw: &[u8], name: &str) -> Result<Audio, Refusal> {
+    let p = raw;
     let n = raw.len();
     if n < 12 || &p[0..4] != b"RIFF" || &p[8..12] != b"WAVE" {
         return Err(Refusal(format!(
             "{}: not a RIFF/WAVE file. convert it: --convert (ffmpeg -f s16le -ar 16000 -ac 1)",
-            path.display()
+            name
         )));
     }
 
@@ -137,25 +150,25 @@ pub fn read_wav(path: &Path) -> Result<Audio, Refusal> {
     let (Some(data), true) = (data, have_fmt) else {
         return Err(Refusal(format!(
             "{}: no fmt /data chunk. it is not a usable PCM WAV; convert it: --convert",
-            path.display()
+            name
         )));
     };
     if !(format == 3 && bits == 32) && !(format == 1 && bits == 16) {
         return Err(Refusal(format!(
             "{}: format {format}, {bits} bits per sample (need 16-bit PCM or 32-bit float). convert it: --convert",
-            path.display()
+            name
         )));
     }
     if channels != 1 {
         return Err(Refusal(format!(
             "{}: {channels} channels. Whisper is 16 kHz MONO; downmix with --convert",
-            path.display()
+            name
         )));
     }
     if rate != SAMPLE_RATE as u32 {
         return Err(Refusal(format!(
             "{}: {rate} Hz. Whisper is 16 kHz; resample with --convert",
-            path.display()
+            name
         )));
     }
 

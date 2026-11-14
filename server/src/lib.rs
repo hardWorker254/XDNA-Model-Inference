@@ -32,12 +32,120 @@
 //! on a Whisper container gets a 404 that says which endpoint to use, and
 //! not a transcription.
 
+pub mod multipart;
 pub mod routes;
 
 use axum::Router;
 
 /// The result type of this crate.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The speech endpoint's engine.
+///
+/// The encoder, the decoder with its KV cache, the tokenizer and the front
+/// end's weights. The decoder is behind a lock because it holds state --
+/// the cache and the "first generated step" counter the decoding policy is
+/// keyed on -- and two requests must not share it: a request that fed its
+/// tokens into another request's cache would answer with the other
+/// request's words.
+///
+/// The work is the CPU backend's and the numbers are the C++'s numbers: the
+/// same container through the same arithmetic gives the same bytes.
+pub struct Transcriber {
+    encoder: npum_cpu::whisper::Encoder,
+    decoder: std::sync::Mutex<npum_cpu::whisper::Decoder>,
+    tokenizer: npum_cpu::whisper_tokenizer::Tokenizer,
+    weights: npum_cpu::whisper_session::FrontEndWeights,
+    options: npum_cpu::whisper_session::Options,
+}
+
+impl Transcriber {
+    /// Build an engine from a container.
+    pub fn open(
+        path: &std::path::Path,
+        options: npum_cpu::whisper_session::Options,
+    ) -> std::result::Result<Self, String> {
+        let container = npum_format::Container::open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let encoder = npum_cpu::whisper::Encoder::open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let decoder = npum_cpu::whisper::Decoder::open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let table = container
+            .tensor_bytes("tokenizer.whisper_table")
+            .map_err(|_| format!("{}: the container holds no tokenizer table", path.display()))?;
+        let tokenizer = npum_cpu::whisper_tokenizer::Tokenizer::from_table(table)?;
+        let weights = npum_cpu::whisper_session::FrontEndWeights {
+            conv1_weight: tensor_f32(&container, "frontend.conv1.weight")?,
+            conv1_bias: tensor_f32(&container, "frontend.conv1.bias")?,
+            conv2_weight: tensor_f32(&container, "frontend.conv2.weight")?,
+            conv2_bias: tensor_f32(&container, "frontend.conv2.bias")?,
+        };
+        Ok(Self {
+            encoder,
+            decoder: std::sync::Mutex::new(decoder),
+            tokenizer,
+            weights,
+            options,
+        })
+    }
+
+    /// The vocabulary's size.
+    pub fn vocab_size(&self) -> usize {
+        self.tokenizer.len()
+    }
+
+    /// The encoder's position count.
+    pub fn positions(&self) -> usize {
+        self.encoder.geometry().max_seq
+    }
+
+    /// How many mel bands.
+    pub fn mel_bins(&self) -> usize {
+        self.encoder.geometry().mel_bins
+    }
+
+    /// Transcribe the audio in a WAV file's BYTES.
+    ///
+    /// The name is what the refusals name: the upload's name, so a client
+    /// that sent the wrong file is told which file.
+    pub fn transcribe_bytes(
+        &self,
+        audio: &[u8],
+        name: &str,
+        options: &npum_cpu::whisper_session::Options,
+    ) -> std::result::Result<npum_cpu::whisper_session::Transcript, String> {
+        let read = npum_cpu::whisper_features::read_wav_bytes(audio, name).map_err(|r| r.0)?;
+        let mut decoder = self
+            .decoder
+            .lock()
+            .map_err(|_| "the decoder's state is poisoned".to_string())?;
+        npum_cpu::whisper_session::transcribe_samples(
+            &self.encoder,
+            &mut decoder,
+            &self.tokenizer,
+            &read.samples,
+            options,
+            &self.weights,
+        )
+    }
+
+    /// The options this engine runs with by default.
+    pub fn options(&self) -> &npum_cpu::whisper_session::Options {
+        &self.options
+    }
+}
+
+/// A tensor's values.
+fn tensor_f32(container: &npum_format::Container, name: &str) -> std::result::Result<Vec<f32>, String> {
+    let bytes = container
+        .tensor_bytes(name)
+        .map_err(|_| format!("the container holds no tensor named {name}"))?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
 
 /// The embedding endpoint's engine.
 ///

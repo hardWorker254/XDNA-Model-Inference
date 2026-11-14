@@ -276,6 +276,91 @@ fn row(name: &str, place: &str, why: &str) {
     eprintln!("             {name:<26} {place:<5} {why}");
 }
 
+/// The lines that follow the ops table: the setup, the language, the task
+/// and the windowing.
+///
+/// They are the same in the CLI and in the server: a server that described
+/// its windows differently from the command line would be two runtimes
+/// wearing one name.
+///
+/// The `chunks` and the `time` lines are NOT here: they need a request,
+/// and the CLI's are printed after the work.
+pub fn print_schedule(
+    setup_s: f64,
+    options: &npum_cpu::whisper_session::Options,
+    language_given: bool,
+) {
+    // The wording is the C++'s, and the C++'s line names what the C++'s
+    // setup did: it opened the device, loaded two design sets and staged the
+    // weights on it. This runtime reads the design sets and the weights and
+    // runs the arithmetic on the host, so the numbers are the host's.
+    eprintln!("  setup      {setup_s:.2} s (device, two design sets, weights staged on it)");
+    eprintln!(
+        "  language   {}{}",
+        options.language,
+        if language_given {
+            ""
+        } else {
+            "   ASSUMED: this build does not detect languages, so --language defaults to en and says so here"
+        }
+    );
+    eprintln!("  task       {}", options.task);
+    // The step between window starts is printed only when it is a real
+    // step: `--chunk-seconds 5 --stride-seconds 5` is two strides across
+    // one window, and a status block that printed "windows start -5 s
+    // apart" before the refusal landed is a line nobody can act on.
+    let step_s = options.chunk_seconds - 2 * options.stride_seconds;
+    if step_s > 0 {
+        eprintln!(
+            "  long form  {} s windows, {} s stride each side, so windows start {} s apart",
+            options.chunk_seconds, options.stride_seconds, step_s
+        );
+    } else {
+        eprintln!(
+            "  long form  {} s windows, {} s stride each side",
+            options.chunk_seconds, options.stride_seconds
+        );
+    }
+}
+
+/// The context budget, checked BEFORE anything is built.
+///
+/// Two design sets are the floor, and every elementwise op on the array is
+/// one more xclbin and one more hw_context: the npu1 driver measured six,
+/// so a run that asks for four elementwise ops on top of the two GEMM sets
+/// cannot be served and has to be told so while there is still nothing to
+/// unwind.
+///
+/// False when the run must not go on.
+pub fn check_context_budget(args: &crate::flags::Args) -> bool {
+    let allow_contention = args.switch("--allow-contention");
+    let report = npum_xdna::contention::survey_contexts();
+    if npum_xdna::contention::require_context_budget(&report, 2, allow_contention) {
+        return true;
+    }
+    eprintln!("error: NPU context budget: refusing to load 2 concurrent hw_context(s) -- see the report above (close the other process, or pass --allow-contention)");
+    false
+}
+
+/// The options one request runs with, from the command line.
+///
+/// The defaults are the C++'s: English, transcribe, 30 s windows with a 5 s
+/// stride on each side.
+pub fn options_from(args: &crate::flags::Args) -> npum_cpu::whisper_session::Options {
+    let default = npum_cpu::whisper_session::Options::default();
+    npum_cpu::whisper_session::Options {
+        language: args.value("--language").unwrap_or("en").to_string(),
+        task: args.value("--task").unwrap_or("transcribe").to_string(),
+        chunk_seconds: args
+            .value_i64("--chunk-seconds")
+            .unwrap_or(default.chunk_seconds),
+        stride_seconds: args
+            .value_i64("--stride-seconds")
+            .unwrap_or(default.stride_seconds),
+        max_new: args.value_i64("--max-new-tokens").unwrap_or(0).max(0) as usize,
+    }
+}
+
 /// The design set's directory for a model, if there is one.
 ///
 /// A speech model needs TWO sets -- `gemm_rtp` for the encoder stack and
@@ -316,10 +401,7 @@ pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> 
     // a run that asks for four elementwise ops on top of the two GEMM sets
     // cannot be served and has to be told so while there is still nothing
     // to unwind.
-    let allow_contention = args.switch("--allow-contention");
-    let report = npum_xdna::contention::survey_contexts();
-    if !npum_xdna::contention::require_context_budget(&report, 2, allow_contention) {
-        eprintln!("error: NPU context budget: refusing to load 2 concurrent hw_context(s) -- see the report above (close the other process, or pass --allow-contention)");
+    if !check_context_budget(args) {
         return crate::EXIT_REFUSED;
     }
 
@@ -404,50 +486,9 @@ pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> 
     let setup_s = started.elapsed().as_secs_f64();
 
     print_block(&geometry, &designs, encoder_design.as_ref(), decoder_design.as_ref());
-    // The wording is the C++'s, and the C++'s line names what the C++'s
-    // setup did: it opened the device, loaded two design sets and staged the
-    // weights on it. This runtime reads the design sets and the weights and
-    // runs the arithmetic on the host, so the numbers are the host's.
-    eprintln!("  setup      {setup_s:.2} s (device, two design sets, weights staged on it)");
 
-    let language = args.value("--language").unwrap_or("en").to_string();
-    let task = args.value("--task").unwrap_or("transcribe").to_string();
-    let options = npum_cpu::whisper_session::Options {
-        language: language.clone(),
-        task: task.clone(),
-        chunk_seconds: args
-            .value_i64("--chunk-seconds")
-            .unwrap_or(npum_cpu::whisper_session::Options::default().chunk_seconds),
-        stride_seconds: args
-            .value_i64("--stride-seconds")
-            .unwrap_or(npum_cpu::whisper_session::Options::default().stride_seconds),
-        max_new: args.value_i64("--max-new-tokens").unwrap_or(0).max(0) as usize,
-    };
-    eprintln!(
-        "  language   {language}{}",
-        if args.value("--language").is_some() {
-            ""
-        } else {
-            "   ASSUMED: this build does not detect languages, so --language defaults to en and says so here"
-        }
-    );
-    eprintln!("  task       {task}");
-    // The step between window starts is printed only when it is a real
-    // step: `--chunk-seconds 5 --stride-seconds 5` is two strides across
-    // one window, and a status block that printed "windows start -5 s
-    // apart" before the refusal landed is a line nobody can act on.
-    let step_s = options.chunk_seconds - 2 * options.stride_seconds;
-    if step_s > 0 {
-        eprintln!(
-            "  long form  {} s windows, {} s stride each side, so windows start {} s apart",
-            options.chunk_seconds, options.stride_seconds, step_s
-        );
-    } else {
-        eprintln!(
-            "  long form  {} s windows, {} s stride each side",
-            options.chunk_seconds, options.stride_seconds
-        );
-    }
+    let options = options_from(args);
+    print_schedule(setup_s, &options, args.value("--language").is_some());
 
     let samples = match npum_cpu::whisper_features::read_wav(Path::new(audio)) {
         Ok(a) => a.samples,
@@ -503,39 +544,10 @@ pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> 
 
 /// The OpenAI-shaped answer, the same object the server returns.
 ///
-/// `verbose` adds the task, the language, the duration, the chunk count
-/// and the segments.
+/// The server's own function: the CLI and the server must not drift, and
+/// two implementations of one JSON shape is how they drift.
 pub fn transcript_json(t: &npum_cpu::whisper_session::Transcript, verbose: bool) -> String {
-    let mut out = format!("{{\"text\":\"{}\"", npuembeddings_server::routes::json_escape(&t.text));
-    if verbose {
-        out.push_str(&format!(",\"task\":\"{}\"", npuembeddings_server::routes::json_escape(&t.task)));
-        out.push_str(&format!(
-            ",\"language\":\"{}\"",
-            npuembeddings_server::routes::json_escape(&t.language)
-        ));
-        out.push_str(&format!(
-            ",\"duration\":{:.3}",
-            t.n_samples as f64 / npum_cpu::whisper_session::SAMPLE_RATE as f64
-        ));
-        out.push_str(&format!(",\"chunks\":{}", t.n_chunks));
-        out.push_str(",\"segments\":[");
-        for (i, segment) in t.segments.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
-                "{{\"id\":{},\"seek\":{},\"start\":{:.2},\"end\":{:.2},\"text\":\"{}\"}}",
-                i,
-                segment.start_sample,
-                segment.start_s,
-                segment.end_s,
-                npuembeddings_server::routes::json_escape(&segment.text)
-            ));
-        }
-        out.push(']');
-    }
-    out.push('}');
-    out
+    npuembeddings_server::routes::transcript_json(t, verbose)
 }
 
 /// A tensor's values.

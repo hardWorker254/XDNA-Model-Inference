@@ -36,6 +36,7 @@ pub fn serve(
     port: u16,
     bind: &str,
     root: &std::path::Path,
+    args: &crate::flags::Args,
 ) -> i32 {
     let path = match resolve_model(model, root) {
         Some(p) => p,
@@ -84,6 +85,11 @@ pub fn serve(
     // The status block, the same one the CLI prints. Each family has its
     // own: a BERT-shaped model and a ViT are not the same architecture
     // and their blocks do not describe the same things.
+    //
+    // The speech family's engine is built HERE, inside the block's own
+    // branch, because the block reports the setup time and the setup is
+    // the engine's construction.
+    let mut speech: Option<npuembeddings_server::Transcriber> = None;
     match family {
         npum_families::Family::Embed => {
             let status = crate::status::read_container(&container, &path);
@@ -114,6 +120,52 @@ pub fn serve(
             );
             crate::vit::print_block(&geometry, &designs, 0.0);
         }
+        npum_families::Family::Stt => {
+            // The context budget, BEFORE the session builds anything, and the
+            // block the CLI prints: a server that described itself
+            // differently from the command line would be two runtimes
+            // wearing one name.
+            if !crate::stt::check_context_budget(args) {
+                return crate::EXIT_REFUSED;
+            }
+            let Some(geometry) = crate::stt::read_geometry(&container, &path) else {
+                eprintln!(
+                    "error: {}: the container does not carry the speech family's geometry",
+                    path.display()
+                );
+                return crate::EXIT_REFUSED;
+            };
+            let designs = crate::stt::find_designs(root, &geometry.model_name).unwrap_or_else(
+                || {
+                    root.join("runtime")
+                        .join("artifacts")
+                        .join(&geometry.model_name)
+                },
+            );
+            let encoder_design = crate::stt::read_design(&designs, false);
+            let decoder_design = crate::stt::read_design(&designs, true);
+            let started = std::time::Instant::now();
+            let transcriber = match npuembeddings_server::Transcriber::open(
+                &path,
+                crate::stt::options_from(args),
+            ) {
+                Ok(t) => t,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let setup_s = started.elapsed().as_secs_f64();
+            crate::stt::print_block(
+                &geometry,
+                &designs,
+                encoder_design.as_ref(),
+                decoder_design.as_ref(),
+            );
+            let options = crate::stt::options_from(args);
+            crate::stt::print_schedule(setup_s, &options, args.value("--language").is_some());
+            speech = Some(transcriber);
+        }
         _ => {
             // The families whose block is not written yet refuse to start.
             // A server that answered a request it cannot answer would be
@@ -128,9 +180,20 @@ pub fn serve(
     }
     let status = crate::status::read_container(&container, &path);
 
-    let state = build_state(binary, &path, &arch, family, &container, &status, root);
+    let mut state = build_state(binary, &path, &arch, family, &container, &status, root);
     if let Some(encoder) = &state.encoder {
         crate::status::print_tokenizer(encoder.vocab_size());
+    }
+    if let Some(transcriber) = speech {
+        // The speech family's own line, and its own word: the C++'s server
+        // says "ids" here and the embed server says "tokens", because a
+        // Whisper's vocabulary is a BPE's entries and a BERT's is a word
+        // piece's.
+        println!(
+            "  tokenizer  {} ids, from the .npum",
+            transcriber.vocab_size()
+        );
+        state.transcriber = Some(std::sync::Arc::new(transcriber));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -199,6 +262,17 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
             );
             println!("  POST multipart/form-data: file (required), model, language, task,");
             println!("              response_format (json | verbose_json | text)");
+            // The shape of the work, so a client knows what it is asking
+            // for: how many mel bands the front end produces and how many
+            // encoder positions a window becomes.
+            let (mel_bins, positions) = state
+                .transcriber
+                .as_ref()
+                .map(|t| (t.mel_bins(), t.positions()))
+                .unwrap_or((0, 0));
+            println!(
+                "  {mel_bins} mel bins, {positions} encoder positions, greedy, temperature 0, no timestamps"
+            );
             println!();
         }
         arch if arch.contains("vit") => {

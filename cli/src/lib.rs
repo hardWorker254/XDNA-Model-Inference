@@ -220,7 +220,7 @@ fn run_serve(binary: &'static str, args: &Args, argv: &[String], root: &PathBuf)
         .value("--bind")
         .map(|s| s.to_string())
         .unwrap_or(bind);
-    serve::serve(binary, model, port, &bind, root)
+    serve::serve(binary, model, port, &bind, root, args)
 }
 
 /// The refusal for a container of another family, re-exported for the
