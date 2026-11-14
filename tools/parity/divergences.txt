@@ -32,3 +32,11 @@ sub/add: the C++ runtime ABORTS inside glibc ("invalid stdio handle") when
          the network path runs on this machine, and the Rust runtime refuses
          cleanly instead. A crash is not a contract: it says what the process
          did, not what the runtime means.
+
+sub/list: the C++ runtime's `list` IGNORES `--root` and reports the tree its
+          own binary lives in; the Rust runtime honours it. The case still
+          compares equal -- the oracle's default root holds the same
+          containers as the fixture root -- but the two runtimes would answer
+          differently the moment the two trees held different models, and
+          the one that says what is installed must say what is installed
+          WHERE THE READER IS.

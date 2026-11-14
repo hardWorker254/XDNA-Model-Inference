@@ -70,6 +70,17 @@ impl Unigram {
         self.pieces.get(id as usize)
     }
 
+    /// The id of a piece, by its text.
+    ///
+    /// The lookup is by EXACT text, and that is what a unigram vocabulary
+    /// is for: the pieces are the strings, and the probabilities decide how
+    /// the string is cut. A lookup that normalised the text first would be
+    /// answering a different question -- the one the normalisation step
+    /// already answered, before this one is reached.
+    pub fn id_of(&self, text: &str) -> Option<u32> {
+        self.by_text.get(text).copied()
+    }
+
     /// Step 1: the grapheme-aware normalisation.
     ///
     /// The classifier branches on the general category, and the tables say

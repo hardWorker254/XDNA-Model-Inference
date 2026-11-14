@@ -468,7 +468,16 @@ pub fn fft(x: &Tensor, out: &mut Tensor) -> Result<()> {
             re += v * angle.cos();
             im += v * angle.sin();
         }
-        result[k] = re;
+        // The MAGNITUDE, and not the real part.
+        //
+        // The caller is the mel filter bank, and it multiplies the POWER
+        // spectrum by the triangular filters -- so it needs the size of each
+        // bin's coefficient, and the real part alone would be the answer to
+        // a question nobody asked. An earlier version of this function
+        // computed the imaginary part and threw it away, which is the kind
+        // of thing that looks fine until the numbers come out half as big
+        // as they should.
+        result[k] = (re * re + im * im).sqrt();
     }
     let mut bytes = Vec::with_capacity(result.len() * 4);
     for v in &result {
