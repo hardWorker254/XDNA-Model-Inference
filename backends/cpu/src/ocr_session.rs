@@ -21,6 +21,19 @@ use npum_format::Container;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// How many threads the host convolutions are split over.
+///
+/// The machine's own count, asked rather than assumed: the oracle's OCR
+/// takes a `--threads` flag and defaults to sixteen, and the two split the
+/// work the same way -- the GEMM over rows, the depthwise convolutions over
+/// channels, the im2col over output rows. None of those splits crosses a
+/// reduction, so the answer does not depend on how many threads there are.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 /// The OCR model: both graphs, read out of one container.
 pub struct Ocr {
     /// The container's geometry.
@@ -41,11 +54,13 @@ impl Ocr {
             geometry.det_graph.clone(),
             geometry.det_convs.clone(),
             geometry.consts.clone(),
+            default_threads(),
         );
         let rec = Network::new(
             geometry.rec_graph.clone(),
             geometry.rec_convs.clone(),
             geometry.consts.clone(),
+            default_threads(),
         );
         Ok(Ocr {
             geometry,

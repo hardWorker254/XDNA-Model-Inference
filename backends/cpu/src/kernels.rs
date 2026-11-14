@@ -517,7 +517,69 @@ pub fn gemm_nt(
     gemm_nt_dispatch(a, m, b, k, n, bias, out)
 }
 
+/// The work below which the threads are not worth their barrier.
+///
+/// The oracle's own number, from `par_items`: 65 536 elements. The oracle's
+/// pool keeps its workers awake between calls, so its barrier is a
+/// condition variable; this runtime spawns threads, and a spawn costs about
+/// as much as a small convolution. Below the threshold the answer is the
+/// same either way -- the split crosses no reduction -- so the cheap way
+/// wins.
+pub const PAR_MIN_ITEMS: i64 = 65_536;
+
+/// The GEMM over ROW RANGES, one per thread.
+///
+/// Each output row is one im2col row times the weight matrix, and a row's
+/// accumulation is over `k` in order -- so splitting ROWS changes which
+/// thread computes a value and never the value itself. That is what makes
+/// the threads free: the split is bit-exact by construction, and a
+/// comparison against the oracle does not have to know how many cores the
+/// machine has.
+///
+/// # WHY THE ORACLE HAS IT AND THIS USED NOT TO
+///
+/// The oracle's `gemm_nt` splits the rows over a pool of one worker per
+/// core, and the text detector's GEMM is 1.2 BILLION multiply-adds: one
+/// thread does that in seconds and sixteen do it in a tenth of the time.
+/// The detector's four heaviest convolutions are 90% of the cost, so this
+/// is the difference between a detector that takes two seconds and one that
+/// takes two hundred milliseconds.
+pub fn gemm_nt_rows(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) {
+    let threads = threads.min(m.max(1)).max(1);
+    let work = (m as i64) * (k as i64) * (n as i64);
+    if threads <= 1 || m == 0 || work < PAR_MIN_ITEMS {
+        gemm_nt(a, m, b, k, n, bias, out);
+        return;
+    }
+    let chunk = m.div_ceil(threads);
+    let parts: Vec<&mut [f32]> = out.chunks_mut(chunk * n).collect();
+    std::thread::scope(|s| {
+        for (ci, part) in parts.into_iter().enumerate() {
+            let rows = part.len() / n;
+            if rows == 0 {
+                continue;
+            }
+            let a_part = &a[ci * chunk * k..(ci * chunk + rows) * k];
+            s.spawn(move || gemm_nt(a_part, rows, b, k, n, bias, part));
+        }
+    });
+}
+
 /// The GEMM body, written once and shared by both builds.
+///
+/// This is the REFERENCE: one output element at a time, one fused
+/// multiply-add per reduction step, in order, with the accumulator in
+/// memory. Every vector path below computes exactly this sequence per
+/// element and differs only in how many elements it does at once.
 #[inline(always)]
 fn gemm_nt_impl(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32], out: &mut [f32]) {
     let mut acc = vec![0.0f32; n];
@@ -538,13 +600,27 @@ fn gemm_nt_impl(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32]
     }
 }
 
-/// The dispatch: the fastest ISA this host has.
+/// The dispatch: the fastest ISA this host has, for THIS width.
 ///
 /// The portable build is not a different function: `mul_add` is a fused
 /// multiply-add on every target, so the builds agree bit for bit and differ
 /// only in speed. The AVX2 build is the C++'s own ISA baseline
 /// (`x86-64-v3`), and this port asks the host at run time rather than
 /// assuming it.
+///
+/// # THE WIDTH DECIDES, NOT ONLY THE HOST
+///
+/// A host with AVX-512 has the sixteen-lane kernel, and the sixteen-lane
+/// kernel needs SIXTEEN output columns to fill a register. The text
+/// detector's first two convolutions have EIGHT output channels each, and
+/// the four that cost the most have TWENTY-FOUR -- which is eight columns
+/// and a half.
+///
+/// So the sixteen-lane kernel was running its SCALAR tail over eight of
+/// every twenty-four columns, and the detector's GEMM took 908 ms where the
+/// oracle's took 77. The host's widest vector is not the answer to "how
+/// wide is this GEMM": the WIDTH is, and the sixteen-lane kernel is only
+/// the right answer when the columns divide by sixteen.
 fn gemm_nt_dispatch(
     a: &[f32],
     m: usize,
@@ -556,19 +632,150 @@ fn gemm_nt_dispatch(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if has_avx512f() {
+        if has_avx512f() && n % 16 == 0 {
             // SAFETY: the function is only called when the host has the
             // features it is compiled for, and it upholds no extra invariant.
-            unsafe { gemm_nt_avx512(a, m, b, k, n, bias, out) };
+            unsafe {
+                if n % PAGE_FLOATS == 0 {
+                    gemm_nt_avx512_rows(a, m, b, k, n, bias, out);
+                } else {
+                    gemm_nt_avx512(a, m, b, k, n, bias, out);
+                }
+            }
             return;
         }
-        if has_avx2_fma() {
+        if has_avx2_fma() && n >= 8 {
             // SAFETY: as above.
-            unsafe { gemm_nt_avx2(a, m, b, k, n, bias, out) };
+            unsafe {
+                if n % PAGE_FLOATS == 0 {
+                    gemm_nt_avx2_rows(a, m, b, k, n, bias, out);
+                } else {
+                    gemm_nt_avx2(a, m, b, k, n, bias, out);
+                }
+            }
             return;
         }
     }
     gemm_nt_impl(a, m, b, k, n, bias, out);
+}
+
+/// The stride at which B's rows land in the same cache set.
+///
+/// The register-blocked kernel reads `B[k][j]` for one group of sixteen
+/// columns and for every `k`, so the stride between its reads is the row
+/// length of B. When that stride is a WHOLE NUMBER OF PAGES, every one of
+/// those reads has the same offset inside its page -- and therefore the
+/// same cache set. A column group's working set is one line per `k`, and
+/// all of them fight for the same eight ways of that set: the ViT's
+/// feed-forward width is 3072 columns, three pages exactly, and the
+/// sixteen-lane kernel ran at a tenth of its speed there.
+///
+/// The row-at-a-time kernel reads a whole row of B at a time, contiguously,
+/// and the prefetcher follows it. So for those widths the OLD kernel is
+/// the faster one, and the dispatch picks it.
+///
+/// Both kernels accumulate over K in the same order with the same fused
+/// multiply-add, so they produce the same bytes; only the speed differs.
+const PAGE_FLOATS: usize = 4096 / 4;
+
+/// The GEMM, one row at a time, with the accumulator in memory.
+///
+/// This is the kernel the runtime used before the register-blocked one, and
+/// it is still the right one when B's rows are a whole number of pages
+/// apart: it reads a row of B at a time, contiguously, and the prefetcher
+/// follows it. The register-blocked kernel reads sixteen columns at a time
+/// across all of K, and at those strides every read lands in one cache
+/// set.
+///
+/// The reduction is over K, in order, one column at a time, with an FMA per
+/// step -- the same sequence, and so the same bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gemm_nt_avx512_rows(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let mut acc = vec![0.0f32; n];
+    for r in 0..m {
+        let arow = &a[r * k..r * k + k];
+        acc.fill(0.0);
+        for kk in 0..k {
+            let av = _mm512_set1_ps(arow[kk]);
+            let brow = &b[kk * n..kk * n + n];
+            let mut j = 0usize;
+            while j + 16 <= n {
+                // SAFETY: the loads and the store are within the slices:
+                // `j + 16 <= n`, and both slices are at least `n` long.
+                unsafe {
+                    let bv = _mm512_loadu_ps(brow.as_ptr().add(j));
+                    let cv = _mm512_loadu_ps(acc.as_ptr().add(j));
+                    let sum = _mm512_fmadd_ps(bv, av, cv);
+                    _mm512_storeu_ps(acc.as_mut_ptr().add(j), sum);
+                }
+                j += 16;
+            }
+            // The tail, in the same order and the same arithmetic.
+            while j < n {
+                acc[j] = brow[j].mul_add(arow[kk], acc[j]);
+                j += 1;
+            }
+        }
+        let orow = &mut out[r * n..r * n + n];
+        for j in 0..n {
+            orow[j] = acc[j] + bias[j];
+        }
+    }
+}
+
+/// The same kernel, eight lanes at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_nt_avx2_rows(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let mut acc = vec![0.0f32; n];
+    for r in 0..m {
+        let arow = &a[r * k..r * k + k];
+        acc.fill(0.0);
+        for kk in 0..k {
+            let av = _mm256_set1_ps(arow[kk]);
+            let brow = &b[kk * n..kk * n + n];
+            let mut j = 0usize;
+            while j + 8 <= n {
+                // SAFETY: as above.
+                unsafe {
+                    let bv = _mm256_loadu_ps(brow.as_ptr().add(j));
+                    let cv = _mm256_loadu_ps(acc.as_ptr().add(j));
+                    let sum = _mm256_fmadd_ps(bv, av, cv);
+                    _mm256_storeu_ps(acc.as_mut_ptr().add(j), sum);
+                }
+                j += 8;
+            }
+            while j < n {
+                acc[j] = brow[j].mul_add(arow[kk], acc[j]);
+                j += 1;
+            }
+        }
+        let orow = &mut out[r * n..r * n + n];
+        for j in 0..n {
+            orow[j] = acc[j] + bias[j];
+        }
+    }
 }
 
 /// The GEMM, on a named ISA.
@@ -624,7 +831,56 @@ pub fn gemm_nt_on(
     }
 }
 
-/// The GEMM, compiled for a host with AVX2 and FMA.
+/// One output element: the reduction over K, the scalar way.
+///
+/// The reference sequence -- one fused multiply-add per k, in order -- and
+/// the sequence every vector path below computes for eight or sixteen
+/// elements at a time.
+#[inline(always)]
+fn gemm_nt_element(a: &[f32], r: usize, b: &[f32], k: usize, n: usize, j: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for kk in 0..k {
+        acc = b[kk * n + j].mul_add(a[r * k + kk], acc);
+    }
+    acc
+}
+
+/// The columns `[j0, j1)`, for every row, the scalar way.
+fn gemm_nt_columns(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    j0: usize,
+    j1: usize,
+) {
+    for r in 0..m {
+        for j in j0..j1 {
+            out[r * n + j] = gemm_nt_element(a, r, b, k, n, j) + bias[j];
+        }
+    }
+}
+
+/// The GEMM, compiled for a host with AVX2 and FMA: FOUR ROWS AND EIGHT
+/// COLUMNS AT A TIME, in registers.
+///
+/// # WHAT CHANGED, AND WHY THE BITS DID NOT
+///
+/// Before, one row was in flight at a time and its accumulator lived in
+/// MEMORY: every reduction step read the accumulator back and wrote it
+/// again, and every row re-read the whole weight matrix. The text
+/// detector's convolutions are the shape that punishes this hardest -- 864
+/// reduction steps and only 24 output columns to amortise them over -- and
+/// the detector's GEMM took 908 ms where the oracle's took 77.
+///
+/// Now four rows are in flight and their accumulators live in registers, so
+/// the weight matrix is read once per four rows and the accumulator never
+/// leaves a register. The ARITHMETIC is untouched: for one output element
+/// the sequence is still `fma(b[k][j], a[r][k], acc)` for k in order, which
+/// is what the previous kernel did and what the oracle does.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn gemm_nt_avx2(
@@ -636,7 +892,63 @@ unsafe fn gemm_nt_avx2(
     bias: &[f32],
     out: &mut [f32],
 ) {
-    gemm_nt_impl(a, m, b, k, n, bias, out)
+    use std::arch::x86_64::*;
+
+    /// The columns one vector holds.
+    const W: usize = 8;
+    /// The rows one pass keeps in registers.
+    const MR: usize = 4;
+
+    let jv = n - n % W;
+    let full = m - m % MR;
+    let mut r = 0usize;
+    while r < full {
+        let a0 = &a[r * k..r * k + k];
+        let a1 = &a[(r + 1) * k..(r + 1) * k + k];
+        let a2 = &a[(r + 2) * k..(r + 2) * k + k];
+        let a3 = &a[(r + 3) * k..(r + 3) * k + k];
+        let mut j = 0usize;
+        while j < jv {
+            // SAFETY: `j + W <= n` and `r + MR <= m`, so every load is inside
+            // `b` (k*n elements) or `bias` (n elements), and every store is
+            // inside `out` (m*n elements).
+            unsafe {
+                let mut c0 = _mm256_setzero_ps();
+                let mut c1 = _mm256_setzero_ps();
+                let mut c2 = _mm256_setzero_ps();
+                let mut c3 = _mm256_setzero_ps();
+                for kk in 0..k {
+                    let bv = _mm256_loadu_ps(b.as_ptr().add(kk * n + j));
+                    c0 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a0.get_unchecked(kk)), c0);
+                    c1 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a1.get_unchecked(kk)), c1);
+                    c2 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a2.get_unchecked(kk)), c2);
+                    c3 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a3.get_unchecked(kk)), c3);
+                }
+                let bv = _mm256_loadu_ps(bias.as_ptr().add(j));
+                _mm256_storeu_ps(out.as_mut_ptr().add(r * n + j), _mm256_add_ps(c0, bv));
+                _mm256_storeu_ps(out.as_mut_ptr().add((r + 1) * n + j), _mm256_add_ps(c1, bv));
+                _mm256_storeu_ps(out.as_mut_ptr().add((r + 2) * n + j), _mm256_add_ps(c2, bv));
+                _mm256_storeu_ps(out.as_mut_ptr().add((r + 3) * n + j), _mm256_add_ps(c3, bv));
+            }
+            j += W;
+        }
+        r += MR;
+    }
+    // The columns that do not fill a vector, for the rows in the blocks.
+    if jv < n {
+        gemm_nt_columns(a, full, b, k, n, bias, out, jv, n);
+    }
+    // The rows that do not fill a block of four: ONE ROW AT A TIME, with
+    // the accumulator in memory -- the same kernel the wide widths use.
+    //
+    // The scalar element path is the REFERENCE, not a fast path, and a
+    // convolution whose input is one pixel has ONE row.
+    if full < m {
+        // SAFETY: as above.
+        unsafe {
+            gemm_nt_avx2_rows(&a[full * k..], m - full, b, k, n, bias, &mut out[full * n..])
+        };
+    }
 }
 
 /// The GEMM, compiled for a host with AVX-512.
@@ -658,35 +970,63 @@ unsafe fn gemm_nt_avx512(
 ) {
     use std::arch::x86_64::*;
 
-    let mut acc = vec![0.0f32; n];
-    for r in 0..m {
-        let arow = &a[r * k..r * k + k];
-        acc.fill(0.0);
-        for kk in 0..k {
-            let av = _mm512_set1_ps(arow[kk]);
-            let brow = &b[kk * n..kk * n + n];
-            let mut j = 0usize;
-            while j + 16 <= n {
-                // SAFETY: the loads and the store are within the slices:
-                // `j + 16 <= n`, and both slices are at least `n` long.
-                unsafe {
-                    let bv = _mm512_loadu_ps(brow.as_ptr().add(j));
-                    let cv = _mm512_loadu_ps(acc.as_ptr().add(j));
-                    let sum = _mm512_fmadd_ps(bv, av, cv);
-                    _mm512_storeu_ps(acc.as_mut_ptr().add(j), sum);
+    /// The columns one vector holds.
+    const W: usize = 16;
+    /// The rows one pass keeps in registers.
+    const MR: usize = 4;
+
+    let jv = n - n % W;
+    let full = m - m % MR;
+    let mut r = 0usize;
+    while r < full {
+        let a0 = &a[r * k..r * k + k];
+        let a1 = &a[(r + 1) * k..(r + 1) * k + k];
+        let a2 = &a[(r + 2) * k..(r + 2) * k + k];
+        let a3 = &a[(r + 3) * k..(r + 3) * k + k];
+        let mut j = 0usize;
+        while j < jv {
+            // SAFETY: `j + W <= n` and `r + MR <= m`, so every load is inside
+            // `b` (k*n elements) or `bias` (n elements), and every store is
+            // inside `out` (m*n elements).
+            unsafe {
+                let mut c0 = _mm512_setzero_ps();
+                let mut c1 = _mm512_setzero_ps();
+                let mut c2 = _mm512_setzero_ps();
+                let mut c3 = _mm512_setzero_ps();
+                for kk in 0..k {
+                    let bv = _mm512_loadu_ps(b.as_ptr().add(kk * n + j));
+                    c0 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a0.get_unchecked(kk)), c0);
+                    c1 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a1.get_unchecked(kk)), c1);
+                    c2 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a2.get_unchecked(kk)), c2);
+                    c3 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a3.get_unchecked(kk)), c3);
                 }
-                j += 16;
+                let bv = _mm512_loadu_ps(bias.as_ptr().add(j));
+                _mm512_storeu_ps(out.as_mut_ptr().add(r * n + j), _mm512_add_ps(c0, bv));
+                _mm512_storeu_ps(out.as_mut_ptr().add((r + 1) * n + j), _mm512_add_ps(c1, bv));
+                _mm512_storeu_ps(out.as_mut_ptr().add((r + 2) * n + j), _mm512_add_ps(c2, bv));
+                _mm512_storeu_ps(out.as_mut_ptr().add((r + 3) * n + j), _mm512_add_ps(c3, bv));
             }
-            // The tail, in the same order and the same arithmetic.
-            while j < n {
-                acc[j] = brow[j].mul_add(arow[kk], acc[j]);
-                j += 1;
-            }
+            j += W;
         }
-        let orow = &mut out[r * n..r * n + n];
-        for j in 0..n {
-            orow[j] = acc[j] + bias[j];
-        }
+        r += MR;
+    }
+    // The columns that do not fill a vector, for the rows in the blocks.
+    if jv < n {
+        gemm_nt_columns(a, full, b, k, n, bias, out, jv, n);
+    }
+    // The rows that do not fill a block of four: ONE ROW AT A TIME, with
+    // the accumulator in memory -- the same kernel the wide widths use.
+    //
+    // The scalar element path is the REFERENCE, not a fast path, and a
+    // convolution whose input is one pixel has ONE row: the mediapipe pose
+    // model's dense convolutions are exactly that, and they were running
+    // the whole matrix through a scalar dot product per output.
+    if full < m {
+        // SAFETY: as above -- the slices are the caller's and the kernel
+        // keeps to them.
+        unsafe {
+            gemm_nt_avx512_rows(&a[full * k..], m - full, b, k, n, bias, &mut out[full * n..])
+        };
     }
 }
 
