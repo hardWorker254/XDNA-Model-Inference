@@ -268,6 +268,442 @@ impl Encoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The decoder
+// ---------------------------------------------------------------------------
+
+/// One decoder layer's weights.
+struct DecoderLayer {
+    self_qkv: Vec<f32>,
+    self_qkv_bias: Vec<f32>,
+    self_attn_out: Vec<f32>,
+    self_attn_out_bias: Vec<f32>,
+    cross_q: Vec<f32>,
+    cross_q_bias: Vec<f32>,
+    cross_kv: Vec<f32>,
+    cross_kv_bias: Vec<f32>,
+    cross_attn_out: Vec<f32>,
+    cross_attn_out_bias: Vec<f32>,
+    ffn_up: Vec<f32>,
+    ffn_up_bias: Vec<f32>,
+    ffn_down: Vec<f32>,
+    ffn_down_bias: Vec<f32>,
+    ln1_gamma: Vec<f32>,
+    ln1_beta: Vec<f32>,
+    ln2_gamma: Vec<f32>,
+    ln2_beta: Vec<f32>,
+    ln3_gamma: Vec<f32>,
+    ln3_beta: Vec<f32>,
+}
+
+/// The decoder stack: greedy autoregression over the encoder's output,
+/// with a KV cache per layer.
+///
+/// The cache is exact, not approximate: a cached K/V row is bit-identical
+/// to what recomputing it from the same state and the same weights would
+/// produce, because the GEMM, the operand and the bias are the same
+/// operations either way.
+///
+/// Positions are structural, not masked: the cache only ever holds
+/// positions at or before the current one, so causality cannot be
+/// violated by a caller and there is no mask to get wrong.
+pub struct Decoder {
+    geometry: Geometry,
+    layers: Vec<DecoderLayer>,
+    embed_positions: Vec<f32>,
+    embed_tokens: Vec<f32>,
+    final_gamma: Vec<f32>,
+    final_beta: Vec<f32>,
+    /// The per-layer cross-attention K|V cache, `[n_src, 2*d_model]` each.
+    cross_kv: Vec<Vec<f32>>,
+    /// The per-layer self-attention K|V cache, `[n_cached, 2*d_model]` each.
+    self_kv: Vec<Vec<f32>>,
+    /// How many positions the self-attention cache holds.
+    n_cached: usize,
+    /// How many positions the cross-attention cache holds.
+    n_src: usize,
+    /// How many tokens this decoder has GENERATED, which is what the
+    /// policy's "begin" list is keyed on.
+    n_generated: usize,
+    /// Forbidden at every step.
+    suppress: Vec<i32>,
+    /// Forbidden at the first generated token only.
+    begin_suppress: Vec<i32>,
+}
+
+impl Decoder {
+    /// Read the decoder's weights out of a container.
+    pub fn open(path: &Path) -> Result<Decoder, String> {
+        let container = Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let geometry = Geometry::read(&container)
+            .ok_or_else(|| format!("{}: the container does not carry the geometry", path.display()))?;
+        let mut layers = Vec::with_capacity(geometry.dec_layers);
+        for l in 0..geometry.dec_layers {
+            let p = format!("decoder.layers.{l}.");
+            layers.push(DecoderLayer {
+                self_qkv: tensor(&container, &format!("{p}self_qkv"))?,
+                self_qkv_bias: tensor(&container, &format!("{p}self_qkv.bias"))?,
+                self_attn_out: tensor(&container, &format!("{p}self_attn_out"))?,
+                self_attn_out_bias: tensor(&container, &format!("{p}self_attn_out.bias"))?,
+                cross_q: tensor(&container, &format!("{p}cross_q"))?,
+                cross_q_bias: tensor(&container, &format!("{p}cross_q.bias"))?,
+                cross_kv: tensor(&container, &format!("{p}cross_kv"))?,
+                cross_kv_bias: tensor(&container, &format!("{p}cross_kv.bias"))?,
+                cross_attn_out: tensor(&container, &format!("{p}cross_attn_out"))?,
+                cross_attn_out_bias: tensor(&container, &format!("{p}cross_attn_out.bias"))?,
+                ffn_up: tensor(&container, &format!("{p}ffn_up"))?,
+                ffn_up_bias: tensor(&container, &format!("{p}ffn_up.bias"))?,
+                ffn_down: tensor(&container, &format!("{p}ffn_down"))?,
+                ffn_down_bias: tensor(&container, &format!("{p}ffn_down.bias"))?,
+                ln1_gamma: tensor(&container, &format!("{p}ln1.weight"))?,
+                ln1_beta: tensor(&container, &format!("{p}ln1.bias"))?,
+                ln2_gamma: tensor(&container, &format!("{p}ln2.weight"))?,
+                ln2_beta: tensor(&container, &format!("{p}ln2.bias"))?,
+                ln3_gamma: tensor(&container, &format!("{p}ln3.weight"))?,
+                ln3_beta: tensor(&container, &format!("{p}ln3.bias"))?,
+            });
+        }
+        // The decoding policy. Both lists are REQUIRED: a container packed
+        // before they were stored is refused rather than run with a policy of
+        // its own, because the difference shows up only in the text and
+        // nowhere else.
+        let suppress = int_list(&container, "decoder.suppress_tokens")?;
+        let begin_suppress = int_list(&container, "decoder.begin_suppress_tokens")?;
+        if suppress.is_empty() && begin_suppress.is_empty() {
+            return Err(format!(
+                "{}: no decoding policy. The container carries neither decoder.suppress_tokens nor decoder.begin_suppress_tokens, so a greedy step here would pick a different token than the reference implementation does.",
+                path.display()
+            ));
+        }
+        for list in [&suppress, &begin_suppress] {
+            for &id in list {
+                if id < 0 || id as usize >= geometry.vocab {
+                    return Err(format!(
+                        "{}: the decoding policy names id {id}, outside this container's {}-entry vocabulary -- the lists were packed against a different checkpoint",
+                        path.display(),
+                        geometry.vocab
+                    ));
+                }
+            }
+        }
+        Ok(Decoder {
+            embed_positions: tensor(&container, "decoder.embed_positions")?,
+            embed_tokens: tensor(&container, "decoder.embed_tokens")?,
+            final_gamma: tensor(&container, "decoder.layer_norm.weight")?,
+            final_beta: tensor(&container, "decoder.layer_norm.bias")?,
+            cross_kv: vec![Vec::new(); geometry.dec_layers],
+            self_kv: vec![Vec::new(); geometry.dec_layers],
+            n_cached: 0,
+            n_src: 0,
+            n_generated: 0,
+            suppress,
+            begin_suppress,
+            layers,
+            geometry,
+        })
+    }
+
+    /// The model's geometry.
+    pub fn geometry(&self) -> &Geometry {
+        &self.geometry
+    }
+
+    /// Build the per-layer cross-attention K|V cache from the encoder's
+    /// output.
+    ///
+    /// Must be called before the first step, and again whenever the source
+    /// changes. The cache is built ONCE per transcription: the encoder's
+    /// output does not change while the decoder runs, so 1500 positions at
+    /// 256 rows is six dispatches per layer instead of 1500.
+    pub fn set_source(&mut self, enc: &[f32], n_src: usize) -> Result<(), String> {
+        let d = self.geometry.d_model;
+        if n_src == 0 || enc.len() < n_src * d {
+            return Err(format!(
+                "whisper decoder: encoder output is {} rows, {n_src} wanted",
+                enc.len() / d
+            ));
+        }
+        self.n_src = n_src;
+        for (l, layer) in self.layers.iter().enumerate() {
+            let mut cache = vec![0.0f32; n_src * 2 * d];
+            kernels::gemm_nt(enc, n_src, &layer.cross_kv, d, 2 * d, &layer.cross_kv_bias, &mut cache);
+            self.cross_kv[l] = cache;
+        }
+        self.reset();
+        Ok(())
+    }
+
+    /// Forget every cached K/V row. A new transcription starts here.
+    pub fn reset(&mut self) {
+        self.n_cached = 0;
+        self.n_generated = 0;
+        for kv in self.self_kv.iter_mut() {
+            kv.clear();
+        }
+    }
+
+    /// How many positions the self-attention cache holds.
+    pub fn cached(&self) -> usize {
+        self.n_cached
+    }
+
+    /// One step: run `token` at `position` and return the greedy next id.
+    ///
+    /// `hidden` receives the final-LayerNorm state and `logits` the
+    /// tied-embedding projection of it.
+    pub fn step(
+        &mut self,
+        token: i32,
+        position: usize,
+        hidden: Option<&mut Vec<f32>>,
+        logits: Option<&mut Vec<f32>>,
+    ) -> Result<i32, String> {
+        let g = &self.geometry;
+        let d = g.d_model;
+        if token < 0 || token as usize >= g.vocab {
+            return Err(format!(
+                "whisper decoder: token {token} is outside the vocabulary ({} ids)",
+                g.vocab
+            ));
+        }
+        // Positions are the cache's own index. Accepting a token at any
+        // other position would produce a fluent transcript with the wrong
+        // position embedding, which is the worst kind of wrong.
+        if position != self.n_cached {
+            return Err(format!(
+                "whisper decoder: token at position {position} but the cache holds {} positions. Tokens must be fed in order, or reset() first.",
+                self.n_cached
+            ));
+        }
+        if self.n_cached >= g.max_target {
+            return Err(format!(
+                "whisper decoder: position {position} is past max_target_positions {}",
+                g.max_target
+            ));
+        }
+        let scale = if g.qkv_scale_folded {
+            1.0f32
+        } else {
+            g.attn_scale as f32
+        };
+
+        // embed_tokens + embed_positions, no norm in between: HF's decoder
+        // adds the position to the token embedding and enters the first
+        // pre-LN block.
+        let mut h = vec![0.0f32; d];
+        let et = &self.embed_tokens[token as usize * d..][..d];
+        let pe = &self.embed_positions[position * d..][..d];
+        for j in 0..d {
+            h[j] = et[j] + pe[j];
+        }
+
+        let mut qkv = vec![0.0f32; 3 * d];
+        let mut proj = vec![0.0f32; d];
+        let mut up = vec![0.0f32; g.dec_intermediate];
+        let mut down = vec![0.0f32; d];
+        let mut ctx = vec![0.0f32; d];
+
+        for (l, layer) in self.layers.iter().enumerate() {
+            // ---- self-attention over the cache, one new row ----
+            let mut norm = h.clone();
+            layernorm_row(&mut norm, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
+            kernels::gemm_nt(&norm, 1, &layer.self_qkv, d, 3 * d, &layer.self_qkv_bias, &mut qkv);
+            // The K|V half of the fused QKV joins the cache; the Q half is
+            // this step's query.
+            let cache = &mut self.self_kv[l];
+            cache.extend_from_slice(&qkv[d..3 * d]);
+            attention(
+                &qkv,
+                3 * d,
+                cache,
+                2 * d,
+                1,
+                self.n_cached + 1,
+                d,
+                g.heads,
+                g.head_dim,
+                scale,
+                &mut ctx,
+            );
+            kernels::gemm_nt(&ctx, 1, &layer.self_attn_out, d, d, &layer.self_attn_out_bias, &mut proj);
+            for j in 0..d {
+                h[j] += proj[j];
+            }
+
+            // ---- cross-attention over the encoder output ----
+            let mut norm = h.clone();
+            layernorm_row(&mut norm, &layer.ln2_gamma, &layer.ln2_beta, g.ln_eps);
+            kernels::gemm_nt(&norm, 1, &layer.cross_q, d, d, &layer.cross_q_bias, &mut qkv);
+            // The Q row is all this step needs from cross_q: its K|V half was
+            // folded into a separate operand precisely so the two could be
+            // fed from different A operands.
+            attention(
+                &qkv,
+                d,
+                &self.cross_kv[l],
+                2 * d,
+                1,
+                self.n_src,
+                d,
+                g.heads,
+                g.head_dim,
+                scale,
+                &mut ctx,
+            );
+            kernels::gemm_nt(&ctx, 1, &layer.cross_attn_out, d, d, &layer.cross_attn_out_bias, &mut proj);
+            for j in 0..d {
+                h[j] += proj[j];
+            }
+
+            // ---- feed-forward ----
+            let mut norm = h.clone();
+            layernorm_row(&mut norm, &layer.ln3_gamma, &layer.ln3_beta, g.ln_eps);
+            kernels::gemm_nt(&norm, 1, &layer.ffn_up, d, g.dec_intermediate, &layer.ffn_up_bias, &mut up);
+            for v in up.iter_mut() {
+                *v = gelu_erf_exact(*v);
+            }
+            kernels::gemm_nt(&up, 1, &layer.ffn_down, g.dec_intermediate, d, &layer.ffn_down_bias, &mut down);
+            for j in 0..d {
+                h[j] += down[j];
+            }
+        }
+
+        self.n_cached += 1;
+        layernorm_row(&mut h, &self.final_gamma, &self.final_beta, g.ln_eps);
+        let mut logit_vector = logits_from(&h, &self.embed_tokens, d, g.vocab);
+        let next = self.apply_policy(&mut logit_vector);
+        if let Some(out) = hidden {
+            *out = h;
+        }
+        if let Some(out) = logits {
+            *out = logit_vector;
+        }
+        self.n_generated += 1;
+        Ok(next)
+    }
+
+    /// The policy's two lists, the argmax, and the tie-break towards the
+    /// lower id.
+    ///
+    /// transformers installs TWO processors and they OVERLAP on the first
+    /// step: `SuppressTokensLogitsProcessor(suppress_tokens)` at every step,
+    /// and `SuppressTokensAtBeginLogitsProcessor(begin_suppress_tokens)` at
+    /// the first generated step only. Applying only the begin list there --
+    /// which is the obvious reading of "begin" -- lets a token the full list
+    /// forbids win the first step: on a 3 s tone that is 50362 instead of
+    /// 50259, and the whole transcript after it is a different language.
+    ///
+    /// The policy is applied to the VECTOR and not to the argmax, so that a
+    /// caller reading the logits sees -3.4e+38 exactly where the choice was
+    /// forbidden.
+    fn apply_policy(&self, logits: &mut [f32]) -> i32 {
+        let vocab = logits.len();
+        for &id in &self.suppress {
+            if id >= 0 && (id as usize) < vocab {
+                logits[id as usize] = -3.4e38f32;
+            }
+        }
+        if self.n_generated == 0 {
+            for &id in &self.begin_suppress {
+                if id >= 0 && (id as usize) < vocab {
+                    logits[id as usize] = -3.4e38f32;
+                }
+            }
+        }
+        // Ties broken by the lower id, so the result does not depend on the
+        // order the ids were looked at: the argmax is a function of the
+        // logits and not of the schedule.
+        let mut best_id = 0usize;
+        let mut best = f32::NEG_INFINITY;
+        let mut have = false;
+        for (v, &x) in logits.iter().enumerate() {
+            if !have || x > best {
+                best = x;
+                best_id = v;
+                have = true;
+            }
+        }
+        best_id as i32
+    }
+
+    /// Greedy continuation of `prompt` (fed at positions 0..n-1), up to
+    /// `stop_id`, `max_new` generated tokens, or the checkpoint's own
+    /// max_target_positions -- whichever comes first.
+    ///
+    /// The cap matters for more than tidiness: a reference implementation is
+    /// compared against this with ITS max_new_tokens, and a 31 s tone makes
+    /// the model emit the same token until it runs out of positions, so an
+    /// uncapped chain and a capped reference are not the same string.
+    pub fn greedy(&mut self, prompt: &[i32], stop_id: i32, max_new: usize) -> Result<Vec<i32>, String> {
+        if prompt.is_empty() {
+            return Err("whisper decoder: greedy() needs at least one prompt token (the control tokens are the model's own)".into());
+        }
+        if prompt.len() > self.geometry.max_target {
+            return Err(format!(
+                "whisper decoder: prompt of {} tokens exceeds max_target_positions {}",
+                prompt.len(),
+                self.geometry.max_target
+            ));
+        }
+        self.reset();
+        let mut next = 0;
+        for (i, &token) in prompt.iter().enumerate() {
+            next = self.step(token, i, None, None)?;
+            if next == stop_id {
+                return Ok(Vec::new());
+            }
+        }
+        let mut out = vec![next];
+        while out.last() != Some(&stop_id)
+            && self.n_cached < self.geometry.max_target
+            && (max_new == 0 || out.len() < max_new)
+        {
+            let token = *out.last().unwrap();
+            let position = self.n_cached;
+            out.push(self.step(token, position, None, None)?);
+        }
+        if out.last() == Some(&stop_id) {
+            out.pop();
+        }
+        Ok(out)
+    }
+}
+
+/// The vocabulary projection: `logits = h @ embed_tokens^T`.
+///
+/// The checkpoint has no `proj_out`: the logit matrix is the tied token
+/// embedding. 66 MB of weights are read for 66 MFLOP of work, which is why
+/// the HOST does it.
+///
+/// The accumulation is EIGHT lane accumulators with an FMA per element,
+/// finished with the same eight-lane horizontal sum the attention uses --
+/// and not the GEMM's own reduction, which walks K in order for each
+/// output. The two are different trees and the two are different numbers.
+pub fn logits_from(h: &[f32], embed_tokens: &[f32], d: usize, vocab: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; vocab];
+    for (v, slot) in out.iter_mut().enumerate() {
+        let e = &embed_tokens[v * d..][..d];
+        let mut lanes = [0.0f32; 8];
+        for l in 0..8 {
+            lanes[l] = h[l] * e[l];
+        }
+        let mut j = 8;
+        while j + 8 <= d {
+            for l in 0..8 {
+                lanes[l] = h[j + l].mul_add(e[j + l], lanes[l]);
+            }
+            j += 8;
+        }
+        let mut acc = kernels::hsum8(lanes);
+        while j < d {
+            acc += h[j] * e[j];
+            j += 1;
+        }
+        *slot = acc;
+    }
+    out
+}
+
 /// LayerNorm over one row, as the C++'s `layernorm_rows` computes it.
 ///
 /// The mean and the variance are accumulated in DOUBLE and rounded to
@@ -390,6 +826,27 @@ fn tensor(container: &Container, name: &str) -> Result<Vec<f32>, String> {
     Ok(bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// A tensor's values, as int32.
+///
+/// A tensor the container does not have is an empty list, not an error: the
+/// policy lists are optional in the sense that one of them may be absent,
+/// and the caller checks that at least one is not.
+fn int_list(container: &Container, name: &str) -> Result<Vec<i32>, String> {
+    if container.directory().tensor(name).is_none() {
+        return Ok(Vec::new());
+    }
+    let bytes = container
+        .tensor_bytes(name)
+        .map_err(|e| format!("{name}: {e}"))?;
+    if bytes.len() % 4 != 0 {
+        return Err(format!("{name}: {} bytes is not a whole number of int32", bytes.len()));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
 
