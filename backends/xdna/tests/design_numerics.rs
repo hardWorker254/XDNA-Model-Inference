@@ -176,8 +176,10 @@ fn the_design_computes_the_gemm_it_claims_to() {
     )
     .expect("the B operand tiles");
 
-    design.stage(0, &a_bytes).expect("A is staged");
-    design.stage(1, &b_panel).expect("B is staged");
+    let slot_a = design.stage(0, &a_bytes).expect("A is staged");
+    let slot_b = design.stage(1, &b_panel).expect("B is staged");
+    design.bind(0, slot_a).expect("A is bound");
+    design.bind(1, slot_b).expect("B is bound");
     design
         .dispatch(stream.slot as usize)
         .expect("the kernel runs");
@@ -229,5 +231,119 @@ fn the_design_computes_the_gemm_it_claims_to() {
     assert!(
         max_rel <= MAX_RELATIVE,
         "the array's answer is not the reference's: max|d|/|ref|max {max_rel:.6e}"
+    );
+}
+
+/// The same GEMM, through the runtime's OWN op layer.
+///
+/// The check above drives the design through the loader's primitives; this
+/// one goes through `gemm::gemm` -- the f32 operand in, the bias, the
+/// padded tail, the read-back -- and so it checks the OP and not only the
+/// transport. An op that added the bias to the bf16 instead of the f32, or
+/// that left the padded tail stale, would pass the first check and fail this
+/// one.
+#[test]
+fn the_op_layer_gemm_matches_the_reference() {
+    let Some(dir) = design_set() else {
+        eprintln!("skipping: no design set (set NPU_ARTIFACTS to the artifacts root)");
+        return;
+    };
+    let transport = match XrtTransport::open(0) {
+        Ok(transport) => transport,
+        Err(e) => {
+            eprintln!("skipping: no NPU board: {e}");
+            return;
+        }
+    };
+
+    let mut design = ArrayDesign::open(&dir, transport).expect("the design set loads");
+    let info = design.info().clone();
+    let stream = info
+        .streams
+        .iter()
+        .find(|s| s.op == "qkv" && s.m > 0)
+        .expect("the design set has a qkv stream with a shape");
+    let (m, k, n) = (stream.m as usize, stream.k as usize, stream.n as usize);
+    let layout = info.b_layout.as_ref().expect("the manifest records the B layout");
+    let (tile_k, tile_n) = (layout.tile_k as usize, layout.tile_n as usize);
+    let (s, t) = (layout.mac_s as usize, layout.mac_t as usize);
+
+    // THE CALLER'S ROWS, WHICH ARE FEWER THAN THE DESIGN'S.
+    //
+    // The design computes `m` rows whatever the caller has, and the tail is
+    // a padded row that must come back as zeros -- not as the previous
+    // call's numbers.
+    let n_real = 128usize;
+
+    let mut state = 0x1319_8a2e_0370_7344u64;
+    let (a_bytes, a_values) = operand(n_real, k, &mut state);
+    let (b_bytes, b_values) = operand(k, n, &mut state);
+    let b_panel = npum_format::tiling::tile_b(
+        &b_bytes,
+        k,
+        n,
+        tile_k,
+        tile_n,
+        2,
+        Some(s),
+        Some(t),
+        npum_format::tiling::TileOrder::Kn,
+    )
+    .expect("the B operand tiles");
+
+    // THE WEIGHT PANEL, STAGED AND BOUND.
+    let slot_b = design.stage(1, &b_panel).expect("B is staged");
+    design.bind(1, slot_b).expect("B is bound");
+
+    // THE BIAS.
+    let mut bias_state = 0x9e37_79b9_7f4a_7c15u64;
+    let (_, bias) = operand(1, n, &mut bias_state);
+
+    let mut out = vec![0f32; n_real * n];
+    npum_xdna::gemm::gemm(
+        &mut design,
+        stream.slot as usize,
+        &a_values,
+        n_real,
+        m,
+        k,
+        Some(&bias),
+        n,
+        &mut out,
+    )
+    .expect("the op runs");
+
+    // THE REFERENCE, WITH THE BIAS: the op adds it, so the reference has it
+    // too, and a reference without it would be a check of nothing.
+    let mut want = reference(&a_values, &b_values, n_real, k, n);
+    for r in 0..n_real {
+        for j in 0..n {
+            want[r * n + j] += bias[j];
+        }
+    }
+    let mut dot = 0f64;
+    let mut norm_got = 0f64;
+    let mut norm_want = 0f64;
+    let mut max_err = 0f32;
+    for (g, w) in out.iter().zip(want.iter()) {
+        dot += *g as f64 * (*w as f64);
+        norm_got += (*g as f64) * (*g as f64);
+        norm_want += (*w as f64) * (*w as f64);
+        max_err = max_err.max((g - w).abs());
+    }
+    let one_minus_cos = 1.0 - dot / (norm_got.sqrt() * norm_want.sqrt());
+    let scale = want.iter().fold(0f32, |acc, v| acc.max(v.abs()));
+    let max_rel = max_err as f64 / scale as f64;
+
+    eprintln!(
+        "  op layer  M{n_real} K{k} N{n}  1-cos {one_minus_cos:.2e}  max|d|/|ref|max {max_rel:.2e}"
+    );
+    assert!(
+        one_minus_cos <= MAX_ONE_MINUS_COS,
+        "the op layer's answer is not the reference's: 1-cos {one_minus_cos:.6e}"
+    );
+    assert!(
+        max_rel <= MAX_RELATIVE,
+        "the op layer's answer is not the reference's: max|d|/|ref|max {max_rel:.6e}"
     );
 }

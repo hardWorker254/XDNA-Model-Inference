@@ -41,6 +41,7 @@
 pub mod array;
 pub mod design;
 pub mod device;
+pub mod gemm;
 pub mod geometry;
 pub mod manifest;
 pub mod transport;

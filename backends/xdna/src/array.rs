@@ -74,8 +74,17 @@ pub struct ArrayDesign<T: Transport> {
     /// dispatch takes, and a byte count divided by four at the call site is
     /// a division somebody has to remember to write.
     instr_words: Vec<u32>,
-    /// The data buffers: A, B, C.
-    buffers: Vec<T::Buffer>,
+    /// The data buffers' SLOTS.
+    ///
+    /// The first slot of each buffer is the design's own; the rest are what
+    /// `stage` adds. The reason there are slots at all is that each
+    /// convolution has its OWN weight panel, and the panels are big: one
+    /// buffer per panel would be a buffer per convolution, and the design's
+    /// memory budget is not that large. The C++ runtime has the same slots,
+    /// and the same rule that a dispatch uses the slot it was bound to.
+    slots: Vec<Vec<T::Buffer>>,
+    /// Which slot each data buffer is bound to.
+    bound: Vec<usize>,
     /// Where it was loaded from, for the messages.
     dir: PathBuf,
 }
@@ -136,14 +145,16 @@ impl<T: Transport> ArrayDesign<T> {
         }
 
         // THE DATA BUFFERS, ZEROED.
-        let mut buffers = Vec::new();
+        let mut slots: Vec<Vec<T::Buffer>> = Vec::new();
+        let mut bound: Vec<usize> = Vec::new();
         for (index, bytes) in info.buffers.iter().enumerate() {
             let group = transport.group_id(GROUP_DATA + index as i32)?;
             let buffer = transport.alloc(*bytes, BufferFlags::HostOnly, group)?;
             let zeros = vec![0u8; *bytes as usize];
             T::write(&buffer, &zeros, 0)?;
             T::sync_to_device(&buffer, *bytes, 0)?;
-            buffers.push(buffer);
+            slots.push(vec![buffer]);
+            bound.push(0);
         }
 
         Ok(Self {
@@ -151,7 +162,8 @@ impl<T: Transport> ArrayDesign<T> {
             info,
             instr,
             instr_words,
-            buffers,
+            slots,
+            bound,
             dir: dir.to_path_buf(),
         })
     }
@@ -168,7 +180,33 @@ impl<T: Transport> ArrayDesign<T> {
 
     /// The number of data buffers.
     pub fn buffers(&self) -> usize {
-        self.buffers.len()
+        self.slots.len()
+    }
+
+    /// The number of staged slots of one data buffer.
+    pub fn slots_of(&self, index: usize) -> usize {
+        self.slots.get(index).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Bind a data buffer to one of its staged slots.
+    ///
+    /// The dispatch uses the slot each buffer is bound to, so a weight panel
+    /// is staged once and bound before the call that uses it.
+    pub fn bind(&mut self, index: usize, slot: usize) -> Result<(), ArrayError> {
+        let slots = self.slots.get(index).ok_or_else(|| {
+            ArrayError::Design(format!(
+                "{}: no data buffer {index}",
+                self.dir.display()
+            ))
+        })?;
+        if slot >= slots.len() {
+            return Err(ArrayError::Design(format!(
+                "{}: data buffer {index} has no slot {slot}",
+                self.dir.display()
+            )));
+        }
+        self.bound[index] = slot;
+        Ok(())
     }
 
     /// Put `data` into the data buffer `index` and make it visible to the
@@ -177,14 +215,13 @@ impl<T: Transport> ArrayDesign<T> {
     /// The size is checked against the buffer's own size: a design computes
     /// a fixed shape, and staging fewer bytes than it will read is a stale
     /// tail, not a shorter answer.
-    pub fn stage(&mut self, index: usize, data: &[u8]) -> Result<(), ArrayError> {
-        let buffer = self.buffers.get(index).ok_or_else(|| {
+    pub fn stage(&mut self, index: usize, data: &[u8]) -> Result<usize, ArrayError> {
+        let capacity = self.info.buffers.get(index).copied().ok_or_else(|| {
             ArrayError::Design(format!(
                 "{}: no data buffer {index}",
                 self.dir.display()
             ))
         })?;
-        let capacity = T::size(buffer);
         if data.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
                 "{}: {} bytes for data buffer {index}, and the design allows {capacity}",
@@ -192,6 +229,39 @@ impl<T: Transport> ArrayDesign<T> {
                 data.len()
             )));
         }
+        let group = self.transport.group_id(GROUP_DATA + index as i32)?;
+        let buffer = self
+            .transport
+            .alloc(data.len() as u64, BufferFlags::HostOnly, group)?;
+        T::write(&buffer, data, 0)?;
+        T::sync_to_device(&buffer, data.len() as u64, 0)?;
+        let slot = self.slots[index].len();
+        self.slots[index].push(buffer);
+        Ok(slot)
+    }
+
+    /// Write into the BOUND slot of a data buffer and make it visible to
+    /// the device.
+    ///
+    /// The bound slot and not a new one: the A operand is written into the
+    /// design's own A buffer, every time, and a slot per operand would leave
+    /// the design's memory budget one operand short per dispatch.
+    pub fn write_bound(&mut self, index: usize, data: &[u8]) -> Result<(), ArrayError> {
+        let capacity = self.info.buffers.get(index).copied().ok_or_else(|| {
+            ArrayError::Design(format!(
+                "{}: no data buffer {index}",
+                self.dir.display()
+            ))
+        })?;
+        if data.len() as u64 > capacity {
+            return Err(ArrayError::Design(format!(
+                "{}: {} bytes for data buffer {index}, and the design allows {capacity}",
+                self.dir.display(),
+                data.len()
+            )));
+        }
+        let slot = self.bound[index];
+        let buffer = &self.slots[index][slot];
         T::write(buffer, data, 0)?;
         T::sync_to_device(buffer, data.len() as u64, 0)?;
         Ok(())
@@ -209,7 +279,12 @@ impl<T: Transport> ArrayDesign<T> {
                 self.dir.display()
             ))
         })?;
-        let args: Vec<&T::Buffer> = self.buffers.iter().collect();
+        let args: Vec<&T::Buffer> = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(index, slots)| &slots[self.bound[index]])
+            .collect();
         let words = self.instr_words[slot];
         let run = self.transport.start(instr, words, &args)?;
         T::wait(&run)?;
@@ -222,12 +297,7 @@ impl<T: Transport> ArrayDesign<T> {
     /// device has written and the host has not read back holds whatever the
     /// host last put there.
     pub fn read(&self, index: usize, out: &mut [u8]) -> Result<(), ArrayError> {
-        let buffer = self.buffers.get(index).ok_or_else(|| {
-            ArrayError::Design(format!(
-                "{}: no data buffer {index}",
-                self.dir.display()
-            ))
-        })?;
+        let buffer = &self.slots[index][self.bound[index]];
         let capacity = T::size(buffer);
         if out.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
