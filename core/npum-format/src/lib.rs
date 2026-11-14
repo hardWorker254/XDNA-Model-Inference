@@ -45,6 +45,7 @@
 //! would read it shifted. The padding is not an optimisation; it is what makes
 //! a wrong offset impossible to mistake for a right one.
 
+pub mod bf16;
 pub mod digest;
 pub mod directory;
 pub mod header;

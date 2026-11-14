@@ -125,6 +125,14 @@ pub trait ArrayConvs {
     /// once, at load, and every run of the model reuses them.
     fn staged_bytes(&self) -> usize;
 
+    /// How long the host spent turning its activations into the device's
+    /// dtype, in seconds.
+    ///
+    /// It is a REPORT and not a cost: the array's time is what the run
+    /// costs, and this is the part of it that the host spends on its own
+    /// side of the boundary.
+    fn convert_seconds(&self) -> f64;
+
     /// Run one dense convolution on the array.
     ///
     /// `weight` is the convolution's weight name in the container --

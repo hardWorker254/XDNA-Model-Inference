@@ -54,7 +54,6 @@
 use crate::array::{ArrayDesign, ArrayError};
 use crate::gemm::{dispatch, Datapath};
 use crate::transport::Transport;
-use npum_format::f32_to_bf16;
 
 /// A convolution's own shape, and the design's padded one.
 ///
@@ -110,6 +109,12 @@ pub struct ConvScratch {
     a_packed: Vec<u8>,
     /// The padded C operand, in f32.
     c: Vec<f32>,
+    /// The conversion's own time, in seconds.
+    ///
+    /// It is a REPORT and not a control: the array's time is what the run
+    /// costs, and this is the part of it that the host's own arithmetic
+    /// spends turning the host's activations into the device's dtype.
+    pub convert_seconds: f64,
 }
 
 impl ConvScratch {
@@ -118,6 +123,7 @@ impl ConvScratch {
         Self {
             a_packed: vec![0u8; rows * k * 2],
             c: Vec::new(),
+            convert_seconds: 0.0,
         }
     }
 }
@@ -210,14 +216,19 @@ pub fn conv<T: Transport>(
         // can only reach their own output rows -- which are not read.
         let row_bytes = shape.padded_k * dp.a_bytes;
         scratch.a_packed[..chunk * row_bytes].fill(0);
+        let t_convert = std::time::Instant::now();
         for r in 0..chunk {
             let src = (done + r) * shape.k;
             let dst = r * row_bytes;
-            for c in 0..shape.k {
-                let value = f32_to_bf16(a[src + c]).to_le_bytes();
-                scratch.a_packed[dst + c * 2..dst + c * 2 + 2].copy_from_slice(&value);
-            }
+            // ONE ROW AT A TIME, because the row is the unit the padding
+            // breaks: a row's values are contiguous on both sides, and the
+            // columns past the convolution's own K are zeros.
+            npum_format::bf16::f32_to_bf16_bytes(
+                &a[src..src + shape.k],
+                &mut scratch.a_packed[dst..dst + shape.k * 2],
+            );
         }
+        scratch.convert_seconds += t_convert.elapsed().as_secs_f64();
 
         // THE DISPATCH.
         //
@@ -258,10 +269,10 @@ pub fn conv<T: Transport>(
 pub fn pack_im2col_rows(a: &[f32], rows: usize, k: usize, padded_k: usize) -> Vec<u8> {
     let mut packed = vec![0u8; rows * padded_k * 2];
     for r in 0..rows {
-        for c in 0..k {
-            let dst = (r * padded_k + c) * 2;
-            packed[dst..dst + 2].copy_from_slice(&f32_to_bf16(a[r * k + c]).to_le_bytes());
-        }
+        npum_format::bf16::f32_to_bf16_bytes(
+            &a[r * k..r * k + k],
+            &mut packed[r * padded_k * 2..r * padded_k * 2 + k * 2],
+        );
     }
     packed
 }

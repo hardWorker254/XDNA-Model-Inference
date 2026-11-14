@@ -33,7 +33,6 @@
 
 use crate::array::{ArrayDesign, ArrayError};
 use crate::transport::Transport;
-use npum_format::{bf16_to_f32, f32_to_bf16};
 
 /// The design's datapath: the element sizes the dispatch works in.
 ///
@@ -141,9 +140,7 @@ pub fn gemm<T: Transport>(
 /// position.
 pub(crate) fn pack_a(a: &[f32], n_real: usize, rows: usize, k: usize, a_bytes: usize) -> Vec<u8> {
     let mut packed = vec![0u8; rows * k * a_bytes];
-    for i in 0..(n_real * k) {
-        packed[i * 2..i * 2 + 2].copy_from_slice(&f32_to_bf16(a[i]).to_le_bytes());
-    }
+    npum_format::bf16::f32_to_bf16_bytes(&a[..n_real * k], &mut packed);
     packed
 }
 
@@ -177,17 +174,28 @@ pub(crate) fn dispatch<T: Transport>(
     design.dispatch(instr)?;
 
     // THE OUTPUT, BACK IN f32, WITH THE BIAS.
+    //
+    // ONE ROW AT A TIME, and the row is widened in blocks: the widening is
+    // the other half of the boundary the A operand crossed, and at the
+    // array's volume it is hundreds of millions of values.
     let mut c_packed = vec![0u8; rows * n * dp.c_bytes];
     design.read(2, &mut c_packed)?;
+    let mut row = vec![0f32; n];
     for r in 0..n_real {
-        for j in 0..n {
-            let bits =
-                u16::from_le_bytes([c_packed[(r * n + j) * 2], c_packed[(r * n + j) * 2 + 1]]);
-            let mut value = bf16_to_f32(bits);
-            if let Some(bias) = bias {
-                value += bias[j];
+        let src = r * n * dp.c_bytes;
+        npum_format::bf16::bf16_to_f32_bytes(
+            &c_packed[src..src + n * dp.c_bytes],
+            &mut row[..n],
+        );
+        match bias {
+            Some(bias) => {
+                for j in 0..n {
+                    out[r * n + j] = row[j] + bias[j];
+                }
             }
-            out[r * n + j] = value;
+            None => {
+                out[r * n..r * n + n].copy_from_slice(&row[..n]);
+            }
         }
     }
     Ok(())

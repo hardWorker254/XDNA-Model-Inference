@@ -172,10 +172,12 @@ pub fn print_split(
     line("rec", rec, rec_dw, rec_tr);
     if let Some(array) = array {
         eprintln!(
-            "             array  {} convs on the array ({:.1} ms, {} dispatches)",
+            "             array  {} convs on the array ({:.1} ms, {} dispatches, {:.1} ms of it \
+             converting to bf16)",
             det.convs_array + rec.convs_array,
             (det.t_array + rec.t_array) * 1e3,
-            array.dispatches()
+            array.dispatches(),
+            array.convert_seconds() * 1e3
         );
     }
 }

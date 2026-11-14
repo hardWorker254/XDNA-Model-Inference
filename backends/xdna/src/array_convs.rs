@@ -288,6 +288,10 @@ impl<T: Transport> npum_model::ArrayConvs for ArrayConvs<T> {
         self.staged
     }
 
+    fn convert_seconds(&self) -> f64 {
+        self.scratch.convert_seconds
+    }
+
     fn conv(
         &mut self,
         weight: &str,
