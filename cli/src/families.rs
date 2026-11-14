@@ -42,7 +42,14 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
     };
     let prefix = args.value("--prefix").map(|s| s.to_string());
     let allow_truncation = args.switch("--allow-truncation");
+    // The provenance warning comes FIRST, before the banner: it is about
+    // the MODEL and not about this run.
+    if !looks_like_container_path(model) {
+        warn_if_unpinned(model);
+    }
     with_model(model, npum_families::Family::Embed, root, |path, arch| {
+        // The banner comes before the refusal, as in the C++.
+        crate::status::announce(path, root);
         if let Some(prefix) = prefix.as_deref() {
             if let Some(reason) = refuse_unknown_prefix(path, prefix) {
                 eprintln!("error: {reason}");
@@ -108,6 +115,29 @@ fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String> {
         "--prefix '{prefix}' is not one of this model's task prefixes: [{}]",
         names.join(", ")
     ))
+}
+
+/// The warning for a model this build cannot verify.
+///
+/// The C++'s `warn_if_unpinned`: loud, and first, because what it warns
+/// about -- weights that NOTHING checks -- is a property of the model and
+/// not of the run. A run that goes quietly is how an unverified model
+/// ends up in production.
+fn warn_if_unpinned(name: &str) {
+    let Some(entry) = npum_families::catalogue::find(name) else {
+        return;
+    };
+    if !entry.sha256.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "  !! '{}' has NO sha256 pin in this build ({}).",
+        entry.name, entry.repo
+    );
+    println!("  !! Its weights are NOT verified against anything.");
+    println!("  !! To pin it:  npuembeddings add {} <sha256>", entry.repo);
+    println!();
 }
 
 /// `add`.

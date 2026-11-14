@@ -11,6 +11,6 @@
   "why": "a sha256 that is not 64 hex characters is refused BEFORE any network call: a pin that can never match is worse than no pin, because it looks like a pin",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:33",
+  "recorded_at": "2026-11-14T16:32:14",
   "rules": []
 }

@@ -11,7 +11,7 @@
   "why": "the transcript, and the status block that goes to stderr",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:20",
+  "recorded_at": "2026-11-14T16:32:01",
   "rules": [
     "field-padding",
     "timing-s"

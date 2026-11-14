@@ -50,13 +50,27 @@ error/dev-unknown-generation: the C++ runtime does NOT check the generation
           DEVICE's, and a misspelled one is a misspelling whichever design
           sets happen to be on disk.
 
-error/prefix-unknown-name: the REFUSAL is word for word the oracle's. What
-          differs is what precedes it: the C++ runtime loads the model and
-          prints the whole encode banner -- the unpinned-weights warning,
-          the design set it picked, the geometry, the tools -- before it
-          gets to the prefix. The Rust runtime has no encode path yet, so
-          there is no banner to print. This divergence is removed when the
-          encode path lands, and not before.
+http/root: the C++'s server hardcodes TWO fields, and on this machine both
+          of them are wrong. The model id's "-npu" suffix -- the container
+          here is a HOST-LAYOUT f32 one, the encode ran on the host and the
+          array dispatched nothing, as the transcript's own status block
+          says. And the "amd-xdna2-npu" backend -- the device is npu1, as
+          the same transcript says ("device npu1 (arch 1)"), and the C++'s
+          server says "npu2" anyway. The Rust runtime reports what is true:
+          "-cpu" and "amd-xdna1-npu". Every other byte of the body is
+          identical, including the vector.
 
-error/prefix-on-model-without-table: the same, for the other half of the
-          prefix refusal: same wording, same absence of the banner.
+http/health: the same two fields, for the same two reasons, in the same
+             body.
+
+http/models: the same two fields, for the same two reasons, in the same
+             body.
+
+http/embeddings: the same two fields, for the same two reasons, in the same
+                 body. The VECTOR is byte-identical: the same container
+                 through the same arithmetic gives the same bytes, and the
+                 base64 form -- the raw float32 -- matches exactly.
+
+http/wrong-family-labels: the same two fields, for the same two reasons, in
+                           the banner. The 404 body itself -- the one that
+                           names the right endpoint -- is byte-identical.

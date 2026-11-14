@@ -123,9 +123,29 @@ RULES: list[Rule] = [
         "the per-stage split of a duration; same reason as timing-ms",
     ),
     _rule(
+        "split-last-stage",
+        re.compile(r"(?<=\w )\d+\.\d+(?=\))"),
+        "<MS>",
+        "the LAST stage of a split: it has no ' / ' after it, because the "
+        "closing bracket is there instead, and it moves just as much as the "
+        "others. The look-behind wants a WORD before the space, and that is "
+        "what keeps it off a number that is not a stage -- the normalisation "
+        "constants, '(x/255 - 0.485)/0.229', are preceded by a minus and not "
+        "by a word",
+    ),
+    _rule(
+        "reference-timing",
+        re.compile(r"(torch's )\d+\.\d+"),
+        r"\1<MS>",
+        "the reference timing a comparison quotes -- '28.5x torch's 20.5'. It "
+        "is a measurement of another implementation on this machine, and it "
+        "moves every run",
+    ),
+    _rule(
         "timings-json",
         re.compile(r'("(?:total|front_end|front_end_s|encoder_s|head_s|'
-                   r'network|decode|detector|db|crop|recogniser|setup)"'
+                   r'network|decode|detector|db|crop|recogniser|setup|'
+                   r'palm|nms|landmarks|postprocess)"'
                    r':\s*)\d+\.\d+'),
         r"\1<MS>",
         "the timings block of a JSON answer; same reason as timing-ms. The "
@@ -151,7 +171,7 @@ RULES: list[Rule] = [
     ),
     _rule(
         "ratio",
-        re.compile(r"\b\d+\.\d+(?= x\b)"),
+        re.compile(r"\b\d+\.\d+(?= ?x\b)"),
         "<RATIO>",
         "a ratio of two durations -- the pipelining achieved. Same reason as "
         "timing-ms, padding included",
@@ -171,13 +191,15 @@ RULES: list[Rule] = [
     ),
     _rule(
         "buffer-alignment",
-        re.compile(r"(?m)(bo-align\s+last data buffer aligned to )\d+( B)"),
+        re.compile(r"(?m)(bo-align\s+last data buffer aligned to )\d+( B)(?: \(>= 2 MB\))?"),
         r"\1<ALIGN>\2",
         "the alignment of a buffer's ADDRESS. It is not a number the runtime "
         "computed about the model: it is where the allocator happened to put "
         "a buffer, and the ORACLE'S OWN RUNS disagree with each other -- "
         "4096, 8192, 16384 and 2097152 bytes for the same command, in the "
-        "same tree, on the same machine",
+        "same tree, on the same machine. The '(>= 2 MB)' that follows it is "
+        "part of the value: it says the value is at least two megabytes, and "
+        "it goes with the value",
     ),
     _rule(
         "runtime-name",

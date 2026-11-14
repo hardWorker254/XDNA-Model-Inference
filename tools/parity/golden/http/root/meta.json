@@ -11,7 +11,7 @@
   "why": "the root: what the server says it is",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:34",
+  "recorded_at": "2026-11-14T16:32:15",
   "rules": [
     "buffer-alignment",
     "container-extension",

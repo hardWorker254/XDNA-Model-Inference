@@ -9,9 +9,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+npum-cpu.workspace = true
 npum-families.workspace = true
 npum-format.workspace = true
 npum-model.workspace = true
+npum-tokenizers.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

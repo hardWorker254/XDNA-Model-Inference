@@ -11,7 +11,7 @@
   "why": "the label and the score",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:26",
+  "recorded_at": "2026-11-14T16:32:07",
   "rules": [
     "field-padding",
     "timing-s"

@@ -11,7 +11,7 @@
   "why": "the speech endpoint's body",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:39",
+  "recorded_at": "2026-11-14T16:32:20",
   "rules": [
     "container-extension",
     "container-extension-path",

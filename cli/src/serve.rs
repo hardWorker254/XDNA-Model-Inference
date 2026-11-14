@@ -4,6 +4,23 @@
 //! serving a container of another family is refused BY NAME, before the
 //! listener opens -- rather than answered by an endpoint this process is not
 //! named for.
+//!
+//! # What the server says about itself
+//!
+//! The same status block the CLI prints, and then the endpoint's own banner:
+//! which path this model answers, and what a request to it looks like. The
+//! banner is flushed, because a server that then prints nothing would leave
+//! its port in a block buffer, and an operator tailing the log would
+//! conclude that the process had not started.
+//!
+//! # The model id, and the backend
+//!
+//! The C++'s server hardcodes `"backend":"amd-xdna2-npu"` in all four of
+//! its backends -- on a machine whose own status block says `device npu1`.
+//! This one reports the device it found. And the model id says `-cpu` when
+//! the compute happened on the host, because the C++'s own convention says
+//! so: "the model id is what a client sees, and naming a host-only server
+//! after the array is exactly the silent mislabel".
 
 use npuembeddings_server::routes::ServerState;
 use npuembeddings_server::Result;
@@ -20,8 +37,8 @@ pub fn serve(
     bind: &str,
     root: &std::path::Path,
 ) -> i32 {
-    let arch = match container_arch(model, root) {
-        Some(arch) => arch,
+    let path = match resolve_model(model, root) {
+        Some(p) => p,
         None => {
             eprintln!("error: the model {model} is not installed.");
             eprintln!("       `serve` downloads and verifies a model it does not have;");
@@ -29,20 +46,20 @@ pub fn serve(
             return crate::EXIT_REFUSED;
         }
     };
+    let container = match npum_format::Container::open(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            return crate::EXIT_REFUSED;
+        }
+    };
+    let arch = container.config_str("arch").unwrap_or_default().to_string();
 
-    let owner = npum_families::registry::family_of_arch(&arch);
-    let this = npum_families::registry::family_of_arch("bert");
     let this_family = match binary {
         "npuaudio" => npum_families::Family::Stt,
         "npuimage" => npum_families::Family::Cls,
         _ => npum_families::Family::Embed,
     };
-    let _ = owner;
-    let _ = this;
-
-    // The family check is by BINARY, not by the arch alone: `npuimage` runs
-    // the image families, `npuaudio` the speech one, and `npuembeddings` the
-    // text one.
     let family = npum_families::Family::from_arch(&arch).unwrap_or(npum_families::Family::Embed);
     let belongs = match this_family {
         npum_families::Family::Embed => family == npum_families::Family::Embed,
@@ -64,6 +81,19 @@ pub fn serve(
         return crate::EXIT_REFUSED;
     }
 
+    // The status block, the same one the CLI prints.
+    let status = crate::status::read_container(&container, &path);
+    let artifacts = crate::embed::find_artifacts(root, &status.model_name);
+    let design = artifacts
+        .as_ref()
+        .and_then(|a| crate::status::read_design(a));
+    crate::status::print_block(&status, design.as_ref(), artifacts.as_deref().unwrap_or(root));
+
+    let state = build_state(binary, &path, &arch, &container, &status, root);
+    if let Some(encoder) = &state.encoder {
+        crate::status::print_tokenizer(encoder.vocab_size());
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -72,8 +102,7 @@ pub fn serve(
         }
     };
     runtime.block_on(async move {
-        let state = ServerState::new(model, &arch, binary);
-        let app = npuembeddings_server::router(state);
+        let app = npuembeddings_server::router(state.clone());
         let address = format!("{bind}:{port}");
         let listener = match tokio::net::TcpListener::bind(&address).await {
             Ok(l) => l,
@@ -82,23 +111,179 @@ pub fn serve(
                 return crate::EXIT_REFUSED;
             }
         };
-        eprintln!("serving {model} ({arch}) on http://{address}");
-        if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("error: the server stopped: {e}");
-            return crate::EXIT_REFUSED;
+        print_banner(binary, &state, &address);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        // The stop path: the C++'s handler sets a flag, the accept loop
+        // notices it, and the message goes to stderr on the way out.
+        let mut terminate = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: the signal handler could not be installed: {e}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let mut interrupt = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: the signal handler could not be installed: {e}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        tokio::select! {
+            result = axum::serve(listener, app) => {
+                if let Err(e) = result {
+                    eprintln!("error: the server stopped: {e}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
         }
+        eprintln!("\n  interrupted -- releasing NPU contexts");
         0
     })
 }
 
-/// Read a container's arch.
-///
-/// A container that cannot be read is NOT "the embed family": it is an
-/// error, and the error names the file.
-fn container_arch(model: &str, root: &std::path::Path) -> Option<String> {
-    let path = resolve_model(model, root)?;
-    let container = npum_format::Container::open(&path).ok()?;
-    container.config_str("arch").map(|s| s.to_string())
+/// The endpoint's banner: which path it answers, and what a request is.
+fn print_banner(binary: &str, state: &ServerState, address: &str) {
+    match state.arch.as_str() {
+        arch if arch.contains("whisper") => {
+            println!(
+                "\n  serving http://{address}/v1/audio/transcriptions   (model {})",
+                state.model_id
+            );
+            println!("  POST multipart/form-data: file (required), model, language, task,");
+            println!("              response_format (json | verbose_json | text)");
+        }
+        arch if arch.contains("vit") => {
+            println!(
+                "\n  serving http://{address}/v1/classify   (model {})",
+                state.model_id
+            );
+            println!("  POST multipart/form-data: image (required, PNG or JPEG), top_k (default 1)");
+            println!("  1000 labels, 224px input");
+        }
+        arch if arch.contains("pose") || arch.contains("mediapipe") => {
+            println!(
+                "\n  serving http://{address}/v1/pose   (model {})",
+                state.model_id
+            );
+            println!("  POST multipart/form-data: image (required, PNG or JPEG), conf, iou, kpt, max_det");
+        }
+        _ => {
+            println!(
+                "\n  serving http://{address}/v1/embeddings   (model {}, seq {})",
+                state.model_id,
+                state.encoder.as_ref().map(|e| e.seq()).unwrap_or(0)
+            );
+            println!("  POST {{\"input\": \"text\" | [\"a\",\"b\"], \"encoding_format\": \"float\"|\"base64\"}}");
+        }
+    }
+    let _ = binary;
+    println!();
+}
+
+/// Build the server's state: the bodies and the engine.
+fn build_state(
+    binary: &'static str,
+    path: &std::path::Path,
+    arch: &str,
+    container: &npum_format::Container,
+    status: &crate::status::Status,
+    root: &std::path::Path,
+) -> ServerState {
+    let mut state = ServerState::new(&path.display().to_string(), arch, binary);
+
+    // The model id: the container's stem, and where the compute happened.
+    let host_only = container.config_str("gemm_layout").unwrap_or("host") == "host";
+    state.model_id = format!(
+        "{}-{}",
+        status.model_name,
+        if host_only { "cpu" } else { "npu" }
+    );
+
+    // The backend: the device this process found.
+    let generation = npum_xdna::device::Device::detect()
+        .map(|d| d.generation())
+        .unwrap_or(npum_xdna::device::Generation::Npu1);
+    let backend = match generation {
+        npum_xdna::device::Generation::Npu1 => "amd-xdna1-npu",
+        npum_xdna::device::Generation::Npu2 => "amd-xdna2-npu",
+    };
+
+    state.models = format!(
+        "{{\"object\":\"list\",\"data\":[{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"npuembeddings\"}}]}}",
+        state.model_id
+    );
+
+    if arch.contains("whisper") {
+        state.health = format!(
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"stt\",\"language\":\"en\",\"task\":\"transcribe\",\"timestamps\":false,\"chunk_seconds\":30,\"stride_seconds\":5}}",
+            state.model_id
+        );
+        state.not_found = format!(
+            "this model serves /v1/audio/transcriptions, not {}. `npuaudio serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.",
+            "/v1/embeddings"
+        );
+        return state;
+    }
+    if arch.contains("vit") {
+        let labels = container
+            .tensor_bytes("labels.table")
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        let names: Vec<&str> = labels.lines().filter(|l| !l.is_empty()).collect();
+        let n_labels = names.len();
+        let mut body = String::from("{\"object\":\"list\",\"data\":[");
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                body.push_str(", ");
+            }
+            body.push_str(&format!(
+                "{{\"id\": {i}, \"name\": \"{}\"}}",
+                npuembeddings_server::routes::json_escape(name)
+            ));
+        }
+        body.push_str("]}");
+        state.labels = Some(body);
+        state.health = format!(
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"classify\",\"int8\":false,\"input_size\":224,\"patch_size\":16,\"labels\":{n_labels},\"top_k\":1,\"dispatches_so_far\":0}}",
+            state.model_id
+        );
+        state.not_found = "this model serves /v1/classify, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
+        return state;
+    }
+    if arch.contains("pose") || arch.contains("mediapipe") {
+        state.health = format!(
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"pose\",\"engine\":\"host\",\"input_size\":640,\"conf\":0.25,\"iou\":0.7,\"keypoint\":0.5,\"max_det\":300,\"skeleton\":\"\"}}",
+            state.model_id
+        );
+        state.not_found = "this model serves /v1/pose, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
+        return state;
+    }
+
+    // The text family: the embedding endpoint.
+    let seq = crate::embed::sequence_length(path, container, root, None);
+    match npuembeddings_server::Embedder::open(path, seq) {
+        Ok(encoder) => {
+            state.health = format!(
+                "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"embeddings\"}}",
+                state.model_id
+            );
+            state.not_found = "this model serves /v1/embeddings. `npuembeddings serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
+            state.encoder = Some(encoder);
+        }
+        Err(reason) => {
+            eprintln!("error: {reason}");
+        }
+    }
+    state
 }
 
 /// Resolve a model's name or path to a container on disk.

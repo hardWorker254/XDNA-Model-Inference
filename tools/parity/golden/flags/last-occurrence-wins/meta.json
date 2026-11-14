@@ -15,6 +15,6 @@
   "why": "the LAST occurrence of a flag wins, not the first: the output is padded to 64 tokens and nothing was truncated, where the first occurrence would have given 8 tokens and a note saying so. The C++ tree got this wrong once and `serve <whisper> --threads 8` answered with 24 threads",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:34",
+  "recorded_at": "2026-11-14T16:32:14",
   "rules": []
 }

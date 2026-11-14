@@ -11,7 +11,7 @@
   "why": "the classifier's whole vocabulary, so a client can turn an id into a name without the container",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:35",
+  "recorded_at": "2026-11-14T16:32:16",
   "rules": [
     "field-padding",
     "port",

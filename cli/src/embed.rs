@@ -64,19 +64,18 @@ pub fn run(
         message: format!("{}: {e}", path.display()),
     })?;
 
-    // The status block: what this runtime says about itself before it works.
-    let status = crate::status::read_container(&container, path);
-    let artifacts = find_artifacts(root, &status.model_name);
-    let design = artifacts.as_ref().and_then(|a| crate::status::read_design(a));
-    crate::status::print_block(
-        &status,
-        design.as_ref(),
-        artifacts.as_deref().unwrap_or(root),
-    );
-
+    // The status block was printed by the caller, before any refusal this
+    // run might give: the banner says WHICH container, and a refusal on
+    // its own does not.
+    let artifacts = find_artifacts(root, &container_name(path));
     let seq = sequence_length(path, &container, root, artifacts.as_deref());
     let hidden = model.spec.hidden;
 
+    // The vocabulary's size, and then the texts. The C++'s order, and the
+    // reason for it: the tokenizer is loaded here and not before.
+    crate::status::print_tokenizer(
+        npum_tokenizers::Tokenizer::vocab_size(&tokenizer),
+    );
     println!("  input      {} texts", texts.len());
     let started = std::time::Instant::now();
     let mut timings = npum_cpu::bert::Timings::default();
@@ -274,4 +273,11 @@ pub fn find_artifacts(root: &Path, model_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// A container's name, without the directory and without the extension.
+fn container_name(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
 }

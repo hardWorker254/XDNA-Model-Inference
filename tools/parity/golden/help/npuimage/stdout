@@ -53,7 +53,7 @@ XDNA2/npu2; --dev selects the generation)
         the array and nothing else, needs a container packed with --npu
         and a design set, and is SLOWER here: <MS> ms of network on 16
         threads against <MS> ms dispatched as GEMMs, because N must be a
-        multiple of 128 (2.6x arithmetic padding waste before anything
+        multiple of 128 (<RATIO>x arithmetic padding waste before anything
         runs), the stem alone is 100 of the 436 dispatches, and a
         dispatch costs 660 us of which 140 us is the device's GEMM. Per
         layer 19 of the 72 are faster on the array and an oracle

@@ -11,6 +11,6 @@
   "why": "the tokenizer's ids: a table that disagrees with the packer's produces a correctly shaped vector of the wrong text",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:16",
+  "recorded_at": "2026-11-14T16:31:57",
   "rules": []
 }

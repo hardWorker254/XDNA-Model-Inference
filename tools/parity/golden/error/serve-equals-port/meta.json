@@ -11,6 +11,6 @@
   "why": "`--serve=8080` is NOT accepted: the grammar has always been `--serve [PORT]` with a separate argument, and a new spelling that nobody asked for is a new spelling",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:33",
+  "recorded_at": "2026-11-14T16:32:14",
   "rules": []
 }

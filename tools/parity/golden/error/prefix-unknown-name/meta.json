@@ -13,7 +13,7 @@
   "why": "an unknown task prefix is refused and the real options are listed; a wrongly-prefixed embedding is correctly shaped and correctly normed, so nothing downstream can tell it is wrong",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T16:00:33",
+  "recorded_at": "2026-11-14T16:32:14",
   "rules": [
     "buffer-alignment",
     "runtime-name"

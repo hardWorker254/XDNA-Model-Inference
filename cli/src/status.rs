@@ -232,6 +232,26 @@ pub fn read_design(artifacts: &Path) -> Option<DesignStatus> {
     })
 }
 
+/// Print the status block for a container, and hand back what was read.
+///
+/// The block comes BEFORE any refusal the work itself would give. The
+/// C++ prints its banner first and refuses after, and a reader who has
+/// seen the banner knows WHICH container the refusal is about -- a
+/// refusal on its own says "something is wrong" and a banner says "this
+/// container, this design, this device".
+pub fn announce(path: &Path, root: &Path) -> Option<Status> {
+    let container = npum_format::Container::open(path).ok()?;
+    let status = read_container(&container, path);
+    let artifacts = crate::embed::find_artifacts(root, &status.model_name);
+    let design = artifacts.as_ref().and_then(|a| read_design(a));
+    print_block(
+        &status,
+        design.as_ref(),
+        artifacts.as_deref().unwrap_or(root),
+    );
+    Some(status)
+}
+
 /// The status block, printed before the work.
 pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &Path) {
     println!(
@@ -315,7 +335,16 @@ pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &P
         "  pipeline   4 concurrent encodes of {}, one NPU mutex, 6 host threads per lane",
         batch
     );
-    println!("  tokenizer  {} tokens, from the .npum", status.vocab);
+}
+
+/// The vocabulary's size, on its own line.
+///
+/// NOT part of the status block: the C++ prints it after the block and
+/// after the prefix refusal, because the tokenizer is loaded at that
+/// point and not before. A refusal that comes before the tokenizer is
+/// loaded has no vocabulary to report.
+pub fn print_tokenizer(vocab: usize) {
+    println!("  tokenizer  {vocab} tokens, from the .npum");
 }
 
 /// One operation's row: the code, the long name, and where it runs.

@@ -1,7 +1,7 @@
 NpuEmbeddings -- body pose (YOLOv8-pose) on the CPU
   model      yolov8n-pose: 640px letterbox, 3 levels (strides 8/16/32), 8400 cells, head 56 = 4 box + 1 class + 17 keypoints x 3
   backend    conv on the host (default), everything else on the host
-             pass --npu-ops conv to measure the array instead; see runtime/include/pose/net.hpp for why the host wins here (2.6x arithmetic padding waste on N <= 64, 100 of the network's 436 dispatches for the stem alone, and 660 us per dispatch of which 140 us is the device's GEMM).
+             pass --npu-ops conv to measure the array instead; see runtime/include/pose/net.hpp for why the host wins here (<RATIO>x arithmetic padding waste on N <= 64, 100 of the network's 436 dispatches for the stem alone, and 660 us per dispatch of which 140 us is the device's GEMM).
   decode     conf 0.25, iou 0.70, keypoint 0.50, max_det 300
   setup <S> s
   ops        (npu = dispatched, host = this process)

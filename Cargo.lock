@@ -474,9 +474,11 @@ name = "npuembeddings-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "npum-cpu",
  "npum-families",
  "npum-format",
  "npum-model",
+ "npum-tokenizers",
  "serde",
  "serde_json",
  "tokio",
