@@ -130,7 +130,7 @@ impl Family {
             }
             Family::Pose => None,
             Family::Hands => None,
-            Family::MpPose => Some("the MediaPipe pose network and its decoding"),
+            Family::MpPose => None,
             Family::Ocr => Some("the text detector, the recogniser and the box merging"),
         }
     }

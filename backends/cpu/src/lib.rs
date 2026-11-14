@@ -38,6 +38,8 @@ pub mod bert;
 pub mod hands;
 pub mod hands_decode;
 pub mod kernels;
+pub mod mppose;
+pub mod mppose_decode;
 pub mod pose;
 pub mod pose_decode;
 pub mod vit;

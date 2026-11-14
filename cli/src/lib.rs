@@ -38,6 +38,7 @@ pub mod flags;
 pub mod hands;
 pub mod help;
 pub mod list;
+pub mod mppose;
 pub mod pose;
 pub mod root;
 pub mod serve;

@@ -758,21 +758,179 @@ pub fn hands(args: &Args, root: &Path) -> Outcome {
 }
 
 /// `mppose`.
+///
+/// Two networks, one container, one image in and N people out. The decode
+/// between the two stages is where the whole of this family's subtlety lives,
+/// and it is in `npum_cpu::mppose_decode`; this function is the block, the
+/// per-image lines and the loop.
 pub fn mppose(args: &Args, root: &Path) -> Outcome {
     let Some(model) = args.positional.first() else {
         return crate::needs_a_model("mppose");
     };
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: this is a MediaPipe Pose model, so say whose body to find:");
+        eprintln!("    npuimage mppose <model> <image.png> [more.png ...]");
+        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
+        eprintln!("  --max-people 1    run the landmark network on at most N detections");
+        eprintln!("  --text            a human summary instead of JSON");
+        eprintln!("  --mppose-dump FILE  every graph node's output, for the gate");
+        eprintln!(
+            "  (every threshold comes from the container, not from a flag: they are\n   \
+             part of the checkpoint -- see the refusal above)"
+        );
+        return crate::EXIT_REFUSED;
+    }
     with_model(model, npum_families::Family::MpPose, root, |path, arch| {
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::MpPose) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        eprintln!("  model      {}: {}", path.display(), arch);
-        if let Some(reason) = refuse_not_ported(npum_families::Family::MpPose) {
-            eprintln!("error: {reason}");
+        // `--npu-ops conv` is a valid mppose request and a valid question, and
+        // this runtime has no answer to it yet: the host path is the ported one.
+        // Accepting the flag and running the host would leave the command line
+        // saying "array" about a run that dispatched nothing -- which is the one
+        // thing this project treats as the worst outcome.
+        if args
+            .value("--npu-ops")
+            .map(|v| v.split(',').any(|c| c.trim() == "conv"))
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "error: --npu-ops conv: the mppose family runs its convolutions on the host \
+                 in this runtime, and the array path is not ported yet. Accepting the flag and \
+                 running the host would make the command line say something the run did not do."
+            );
             return crate::EXIT_REFUSED;
         }
-        0
+        // The other architectures' own flags are REFUSED rather than ignored: they
+        // read as "thresholds for the detection" on a mode that also has a
+        // detector, and silently dropping them would produce a run whose people
+        // differ from the one that was asked for with nothing in the output
+        // saying so.
+        for f in [
+            "--conf",
+            "--iou",
+            "--kpt",
+            "--max-det",
+            "--pose",
+            "--pose-dump",
+            "--bo-mode",
+            "--max-hands",
+            "--hands-dump",
+        ] {
+            if args.value(f).is_some() || args.switch(f) {
+                eprintln!(
+                    "error: {f}: not a flag of `mppose`. The detector's score and NMS \
+                     thresholds and the landmark net's confidence threshold are read from the \
+                     container (score_threshold, nms_threshold, top_k, pose_conf_threshold, \
+                     person_box_pre_enlarge, person_box_enlarge), because they are part of how \
+                     this checkpoint was trained and the OpenCV zoo demo that recorded the \
+                     golden used the container's values, not a command line's. For --pose: use \
+                     `pose`, which is a different model with different flags. The three dumps \
+                     are separate because they record different graphs, and one reader cannot \
+                     read another's file."
+                );
+                return crate::EXIT_REFUSED;
+            }
+        }
+        // --max-people: a CAP on how many detections reach the second stage, not a
+        // score threshold. Every person is an independent rotated crop of the
+        // original frame, so there is no way to batch them and the only lever is
+        // how many to run.
+        let mut max_people = -1i64;
+        if let Some(v) = args.value("--max-people") {
+            match v.parse::<i64>() {
+                Ok(n) if (1..=10000).contains(&n) => max_people = n,
+                _ => {
+                    eprintln!(
+                        "error: --max-people '{v}': expected an integer in 1..10000, or omit \
+                         it to run the landmark network on every detection"
+                    );
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        let text = args.switch("--text");
+        let started = std::time::Instant::now();
+        let network = match crate::mppose::open(path) {
+            Ok(n) => n,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let setup_s = started.elapsed().as_secs_f64();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        crate::mppose::print_block(&name, network.geometry(), setup_s);
+        let _ = arch;
+
+        let dump_path = args.value("--mppose-dump").map(std::path::PathBuf::from);
+        let mut dump = match dump_path.as_deref() {
+            Some(p) => match crate::mppose::Dump::create(p) {
+                Ok(d) => Some(d),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            },
+            None => None,
+        };
+        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
+            crate::mppose::print_dump_header(p, network.geometry());
+        }
+
+        let mut exit = 0;
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            let run = {
+                let mut hook = |net: &str, node: usize, t: &npum_cpu::pose::Tensor| {
+                    if let Some(d) = dump.as_mut() {
+                        d.record(net, node, t);
+                    }
+                };
+                npum_cpu::mppose_decode::detect(&network, &decoded, max_people, &mut hook)
+            };
+            let run = match run {
+                Ok(r) => r,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_mut() {
+                d.image += 1;
+            }
+            crate::mppose::print_run(image, &run);
+            if text {
+                print!("{}", npum_cpu::mppose_decode::text_summary(image, &run));
+                continue;
+            }
+            crate::mppose::print_crop(&run);
+            print!("{}", npum_cpu::mppose_decode::result_json(&run, image));
+        }
+
+        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
+            match d.finish(p) {
+                Ok(n) => eprintln!("             {n} node tensors written"),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        exit
     })
 }
 
