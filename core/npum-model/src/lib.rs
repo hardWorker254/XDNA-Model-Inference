@@ -26,11 +26,13 @@
 //! forward pass that it could not run the model would have done half the work
 //! first, and the user would see the failure after the wait.
 
+pub mod array;
 pub mod caps;
 pub mod dispatcher;
 pub mod graph;
 pub mod tensor;
 
+pub use array::{ArrayConvs, ArrayError, ConvSpec};
 pub use caps::{Caps, OpKind};
 pub use dispatcher::{Dispatcher, Placement};
 pub use graph::{Graph, ModelSpec, Op};

@@ -13,6 +13,7 @@
 //! the caller that wants the reading order sorts them.
 
 use crate::ocr::{read_geometry, Cost, Geometry, Network, Tensor};
+use npum_model::array::ArrayConvs;
 use crate::ocr_decode::{
     ctc_decode, ctc_logits, db_postprocess, det_input, rec_input, DbBox, OcrResult, Quad, TextBox,
 };
@@ -42,11 +43,23 @@ pub struct Ocr {
     det: Network,
     /// The recogniser's graph.
     rec: Network,
+    /// The array's convolutions, when the run asked for them.
+    ///
+    /// ONE backend for both graphs: the design is one, its slots are one,
+    /// and the panels are one set. The two graphs' convolutions are keyed
+    /// by their own names, so a detector's conv 0 and a recogniser's conv 0
+    /// are two different panels and not one slot's worth of confusion.
+    array: Option<Box<dyn ArrayConvs>>,
 }
 
 impl Ocr {
     /// Read both graphs out of a container.
-    pub fn open(path: &Path) -> Result<Ocr, String> {
+    ///
+    /// `array` is the array's backend, when the run asked for the array.
+    /// It is taken and not opened here: the design set's source is the
+    /// caller's business, and a design set loaded from the wrong place is a
+    /// wrong answer rather than an error.
+    pub fn open(path: &Path, array: Option<Box<dyn ArrayConvs>>) -> Result<Ocr, String> {
         let container = Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let label = path.display().to_string();
         let geometry = read_geometry(&container, &label)?;
@@ -66,12 +79,29 @@ impl Ocr {
             geometry,
             det,
             rec,
+            array,
         })
     }
 
     /// The container's geometry.
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
+    }
+
+    /// The array's backend, when the run asked for the array.
+    pub fn array(&self) -> Option<&dyn ArrayConvs> {
+        self.array.as_deref()
+    }
+
+    /// Give the session the array's backend.
+    ///
+    /// The backend is taken and not opened here: the design set's source is
+    /// the caller's business, and a design set loaded from the wrong place
+    /// is a wrong answer rather than an error. It is set after the session
+    /// is open because the caller's list of the family's convolutions comes
+    /// from the geometry, and the geometry is what the session read.
+    pub fn set_array(&mut self, array: Option<Box<dyn ArrayConvs>>) {
+        self.array = array;
     }
 
     /// The detector's graph.
@@ -126,7 +156,9 @@ impl Ocr {
 
         let t1 = std::time::Instant::now();
         let mut det_hook = |i: i64, t: &Tensor| on_node("det", i, t);
-        let dnodes = self.det.run(&det_tensor, &mut det_hook)?;
+        let dnodes = self
+            .det
+            .run(&det_tensor, &mut det_hook, self.array.as_deref_mut())?;
         r.det_s = t1.elapsed().as_secs_f64();
 
         // THE PROBABILITY MAP. The detector's output is [1, 1, H, W] -- one
@@ -185,7 +217,9 @@ impl Ocr {
 
             let t4 = std::time::Instant::now();
             let mut rec_hook = |j: i64, t: &Tensor| on_node("rec", j, t);
-            let rnodes = self.rec.run(&rec_tensor, &mut rec_hook)?;
+            let rnodes = self
+                .rec
+                .run(&rec_tensor, &mut rec_hook, self.array.as_deref_mut())?;
             r.rec_s += t4.elapsed().as_secs_f64();
 
             // THE CTC HEAD'S OUTPUT: [1, frames, classes]. The frames are the

@@ -282,6 +282,7 @@ fn the_container_s_own_convolution_panel_goes_through_the_array() {
     design.bind(1, slot_b).expect("the panel is bound");
 
     let mut out = vec![0f32; n_rows * n];
+    let mut scratch = npum_xdna::conv::ConvScratch::default();
     conv(
         &mut design,
         stream.slot as usize,
@@ -289,6 +290,7 @@ fn the_container_s_own_convolution_panel_goes_through_the_array() {
         Some(&bias),
         &a_values,
         &mut out,
+        &mut scratch,
     )
     .expect("the op runs");
 

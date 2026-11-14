@@ -72,6 +72,7 @@
 
 use crate::kernels;
 use npum_format::Container;
+use npum_model::array::{ArrayRef, ConvSpec};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -510,6 +511,48 @@ impl Geometry {
     pub fn rec_transposed(&self) -> i64 {
         self.rec_convs.iter().filter(|c| c.transposed).count() as i64
     }
+}
+
+/// The dense convolutions of both graphs, as the array's list.
+///
+/// THE LIST IS THE FAMILY'S OWN, and it is built from the graphs rather
+/// than from the container's directory: a panel exists for a convolution
+/// the graph RUNS, and a panel that no op calls is a panel nobody stages.
+///
+/// Three kinds of convolution are left out, and each for its own reason:
+///
+/// * the DEPTHWISE ones, because a depthwise filter reduces WITHIN one
+///   channel and has no `[M, N]` product to dispatch;
+/// * the TRANSPOSED ones, because a transposed convolution's output is a
+///   sum of shifted contributions and not a matrix product;
+/// * the ones whose graph names no stream, which is what a container
+///   packed WITHOUT the array panels looks like.
+pub fn array_specs(geometry: &Geometry) -> Vec<ConvSpec> {
+    let mut specs = Vec::new();
+    for (graph, convs) in [
+        (&geometry.det_graph, &geometry.det_convs),
+        (&geometry.rec_graph, &geometry.rec_convs),
+    ] {
+        for l in graph {
+            if l.op != Op::Conv || l.group != 1 || l.stream.is_empty() {
+                continue;
+            }
+            let Some(cw) = convs.get(l.conv as usize) else {
+                continue;
+            };
+            if cw.transposed || cw.depthwise() || cw.w.is_empty() {
+                continue;
+            }
+            specs.push(ConvSpec {
+                weight: l.w.clone(),
+                stream: l.stream.clone(),
+                k: (cw.cin * cw.kh * cw.kw) as usize,
+                n: cw.cout as usize,
+                bias: cw.b.clone(),
+            });
+        }
+    }
+    specs
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,6 +1385,8 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Ref
 pub struct Cost {
     /// The dense convolutions that ran on the host.
     pub convs_host: i64,
+    /// The dense convolutions that ran on the array.
+    pub convs_array: i64,
     /// The depthwise convolutions that ran on the host.
     pub dwconvs_host: i64,
     /// The transposed convolutions that ran on the host.
@@ -1350,6 +1395,12 @@ pub struct Cost {
     pub elementwise_ops: i64,
     /// The host's share of the dense convolutions.
     pub t_host: f64,
+    /// The array's share of the dense convolutions.
+    ///
+    /// The array's own time, measured around the call: the im2col and the
+    /// transpose back to NCHW stay on the host either way, and they are
+    /// counted as the host's, because that is where they happen.
+    pub t_array: f64,
     /// The depthwise convolutions' own time.
     pub t_dwconv: f64,
     /// The im2col's own time.
@@ -1748,6 +1799,7 @@ impl Network {
         &mut self,
         input: &Tensor,
         on_node: &mut dyn FnMut(i64, &Tensor),
+        mut array: ArrayRef<'_, '_>,
     ) -> Result<Vec<Tensor>, Refusal> {
         // THE BODY IS A LOCAL, not a field, and that is why the operands can
         // be BORROWED.
@@ -1766,7 +1818,7 @@ impl Network {
         for i in 0..self.graph.len() {
             let l = self.graph[i].clone();
             let nl = format!("node {i}");
-            let out = self.step(&body, i, &l, &nl)?;
+            let out = self.step(&body, i, &l, &nl, array.as_deref_mut())?;
             // THE CHECK, AND WHY IT IS HERE.
             //
             // Every op's output extent was resolved at PACK time and recorded
@@ -1800,6 +1852,7 @@ impl Network {
         index: usize,
         l: &Layer,
         nl: &str,
+        array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, Refusal> {
         // The operands. -1 is the image, and every other index is an EARLIER
         // op's output -- the graph is evaluated in order, which the reader
@@ -1825,7 +1878,7 @@ impl Network {
                 } else {
                     let inp = operand(0)?;
                     let table = self.wmat[l.conv as usize].clone();
-                    self.conv(inp, l, &w, table, nl)
+                    self.conv(inp, l, &w, table, nl, array)
                 }
             }
             Op::ConvTranspose => {
@@ -1979,6 +2032,7 @@ impl Network {
         w: &ConvW,
         table: Option<Vec<f32>>,
         nl: &str,
+        array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
             return Err(format!(
@@ -2059,25 +2113,55 @@ impl Network {
         };
         let t1 = std::time::Instant::now();
         self.c = vec![0.0f32; (m * n) as usize];
-        // OVER ROWS, like the oracle: a row's reduction is over `k` in
-        // order, so which thread computes a row changes the thread and not
-        // the number.
-        kernels::gemm_nt_rows(
-            &self.a,
-            m as usize,
-            &wkn,
-            k as usize,
-            n as usize,
-            &bias,
-            &mut self.c,
-            self.threads,
-        );
-        self.cost.t_gemm += t1.elapsed().as_secs_f64();
+        // THE ARRAY, OR THE HOST.
+        //
+        // This is the SEAM, and it is one branch in one place. The im2col
+        // above is the host's either way -- it is a gather, and the array's
+        // MMAC multiplies matrices -- and so is the transpose below.
+        //
+        // The two paths are NOT the same numbers: the array multiplies the
+        // weights rounded to bf16, and the host multiplies them in f32. So a
+        // run on the array is the same network with a coarser weight, and the
+        // difference is the width of bf16 and not a bug.
+        let on_array = array.is_some();
+        match array {
+            Some(array) => {
+                let t = std::time::Instant::now();
+                array
+                    .conv(&l.w, &self.a, m as usize, k as usize, n as usize, &mut self.c)
+                    .map_err(|e| format!("{nl}: {e}"))?;
+                self.cost.t_array += t.elapsed().as_secs_f64();
+                self.cost.convs_array += 1;
+            }
+            None => {
+                // OVER ROWS, like the oracle: a row's reduction is over `k` in
+                // order, so which thread computes a row changes the thread and not
+                // the number.
+                kernels::gemm_nt_rows(
+                    &self.a,
+                    m as usize,
+                    &wkn,
+                    k as usize,
+                    n as usize,
+                    &bias,
+                    &mut self.c,
+                    self.threads,
+                );
+                self.cost.t_gemm += t1.elapsed().as_secs_f64();
+                self.cost.convs_host += 1;
+            }
+        }
         let t2 = std::time::Instant::now();
         transpose_mn_to_nchw(&self.c, m, n, &mut out.d, self.threads);
         self.cost.t_transpose += t2.elapsed().as_secs_f64();
-        self.cost.t_host += t1.elapsed().as_secs_f64();
-        self.cost.convs_host += 1;
+        if !on_array {
+            // The host's share of a dense convolution is the GEMM AND the
+            // transpose back to NCHW, and it is measured HERE so that the
+            // transpose is in it. An array run has no host share of the
+            // multiplication: the transpose is the host's, and the GEMM is
+            // the array's.
+            self.cost.t_host += t1.elapsed().as_secs_f64();
+        }
         // The activation is a SEPARATE PASS, and the reason is arithmetic: the
         // host convolution's epilogue computes the OTHER architectures'
         // activations, and this one's hardswish and hardsigmoid carry a

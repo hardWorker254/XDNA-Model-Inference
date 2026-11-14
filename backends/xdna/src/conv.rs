@@ -19,7 +19,7 @@
 //! convolution's own.
 //!
 //! The padding is not bookkeeping. The A operand's padded COLUMNS are
-//! multiplied by the panel's padded columns, and a stale value there is a
+//! multiplied by the panel's padded rows, and a stale value there is a
 //! wrong number rather than a wrong shape -- which is harder to see than a
 //! wrong shape is. So the padded columns are zeroed, and they are zeroed
 //! FIRST and copied SECOND, exactly as the C++ runtime does it.
@@ -36,9 +36,23 @@
 //! The design computes a fixed number of rows per dispatch, and a
 //! convolution can have more rows than that. The rows go in chunks of the
 //! design's own, and each chunk is one dispatch.
+//!
+//! # THE SCRATCH IS THE CALLER'S, AND IT IS REUSED
+//!
+//! The detector's stem convolution gathers 230 400 rows of 27 values and
+//! dispatches them in 225 chunks of the design's 1024 rows. A scratch that
+//! was allocated and zeroed per chunk would cost more than the device
+//! does: the zeroing alone is megabytes per chunk, and the device's own
+//! time for the whole detector is under half a second.
+//!
+//! So the scratch belongs to the caller, it grows when it has to, and only
+//! the CHUNK'S OWN ROWS are touched per dispatch. The rows past the chunk
+//! keep their previous values, and that is safe: the design's GEMM is
+//! ROW-WISE, so a stale row can only reach its own output row, and the
+//! output rows past the chunk are not read.
 
 use crate::array::{ArrayDesign, ArrayError};
-use crate::gemm::{dispatch, pack_a, Datapath};
+use crate::gemm::{dispatch, Datapath};
 use crate::transport::Transport;
 use npum_format::f32_to_bf16;
 
@@ -86,12 +100,39 @@ impl ConvShape {
     }
 }
 
+/// The buffers one convolution's dispatch needs.
+///
+/// They are the caller's, and they are REUSED across the chunks and across
+/// the convolutions: the sizes grow to the largest shape and stay there.
+#[derive(Debug, Default)]
+pub struct ConvScratch {
+    /// The padded A operand, in the design's dtype.
+    a_packed: Vec<u8>,
+    /// The padded C operand, in f32.
+    c: Vec<f32>,
+}
+
+impl ConvScratch {
+    /// A scratch with room for `rows` rows of `k` columns, in f32.
+    pub fn new(rows: usize, k: usize) -> Self {
+        Self {
+            a_packed: vec![0u8; rows * k * 2],
+            c: Vec::new(),
+        }
+    }
+}
+
 /// Run one dense convolution on the array.
 ///
 /// `a` holds the host's im2col rows -- `m` rows of `shape.k` values -- and
 /// `out` receives `m` rows of `shape.n` values. The weight panel is staged
 /// and bound by the caller, and it is the container's own: pre-tiled into
 /// the MMAC's byte order and padded to the design's widths.
+///
+/// The number of dispatches is returned, because it is not the number of
+/// convolutions: a convolution with more rows than the design computes is
+/// several dispatches, and the count that says "the flag did what it said"
+/// is the one the device saw.
 pub fn conv<T: Transport>(
     design: &mut ArrayDesign<T>,
     instr: usize,
@@ -99,7 +140,8 @@ pub fn conv<T: Transport>(
     bias: Option<&[f32]>,
     a: &[f32],
     out: &mut [f32],
-) -> Result<(), ArrayError> {
+    scratch: &mut ConvScratch,
+) -> Result<usize, ArrayError> {
     shape.checked()?;
     if let Some(bias) = bias {
         if bias.len() != shape.n {
@@ -140,41 +182,56 @@ pub fn conv<T: Transport>(
         padded
     });
 
+    // THE SCRATCH, GROWN TO THE DESIGN'S SHAPE.
+    let a_need = shape.rows * shape.padded_k * dp.a_bytes;
+    if scratch.a_packed.len() < a_need {
+        scratch.a_packed.resize(a_need, 0);
+    }
+    let c_need = shape.rows * shape.padded_n;
+    if scratch.c.len() < c_need {
+        scratch.c.resize(c_need, 0.0);
+    }
+
     // THE CHUNKS.
     //
     // The design computes `rows` rows per dispatch, and a convolution can
     // have more rows than that.
     let mut done = 0usize;
+    let mut dispatches = 0usize;
     while done < m {
         let chunk = (m - done).min(shape.rows);
 
         // THE PADDED A, ZEROED FIRST AND COPIED SECOND.
         //
-        // The padded COLUMNS are multiplied by the panel's padded columns,
-        // and a stale value there is a wrong number rather than a wrong
-        // shape.
-        let mut padded_a = vec![0f32; shape.rows * shape.padded_k];
+        // The padded COLUMNS are multiplied by the panel's padded rows, and
+        // a stale value there is a wrong number rather than a wrong shape.
+        // Only the CHUNK'S OWN ROWS are touched: the rows past the chunk
+        // keep their old values, and the design's GEMM is row-wise, so they
+        // can only reach their own output rows -- which are not read.
+        let row_bytes = shape.padded_k * dp.a_bytes;
+        scratch.a_packed[..chunk * row_bytes].fill(0);
         for r in 0..chunk {
             let src = (done + r) * shape.k;
-            let dst = r * shape.padded_k;
-            padded_a[dst..dst + shape.k].copy_from_slice(&a[src..src + shape.k]);
+            let dst = r * row_bytes;
+            for c in 0..shape.k {
+                let value = f32_to_bf16(a[src + c]).to_le_bytes();
+                scratch.a_packed[dst + c * 2..dst + c * 2 + 2].copy_from_slice(&value);
+            }
         }
-        let a_packed = pack_a(&padded_a, chunk, shape.rows, shape.padded_k, dp.a_bytes);
 
         // THE DISPATCH.
         //
         // The design's own K and N, the chunk's rows, and the padded bias.
-        let mut c_padded = vec![0f32; chunk * shape.padded_n];
         dispatch(
             design,
             instr,
-            &a_packed,
+            &scratch.a_packed,
             chunk,
             shape.rows,
             dp,
             padded_bias.as_deref(),
             shape.padded_n,
-            &mut c_padded,
+            &mut scratch.c,
         )?;
 
         // THE NARROWING BACK.
@@ -183,12 +240,13 @@ pub fn conv<T: Transport>(
         for r in 0..chunk {
             let src = r * shape.padded_n;
             let dst = (done + r) * shape.n;
-            out[dst..dst + shape.n].copy_from_slice(&c_padded[src..src + shape.n]);
+            out[dst..dst + shape.n].copy_from_slice(&scratch.c[src..src + shape.n]);
         }
 
         done += chunk;
+        dispatches += 1;
     }
-    Ok(())
+    Ok(dispatches)
 }
 
 /// The A operand of a convolution, in the design's own dtype, without a

@@ -1068,13 +1068,31 @@ pub fn ocr(args: &Args, root: &Path) -> Outcome {
                 return crate::EXIT_REFUSED;
             }
         };
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the convolutions go to the array,
+        // the depthwise and the transposed ones stay on the host, and the
+        // run says how many it dispatched.
+        let array = if crate::ocr::wants_conv(args) {
+            match crate::ocr::open_array(path, session.geometry(), args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        session.set_array(array);
         let setup_s = started.elapsed().as_secs_f64();
         let name = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| arch.to_string());
         let geometry = session.geometry().clone();
-        crate::ocr::print_block(&name, &geometry, setup_s);
+        crate::ocr::print_block(&name, &geometry, setup_s, session.array());
         let _ = arch;
 
         let dump_path = args.value("--ocr-dump").map(std::path::PathBuf::from);
@@ -1125,16 +1143,15 @@ pub fn ocr(args: &Args, root: &Path) -> Outcome {
             crate::ocr::print_split(
                 session.det_cost(),
                 session.rec_cost(),
-                geometry.det_dense(),
                 geometry.det_depthwise(),
                 geometry.det_transposed(),
                 // The recogniser's counters accumulate over EVERY box, so the
                 // split reports the multiplication the oracle's does: the
                 // recogniser runs once per box, and its 24 dense and 14
                 // depthwise convolutions are counted once per crop.
-                geometry.rec_dense() * run.boxes_read,
                 geometry.rec_depthwise() * run.boxes_read,
                 geometry.rec_transposed() * run.boxes_read,
+                session.array(),
             );
             if text {
                 print!("{}", npum_cpu::ocr_decode::text_summary(image, &run));

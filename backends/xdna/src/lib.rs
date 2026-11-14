@@ -39,6 +39,7 @@
 //! is room".
 
 pub mod array;
+pub mod array_convs;
 pub mod conv;
 pub mod design;
 pub mod device;

@@ -41,7 +41,7 @@ use std::path::Path;
 pub const DUMP_HEADER: usize = 1 << 20;
 
 /// The block, printed to stderr before the first image.
-pub fn print_block(name: &str, g: &Geometry, setup_s: f64) {
+pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&dyn npum_model::array::ArrayConvs>) {
     eprintln!("NpuEmbeddings -- ocr (PaddleOCR text det + rec) on the CPU");
     eprintln!(
         "  model      {}: detector {}px, recogniser {}x{}, {} classes over {} characters",
@@ -68,16 +68,22 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64) {
         g.rec_pad_value
     );
     eprintln!("  ops        (npu = dispatched, host = this process)");
+    // THE CONVOLUTIONS' PLACEMENT, AND IT IS NOT ALWAYS THE HOST'S.
+    //
+    // The line says where the convolutions ran, and a run that dispatched
+    // them to the array and printed "host" would be the one thing the flag
+    // exists to prevent.
+    let convs_place = if array.is_some() { "npu" } else { "host" };
     eprintln!(
         "             {:<26} {:<5} {}",
         format!("{} x conv + {} x dwconv", g.det_dense(), g.det_depthwise()),
-        "host",
+        convs_place,
         "text detector, once per frame"
     );
     eprintln!(
         "             {:<26} {:<5} {}",
         format!("{} x conv + {} x dwconv", g.rec_dense(), g.rec_depthwise()),
-        "host",
+        convs_place,
         "text recogniser, once per box"
     );
     eprintln!(
@@ -94,6 +100,12 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64) {
         "  setup      {:.3} s (both graphs read, weights transposed once)",
         setup_s
     );
+    if let Some(array) = array {
+        eprintln!(
+            "  array      {:.1} MB of bf16 panels staged, once, at load",
+            array.staged_bytes() as f64 / (1024.0 * 1024.0)
+        );
+    }
 }
 
 /// The `--ocr-dump` line, once the path is known.
@@ -134,22 +146,21 @@ pub fn print_run(image: &str, r: &npum_cpu::ocr_decode::OcrResult) {
 pub fn print_split(
     det: &npum_cpu::ocr::Cost,
     rec: &npum_cpu::ocr::Cost,
-    det_dense: i64,
     det_dw: i64,
     det_tr: i64,
-    rec_dense: i64,
     rec_dw: i64,
     rec_tr: i64,
+    array: Option<&dyn npum_model::array::ArrayConvs>,
 ) {
-    let line = |who: &str, c: &npum_cpu::ocr::Cost, dense: i64, dw: i64, tr: i64| {
+    let line = |who: &str, c: &npum_cpu::ocr::Cost, dw: i64, tr: i64| {
         eprintln!(
             "             split  {}: {} convs on the host ({:.1} ms: {:.1} ms of GEMM, {:.1} ms \
              of transpose back), {} dwconv + {} convtranspose on the host ({:.1} ms), im2col \
              {:.1} ms",
             who,
-            dense,
+            c.convs_host,
             c.t_host * 1e3,
-            (c.t_host - c.t_transpose) * 1e3,
+            c.t_gemm * 1e3,
             c.t_transpose * 1e3,
             dw,
             tr,
@@ -157,8 +168,16 @@ pub fn print_split(
             c.t_im2col * 1e3
         );
     };
-    line("det", det, det_dense, det_dw, det_tr);
-    line("rec", rec, rec_dense, rec_dw, rec_tr);
+    line("det", det, det_dw, det_tr);
+    line("rec", rec, rec_dw, rec_tr);
+    if let Some(array) = array {
+        eprintln!(
+            "             array  {} convs on the array ({:.1} ms, {} dispatches)",
+            det.convs_array + rec.convs_array,
+            (det.t_array + rec.t_array) * 1e3,
+            array.dispatches()
+        );
+    }
 }
 
 /// The node-dump writer, installed for the lifetime of the process.
@@ -250,7 +269,130 @@ impl Dump {
     }
 }
 
+/// Whether the run asked for the convolutions to go on the array.
+///
+/// The flag is a SET of codes, and this family has exactly one of them:
+/// `conv`. Anything else is refused by the family's own check, which knows
+/// what this architecture has.
+pub fn wants_conv(args: &crate::flags::Args) -> bool {
+    args.value("--npu-ops")
+        .map(|v| v.split(',').any(|c| c.trim() == "conv"))
+        .unwrap_or(false)
+}
+
 /// Open a container and hand back the session, for the CLI's block.
 pub fn open(path: &Path) -> Result<npum_cpu::ocr_session::Ocr, String> {
-    npum_cpu::ocr_session::Ocr::open(path)
+    npum_cpu::ocr_session::Ocr::open(path, None)
+}
+
+/// Open the array's backend for this family, when the run asked for it.
+///
+/// # THE TWO THINGS THE ARRAY NEEDS ARE SEPARATE
+///
+/// * the PANELS -- the container's own pre-tiled bf16 weights, one per
+///   dense convolution. A container packed without them says so in its
+///   config, and the refusal says how to pack it.
+///
+/// * the DESIGN SET -- the compiled core. It is the MODEL's own and it
+///   cannot be guessed: its streams are named after the padded shapes this
+///   model's convolutions need, and a design set from another model would
+///   dispatch another model's shapes against this model's weights.
+///
+/// The container's own copy of the design set is preferred when it has one,
+/// and a directory is the fallback.
+pub fn open_array(
+    path: &Path,
+    geometry: &Geometry,
+    args: &crate::flags::Args,
+    root: &Path,
+) -> Result<Box<dyn npum_model::array::ArrayConvs>, String> {
+    use npum_xdna::array::ArrayDesign;
+    use npum_xdna::array_convs::ArrayConvs;
+    use npum_xdna::transport::Transport;
+
+    // THE PANELS.
+    let container =
+        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let streams = container.config_str("npu_streams").unwrap_or_default();
+    if streams.is_empty() {
+        return Err(format!(
+            "{}: --npu-ops conv needs the array panels, and this container does not carry \
+             any: it was packed without --npu. Repack with the packer's --npu, which stages \
+             a pre-tiled bf16 B panel for every DENSE convolution of BOTH graphs. (A design \
+             set is the SECOND requirement, and a separate one.)",
+            path.display()
+        ));
+    }
+
+    // THE DESIGN SET.
+    //
+    // The container's own copy first, and then the directory: the container
+    // is self-sufficient when it carries the set, and a container that does
+    // needs nothing beside it.
+    let own = container
+        .directory()
+        .tensor("design/gemm_rtp/design.json")
+        .is_some();
+    let dir = if own {
+        None
+    } else {
+        Some(find_design(root, path, args.value("--artifacts")).ok_or_else(|| {
+            format!(
+                "{}: --npu-ops conv needs a design set on disk: pass --artifacts <dir> naming \
+                 one, or build it with the exporter. The flag has no default to fall back on, \
+                 because this container's padded (K, N) designs are its own -- and picking one \
+                 silently is how a run reports array numbers from a design set belonging to \
+                 another model.",
+                path.display()
+            )
+        })?)
+    };
+
+    // THE BOARD.
+    let transport = npum_xdna::xrt::XrtTransport::open(0)
+        .map_err(|e| format!("{}: cannot open the NPU board: {e}", path.display()))?;
+    let design = match dir {
+        Some(dir) => ArrayDesign::open(&dir, transport).map_err(|e| e.to_string())?,
+        None => ArrayDesign::open_from_container(path, "gemm_rtp", transport)
+            .map_err(|e| e.to_string())?,
+    };
+
+    // THE CONVOLUTIONS.
+    let specs = npum_cpu::ocr::array_specs(geometry);
+    if specs.is_empty() {
+        return Err(format!(
+            "{}: the container names array streams, and none of them belongs to a convolution \
+             this graph runs.",
+            path.display()
+        ));
+    }
+    let backend = ArrayConvs::open(path, design, &specs).map_err(|e| e.to_string())?;
+    Ok(Box::new(backend))
+}
+
+/// The design set's directory, if one can be found.
+///
+/// The `--artifacts` flag first -- it is the reader saying where their own
+/// design set is -- and then the tree's own artifacts, under the model's
+/// name. The model's name is the CONTAINER'S file name, because that is
+/// what the artifacts are laid out under.
+fn find_design(root: &Path, model: &Path, named: Option<&str>) -> Option<std::path::PathBuf> {
+    let usable = |dir: &Path| dir.join("gemm_rtp").join("design.json").is_file();
+    if let Some(named) = named {
+        let dir = std::path::PathBuf::from(named);
+        if usable(&dir) {
+            return Some(dir.join("gemm_rtp"));
+        }
+        if dir.join("design.json").is_file() {
+            return Some(dir);
+        }
+    }
+    let stem = model
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return None;
+    }
+    crate::vit::find_designs(root, &stem).map(|dir| dir.join("gemm_rtp"))
 }
