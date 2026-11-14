@@ -280,12 +280,12 @@ pub fn transcribe(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: the audio file {audio} does not exist.");
             return crate::EXIT_REFUSED;
         }
-        eprintln!("  model      {}: {}", path.display(), arch);
-        if let Some(reason) = refuse_not_ported(npum_families::Family::Stt) {
+        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Stt) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        0
+        let _ = arch;
+        crate::stt::run(path, audio, args, root)
     })
 }
 

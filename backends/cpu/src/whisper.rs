@@ -67,6 +67,8 @@ pub struct Geometry {
     pub vocab: usize,
     /// How many mel bands.
     pub mel_bins: usize,
+    /// The transform's hop, in samples.
+    pub hop_length: usize,
     /// The LayerNorm's epsilon.
     pub ln_eps: f64,
     /// The attention's scale.
@@ -95,6 +97,7 @@ impl Geometry {
             max_target: config.get_i64("max_target_positions")? as usize,
             vocab: config.get_i64("vocab_size")? as usize,
             mel_bins: config.get_i64("num_mel_bins")? as usize,
+            hop_length: config.get_i64("hop_length")? as usize,
             ln_eps: config.get_f64("layer_norm_eps")?,
             attn_scale: config.get_f64("attention_scale")?,
             qkv_scale_folded: config.get_str("qkv_scale_folded") != Some("false"),

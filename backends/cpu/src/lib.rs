@@ -38,6 +38,7 @@ pub mod bert;
 pub mod kernels;
 pub mod whisper;
 pub mod whisper_features;
+pub mod whisper_session;
 pub mod whisper_tokenizer;
 
 use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};

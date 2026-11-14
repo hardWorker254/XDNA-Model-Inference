@@ -47,6 +47,7 @@ pub mod direct;
 #[cfg(feature = "xrt")]
 pub mod xrt;
 
+pub mod contention;
 pub mod dispatch;
 
 pub use design::{Design, DesignSet};
