@@ -39,6 +39,7 @@ pub mod hands;
 pub mod help;
 pub mod list;
 pub mod mppose;
+pub mod ocr;
 pub mod pose;
 pub mod root;
 pub mod serve;

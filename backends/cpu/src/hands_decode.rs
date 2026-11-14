@@ -482,6 +482,25 @@ pub fn letterbox(src: &Image, side: i64) -> Result<(Image, Letterbox), String> {
 /// is a channel that reaches the first convolution as a NaN rather than as an
 /// error.
 pub fn to_nchw_normalised(src: &Image, mean: &[f32], std_dev: &[f32]) -> Result<Tensor, String> {
+    let d = to_nchw_normalised_values(src, mean, std_dev)?;
+    Ok(Tensor {
+        c: 3,
+        h: src.height,
+        w: src.width,
+        d,
+    })
+}
+
+/// The same normalisation, as a flat buffer.
+///
+/// The OCR family's tensors are not all NCHW -- the recogniser's attention
+/// block has rank-5 ones -- so this returns the VALUES and lets the caller
+/// wrap them in whatever shape it needs.
+pub fn to_nchw_normalised_values(
+    src: &Image,
+    mean: &[f32],
+    std_dev: &[f32],
+) -> Result<Vec<f32>, String> {
     if src.empty() {
         return Err("to_nchw_normalised: the image is empty".into());
     }
@@ -515,12 +534,7 @@ pub fn to_nchw_normalised(src: &Image, mean: &[f32], std_dev: &[f32]) -> Result<
             out[base + p] = ((v - mu) / sd) as f32;
         }
     }
-    Ok(Tensor {
-        c: 3,
-        h: src.height,
-        w: src.width,
-        d: out,
-    })
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -175,6 +175,93 @@ pub fn decode_jpeg(bytes: &[u8], name: &str) -> Result<Image, String> {
 /// The PNG signature.
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
+unsafe extern "C" {
+    /// libpng, through the shim. See `png_shim.c`.
+    fn npue_png_decode(
+        data: *const u8,
+        length: std::ffi::c_ulong,
+        out: *mut *mut u8,
+        width: *mut i32,
+        height: *mut i32,
+        bit_depth: *mut i32,
+        errbuf: *mut u8,
+        errlen: std::ffi::c_ulong,
+    ) -> i32;
+}
+
+/// Decode a PNG into RGB.
+///
+/// The same libpng the C++ runtime calls, and the same decisions it makes:
+/// a palette becomes RGB, a grayscale becomes RGB by REPLICATION (which is
+/// what PIL's `convert("RGB")` does and therefore what the checkpoint was
+/// trained to see), a `tRNS` key becomes a real alpha, and a four-channel
+/// image is composited onto WHITE rather than treated as black.
+///
+/// A 16-BIT PNG is REFUSED BY NAME, and the reason is a measured
+/// disagreement rather than a preference: there are two ways to turn 16 bits
+/// into 8 and this build cannot pick between them by looking at the file.
+/// libpng's strip-16 drops the LOW byte -- a correct 16->8 reduction -- and
+/// PIL's `.convert("RGB")` on an `I;16` image CLIP8s every value above 255
+/// to white. The two give DIFFERENT images, and PIL's is the one
+/// transformers feeds the model, so the alternatives are a near-correct
+/// picture and a near-white one. Neither is guessed at; the file is named.
+pub fn decode_png(bytes: &[u8], name: &str) -> Result<Image, String> {
+    let mut out: *mut u8 = std::ptr::null_mut();
+    let mut width: i32 = 0;
+    let mut height: i32 = 0;
+    let mut bit_depth: i32 = 0;
+    let mut err = [0u8; 256];
+    let ok = unsafe {
+        npue_png_decode(
+            bytes.as_ptr(),
+            bytes.len() as std::ffi::c_ulong,
+            &mut out,
+            &mut width,
+            &mut height,
+            &mut bit_depth,
+            err.as_mut_ptr(),
+            err.len() as std::ffi::c_ulong,
+        )
+    };
+    if ok == 0 {
+        let message = String::from_utf8_lossy(&err)
+            .trim_end_matches('\0')
+            .to_string();
+        return Err(format!(
+            "{name}: {}",
+            if message.is_empty() {
+                "PNG is corrupt or truncated"
+            } else {
+                &message
+            }
+        ));
+    }
+    if bit_depth == 16 {
+        // The buffer is freed below, before the refusal is returned: the
+        // refusal is a policy about the FILE and the allocation is the
+        // decoder's.
+        unsafe { npue_free(out as *mut std::ffi::c_void) };
+        return Err(format!(
+            "{name}: PNG is 16 bits per channel and this runtime reads 8-bit \
+             images. It will not choose for you: dropping the low byte (what \
+             libpng's strip-16 does, and a correct 16->8 reduction) and what \
+             PIL does -- .convert(\"RGB\") on an I;16 image, which CLIP8s every \
+             value above 255 to white -- give DIFFERENT images, and PIL's is \
+             the one transformers feeds the model, so the two answers are a \
+             near-correct picture and a near-white one. Re-save the image as \
+             8-bit PNG or JPEG."
+        ));
+    }
+    let count = (width as usize) * (height as usize) * 3;
+    let rgb = unsafe { std::slice::from_raw_parts(out, count) }.to_vec();
+    unsafe { npue_free(out as *mut std::ffi::c_void) };
+    Ok(Image {
+        width: width as i64,
+        height: height as i64,
+        rgb,
+    })
+}
+
 /// Decode a PNG or a JPEG into RGB.
 ///
 /// PNG and JPEG only, and both are DECIDED BY MAGIC BYTES: a `.png` that
@@ -183,10 +270,9 @@ const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// returns an error the user cannot act on, or worse, succeeds on the wrong
 /// bytes.
 ///
-/// A PNG is REFUSED here, by name, and not decoded: the PNG reader is
-/// libpng's, and the OCR family is where it is wired. Refusing is the
-/// honest answer -- a decoder that guesses at a format reports a label for
-/// a picture it may never have seen.
+/// A file that is neither is REFUSED here, by name, and not guessed at: a
+/// runtime that guesses at an image format reports a label for a picture it
+/// may never have seen.
 pub fn decode_image_bytes(bytes: &[u8], name: &str) -> Result<Image, String> {
     if bytes.len() < 8 {
         return Err(format!(
@@ -195,10 +281,7 @@ pub fn decode_image_bytes(bytes: &[u8], name: &str) -> Result<Image, String> {
         ));
     }
     if bytes[..8] == PNG_MAGIC {
-        return Err(format!(
-            "{name}: a PNG. This runtime's image front end decodes JPEG; the PNG \
-             reader is not wired here yet, and it will not guess at one."
-        ));
+        return decode_png(bytes, name);
     }
     if bytes[0] == 0xFF && bytes[1] == 0xD8 {
         return decode_jpeg(bytes, name);

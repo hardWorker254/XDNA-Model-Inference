@@ -36,51 +36,79 @@ const FLAGS: [&str; 3] = ["-O2", "-fPIC", "-std=c11"];
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
-    let shim = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jpeg_shim.c");
-    let object = std::path::Path::new(&out_dir).join("jpeg_shim.o");
-
     let cc = compiler();
-    let mut command = Command::new(&cc);
-    command.args(FLAGS).arg("-c").arg(&shim).arg("-o").arg(&object);
-    // The header is in the default include path on every system that has
-    // libjpeg's development files; a caller who keeps them elsewhere can
-    // point at them with CFLAGS, which cargo passes through.
-    if let Ok(extra) = std::env::var("CFLAGS") {
-        for flag in extra.split_whitespace() {
-            command.arg(flag);
-        }
-    }
-    let status = command
-        .status()
-        .unwrap_or_else(|e| panic!("{cc} could not be run: {e}"));
-    if !status.success() {
-        panic!(
-            "{cc} failed to compile the JPEG shim.\n\
-             The image front end decodes JPEG through libjpeg, the same library \
+
+    // The two shims, and the libraries they need.
+    //
+    // JPEG is the classifier's front end and PNG is the OCR family's, and the
+    // reason both are C is the same: the answer is the end of a chain that
+    // starts with PIXELS, so the decode has to be the SAME bytes and not a
+    // close enough copy.
+    let shims: [(&str, &str, &str); 2] = [
+        (
+            "jpeg_shim.c",
+            "npum_jpeg_shim",
+            "The image front end decodes JPEG through libjpeg, the same library \
              the C++ runtime uses, because the classifier's probability is the \
              end of a chain that starts with pixels and a different IDCT gives \
              a different answer.\n\
              Install libjpeg's development files (libjpeg-dev, libjpeg-devel) \
-             or set CC to a compiler that can find jpeglib.h."
-        );
+             or set CC to a compiler that can find jpeglib.h.",
+        ),
+        (
+            "png_shim.c",
+            "npum_png_shim",
+            "The OCR family's front end decodes PNG through libpng, the same \
+             library the C++ runtime uses, because the transcription is the end \
+             of a chain that starts with pixels and a different inflate gives \
+             a different character.\n\
+             Install libpng's development files (libpng-dev, libpng-devel) \
+             or set CC to a compiler that can find png.h.",
+        ),
+    ];
+
+    for (file, archive_name, hint) in shims {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(file);
+        let object = std::path::Path::new(&out_dir).join(format!("{archive_name}.o"));
+
+        let mut command = Command::new(&cc);
+        command.args(FLAGS).arg("-c").arg(&source).arg("-o").arg(&object);
+        // The header is in the default include path on every system that has
+        // the library's development files; a caller who keeps them elsewhere
+        // can point at them with CFLAGS, which cargo passes through.
+        if let Ok(extra) = std::env::var("CFLAGS") {
+            for flag in extra.split_whitespace() {
+                command.arg(flag);
+            }
+        }
+        let status = command
+            .status()
+            .unwrap_or_else(|e| panic!("{cc} could not be run: {e}"));
+        if !status.success() {
+            panic!("{cc} failed to compile {archive_name}.\n{hint}");
+        }
+
+        // The object goes into an archive, because the linker wants a LIBRARY
+        // and an object file is not one.
+        let archive = std::path::Path::new(&out_dir).join(format!("lib{archive_name}.a"));
+        let _ = std::fs::remove_file(&archive);
+        let ar_status = Command::new("ar")
+            .arg("rcs")
+            .arg(&archive)
+            .arg(&object)
+            .status()
+            .unwrap_or_else(|e| panic!("ar could not be run: {e}"));
+        if !ar_status.success() {
+            panic!("ar failed to archive {archive_name}");
+        }
+
+        println!("cargo:rustc-link-search=native={out_dir}");
+        println!("cargo:rustc-link-lib=static={archive_name}");
+        println!("cargo:rerun-if-changed=src/{file}");
     }
 
-    // The object goes into an archive, because the linker wants a LIBRARY
-    // and an object file is not one.
-    let archive = std::path::Path::new(&out_dir).join("libnpum_jpeg_shim.a");
-    let _ = std::fs::remove_file(&archive);
-    let ar_status = Command::new("ar")
-        .arg("rcs")
-        .arg(&archive)
-        .arg(&object)
-        .status()
-        .unwrap_or_else(|e| panic!("ar could not be run: {e}"));
-    if !ar_status.success() {
-        panic!("ar failed to archive the JPEG shim");
-    }
-
-    println!("cargo:rustc-link-search=native={out_dir}");
-    println!("cargo:rustc-link-lib=static=npum_jpeg_shim");
     println!("cargo:rustc-link-lib=jpeg");
-    println!("cargo:rerun-if-changed=src/jpeg_shim.c");
+    println!("cargo:rustc-link-lib=png");
 }

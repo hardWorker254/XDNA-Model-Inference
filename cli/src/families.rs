@@ -140,16 +140,6 @@ fn warn_if_unpinned(name: &str) {
     println!();
 }
 
-/// The refusal for a family this runtime does not run yet.
-///
-/// The families arrive in the plan's order, and the ones that have not
-/// arrived say so BY NAME. Exiting 0 with nothing on the stdout would be
-/// a lie about the answer: a script would read it as "the model said
-/// nothing", and the model's answer is a sentence.
-fn refuse_not_ported(family: npum_families::Family) -> Option<String> {
-    family.not_ported_refusal()
-}
-
 /// The refusal for an operation this architecture does not have.
 ///
 /// The check lives in the FAMILY's path and not in the global gate,
@@ -935,21 +925,177 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
 }
 
 /// `ocr`.
+///
+/// Two graphs, one container, one image in and N boxes of text out. The
+/// detector finds the boxes and the recogniser reads each of them, and the
+/// decode between the two stages is where this family's subtlety lives; it is
+/// in `npum_cpu::ocr_decode`. This function is the block, the per-image lines
+/// and the loop.
 pub fn ocr(args: &Args, root: &Path) -> Outcome {
     let Some(model) = args.positional.first() else {
         return crate::needs_a_model("ocr");
     };
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: this is an OCR model, so say what to read:");
+        eprintln!("    npuimage ocr <model> <image.png> [more.png ...]");
+        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
+        eprintln!("  --max-boxes 1      read at most N boxes");
+        eprintln!("  --text             a human summary instead of JSON");
+        eprintln!("  --ocr-dump FILE    every graph node's output, for the gate");
+        eprintln!(
+            "  (every threshold comes from the container, not from a flag: they are\n   \
+             part of the checkpoint -- see the refusal above)"
+        );
+        return crate::EXIT_REFUSED;
+    }
     with_model(model, npum_families::Family::Ocr, root, |path, arch| {
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Ocr) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        eprintln!("  model      {}: {}", path.display(), arch);
-        if let Some(reason) = refuse_not_ported(npum_families::Family::Ocr) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
+        // The other architectures' own flags are REFUSED rather than ignored: they
+        // read as "thresholds for the detection" on a mode that also has a detector,
+        // and silently dropping them would produce a run whose boxes differ from the
+        // one that was asked for with nothing in the output saying so.
+        for f in [
+            "--conf",
+            "--iou",
+            "--kpt",
+            "--max-det",
+            "--pose",
+            "--pose-dump",
+            "--bo-mode",
+            "--max-hands",
+            "--hands-dump",
+            "--max-people",
+            "--mppose-dump",
+        ] {
+            if args.value(f).is_some() || args.switch(f) {
+                eprintln!(
+                    "error: {f}: not a flag of `ocr`. The detector's thresholds and the \
+                     recogniser's are read from the container (det_thresh, det_box_thresh, \
+                     det_unclip_ratio, det_max_candidates, det_min_size), because they are \
+                     part of how this checkpoint was trained and the demo that recorded the \
+                     golden used the container's values, not a command line's. For --pose: use \
+                     `pose`, which is a different model with different flags; for \
+                     --max-people: use `mppose`, whose second stage is a landmark network \
+                     and not a recogniser. The dumps are separate because they record \
+                     different graphs, and one reader cannot read another's file."
+                );
+                return crate::EXIT_REFUSED;
+            }
         }
-        0
+        // --max-boxes: a CAP on how many boxes reach the recogniser, not a score
+        // threshold. Every box is an independent crop of the original frame, so there
+        // is no way to batch them and the only lever is how many to read.
+        let mut max_boxes = -1i64;
+        if let Some(v) = args.value("--max-boxes") {
+            match v.parse::<i64>() {
+                Ok(n) if (1..=10000).contains(&n) => max_boxes = n,
+                _ => {
+                    eprintln!(
+                        "error: --max-boxes '{v}': expected an integer in 1..10000, or omit it \
+                         to read every box the detector found"
+                    );
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        let text = args.switch("--text");
+        let started = std::time::Instant::now();
+        let mut session = match crate::ocr::open(path) {
+            Ok(s) => s,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let setup_s = started.elapsed().as_secs_f64();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        let geometry = session.geometry().clone();
+        crate::ocr::print_block(&name, &geometry, setup_s);
+        let _ = arch;
+
+        let dump_path = args.value("--ocr-dump").map(std::path::PathBuf::from);
+        let mut dump = match dump_path.as_deref() {
+            Some(p) => match crate::ocr::Dump::create(p) {
+                Ok(d) => Some(d),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            },
+            None => None,
+        };
+        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
+            crate::ocr::print_dump_header(p, &geometry);
+        }
+
+        let mut exit = 0;
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            let run = {
+                let mut hook = |net: &str, node: i64, t: &npum_cpu::ocr::Tensor| {
+                    if let Some(d) = dump.as_mut() {
+                        d.record(net, node, t);
+                    }
+                };
+                session.read(&decoded, max_boxes, &mut hook)
+            };
+            let run = match run {
+                Ok(r) => r,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_mut() {
+                d.image += 1;
+            }
+            crate::ocr::print_run(image, &run);
+            crate::ocr::print_split(
+                session.det_cost(),
+                session.rec_cost(),
+                geometry.det_dense(),
+                geometry.det_depthwise(),
+                geometry.det_transposed(),
+                // The recogniser's counters accumulate over EVERY box, so the
+                // split reports the multiplication the oracle's does: the
+                // recogniser runs once per box, and its 24 dense and 14
+                // depthwise convolutions are counted once per crop.
+                geometry.rec_dense() * run.boxes_read,
+                geometry.rec_depthwise() * run.boxes_read,
+                geometry.rec_transposed() * run.boxes_read,
+            );
+            if text {
+                print!("{}", npum_cpu::ocr_decode::text_summary(image, &run));
+                continue;
+            }
+            print!("{}", npum_cpu::ocr_decode::result_json(&run, image));
+        }
+
+        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
+            match d.finish(p) {
+                Ok(n) => eprintln!("             {n} node tensors written"),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        exit
     })
 }
 

@@ -131,7 +131,7 @@ impl Family {
             Family::Pose => None,
             Family::Hands => None,
             Family::MpPose => None,
-            Family::Ocr => Some("the text detector, the recogniser and the box merging"),
+            Family::Ocr => None,
         }
     }
 

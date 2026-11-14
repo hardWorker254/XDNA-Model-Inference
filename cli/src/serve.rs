@@ -196,6 +196,39 @@ pub fn serve(
             crate::pose::print_block(&name, &geometry, detector.threads(), setup_s);
             pose = Some(detector);
         }
+        npum_families::Family::MpPose => {
+            // NOT "not ported": the block IS ported and `npuimage mppose`
+            // prints it. The reason there is no server here is the oracle's
+            // own -- arch 8 has no endpoint in C++ either -- and saying
+            // otherwise would name a gap that does not exist while hiding the
+            // one that does.
+            eprintln!(
+                "error: this architecture has no HTTP endpoint yet, so `serve` cannot be \
+                 honoured for a MediaPipe Pose container. `npuimage mppose` is the whole \
+                 answer: a server answering from a different code path than the CLI is \
+                 exactly the drift the pose endpoint documents as a contract."
+            );
+            return crate::EXIT_REFUSED;
+        }
+        npum_families::Family::Ocr => {
+            // The oracle's refusal, in the oracle's words: arch 9 has no
+            // endpoint in C++ either, and saying "not ported" would name a
+            // gap that does not exist -- the CLI reads text -- while hiding
+            // the one that does: there is no endpoint to land on.
+            eprintln!(
+                "error: this architecture has no HTTP endpoint yet, so `serve` cannot be \
+                 honoured for an OCR container. The four that exist are /v1/embeddings \
+                 (arch 1,2,3), /v1/audio/transcriptions (arch 4), /v1/classify (arch 5) \
+                 and /v1/pose (arch 6, YOLOv8n-pose -- a DIFFERENT pose model); arch 9 is \
+                 the third container whose arch the dispatcher routes here without an \
+                 endpoint to land on. Not refused because a text cannot be found over \
+                 HTTP -- it can -- but because a server that answers from a DIFFERENT \
+                 code path than `npuimage ocr` is exactly the drift the pose endpoint \
+                 documents as a contract. Until the endpoint exists, the CLI is the whole \
+                 answer."
+            );
+            return crate::EXIT_REFUSED;
+        }
         _ => {
             // The families whose block is not written yet refuse to start.
             // A server that answered a request it cannot answer would be
