@@ -36,6 +36,7 @@
 
 pub mod bert;
 pub mod kernels;
+pub mod whisper;
 
 use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 use npum_model::caps::Precision as CapsPrecision;
