@@ -310,6 +310,9 @@ pub fn refuse_unknown_npu_op(code: &str) -> String {
 /// so a trailing comma and `--npu-ops ""` are the same thing.
 pub fn parse_npu_ops(list: &str) -> Result<Vec<&'static str>, String> {
     let mut out = Vec::new();
+    // The codes come back SORTED, because the C++'s are a `std::set` and
+    // every message that names them walks that set. The order the user
+    // typed them in is echoed unchanged where it is echoed at all.
     for item in list.split(',') {
         let code = item.trim();
         if code.is_empty() {
@@ -324,6 +327,7 @@ pub fn parse_npu_ops(list: &str) -> Result<Vec<&'static str>, String> {
             None => return Err(refuse_unknown_npu_op(code)),
         }
     }
+    out.sort_unstable();
     Ok(out)
 }
 

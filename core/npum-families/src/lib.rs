@@ -28,6 +28,7 @@
 //! The second check matters because the flag form has no verb to check.
 
 pub mod catalogue;
+pub mod ops;
 pub mod registry;
 
 use npum_model::ModelSpec;

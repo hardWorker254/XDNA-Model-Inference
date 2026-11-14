@@ -140,6 +140,20 @@ fn warn_if_unpinned(name: &str) {
     println!();
 }
 
+/// The refusal for an operation this architecture does not have.
+///
+/// The check lives in the FAMILY's path and not in the global gate,
+/// because what an architecture has is the architecture's business: the
+/// same code is valid for one family and not for another, and the
+/// refusal has to say which.
+fn refuse_op_not_in_arch(args: &Args, family: npum_families::Family) -> Option<String> {
+    let listing = args.value("--npu-ops")?;
+    // The codes were checked against the ones this build knows when the
+    // command line was parsed; a failure here would be a different bug.
+    let codes = crate::flags::parse_npu_ops(listing).ok()?;
+    npum_families::ops::refuse_op_not_in_arch(family, listing, &codes)
+}
+
 /// `add`.
 ///
 /// The sha256 is checked BEFORE anything else, and a pin that can never
@@ -267,6 +281,10 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
         return crate::needs_a_model("classify");
     };
     with_model(model, npum_families::Family::Cls, root, |path, arch| {
+        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Cls) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         eprintln!("  model      {}: {}", path.display(), arch);
         0
     })
@@ -278,6 +296,10 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
         return crate::needs_a_model("pose");
     };
     with_model(model, npum_families::Family::Pose, root, |path, arch| {
+        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Pose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         eprintln!("  model      {}: {}", path.display(), arch);
         0
     })
@@ -289,6 +311,10 @@ pub fn hands(args: &Args, root: &Path) -> Outcome {
         return crate::needs_a_model("hands");
     };
     with_model(model, npum_families::Family::Hands, root, |path, arch| {
+        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Hands) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         eprintln!("  model      {}: {}", path.display(), arch);
         0
     })
@@ -300,6 +326,10 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
         return crate::needs_a_model("mppose");
     };
     with_model(model, npum_families::Family::MpPose, root, |path, arch| {
+        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::MpPose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         eprintln!("  model      {}: {}", path.display(), arch);
         0
     })
@@ -311,6 +341,10 @@ pub fn ocr(args: &Args, root: &Path) -> Outcome {
         return crate::needs_a_model("ocr");
     };
     with_model(model, npum_families::Family::Ocr, root, |path, arch| {
+        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Ocr) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         eprintln!("  model      {}: {}", path.display(), arch);
         0
     })
