@@ -26,7 +26,9 @@
 //! does the same thing, for the same reason.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use npum_format::Container;
 
 use crate::manifest::DesignInfo;
 use crate::transport::{BufferFlags, Transport, TransportError};
@@ -86,7 +88,7 @@ pub struct ArrayDesign<T: Transport> {
     /// Which slot each data buffer is bound to.
     bound: Vec<usize>,
     /// Where it was loaded from, for the messages.
-    dir: PathBuf,
+    label: String,
 }
 
 impl<T: Transport> ArrayDesign<T> {
@@ -98,17 +100,86 @@ impl<T: Transport> ArrayDesign<T> {
     /// error, so the choice belongs to the caller.
     pub fn open(dir: &Path, transport: T) -> Result<Self, ArrayError> {
         let info = DesignInfo::read(dir).map_err(ArrayError::Design)?;
-
-        if info.buffers.len() < 2 {
-            return Err(ArrayError::Design(format!(
-                "{}: fewer than two data buffers",
-                dir.display()
-            )));
-        }
-
         let xclbin = std::fs::read(dir.join("final.xclbin")).map_err(|e| {
             ArrayError::Design(format!("cannot read {}/final.xclbin: {e}", dir.display()))
         })?;
+        let mut blobs = Vec::new();
+        for stream in info.streams_in_slot_order() {
+            let bytes = std::fs::read(dir.join(&stream.file)).map_err(|e| {
+                ArrayError::Design(format!(
+                    "cannot read {}/{}: {e}",
+                    dir.display(),
+                    stream.file
+                ))
+            })?;
+            blobs.push(bytes);
+        }
+        Self::load(transport, info, xclbin, blobs, dir.display().to_string())
+    }
+
+    /// Load a design set out of a container.
+    ///
+    /// A container can carry its own compiled design set, and a container that
+    /// does needs nothing beside it: no directory, no MLIR-AIE on the reader's
+    /// machine, no artifacts to install. That is why the packer embeds the
+    /// set by default, and why the set's files live in the container under
+    /// `design/<set>/`.
+    ///
+    /// THE CONTAINER IS THE PREFERRED SOURCE, and the directory is the
+    /// fallback -- not the other way round, and not "preferred" in the sense
+    /// of "changes nothing for anyone who has both": every existing layout,
+    /// every gate and every refusal behaves exactly as it did.
+    pub fn open_from_container(
+        container: &Path,
+        set: &str,
+        transport: T,
+    ) -> Result<Self, ArrayError> {
+        let file = Container::open(container).map_err(|e| {
+            ArrayError::Design(format!("cannot open {}: {e}", container.display()))
+        })?;
+        let prefix = format!("design/{set}");
+        let read = |name: &str| -> Result<Vec<u8>, ArrayError> {
+            let key = format!("{prefix}/{name}");
+            file.tensor_bytes(&key)
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| ArrayError::Design(format!("{container:?} has no {key}: {e}")))
+        };
+        let manifest = read("design.json")?;
+        let info: DesignInfo = serde_json::from_slice(&manifest).map_err(|e| {
+            ArrayError::Design(format!(
+                "cannot parse the container's {prefix}/design.json: {e}"
+            ))
+        })?;
+        let xclbin = read("final.xclbin")?;
+        let mut blobs = Vec::new();
+        for stream in info.streams_in_slot_order() {
+            blobs.push(read(&stream.file)?);
+        }
+        Self::load(
+            transport,
+            info,
+            xclbin,
+            blobs,
+            format!("the container's {prefix}"),
+        )
+    }
+
+    /// The one body both constructors go through.
+    ///
+    /// Two constructors and one body, so the buffer-object dance that follows
+    /// cannot be got right in one spelling and wrong in the other.
+    fn load(
+        transport: T,
+        info: DesignInfo,
+        xclbin: Vec<u8>,
+        instr_blobs: Vec<Vec<u8>>,
+        label: String,
+    ) -> Result<Self, ArrayError> {
+        if info.buffers.len() < 2 {
+            return Err(ArrayError::Design(format!(
+                "{label}: fewer than two data buffers"
+            )));
+        }
 
         let mut transport = transport;
         transport.open_context(&xclbin)?;
@@ -124,14 +195,7 @@ impl<T: Transport> ArrayDesign<T> {
         // THE INSTRUCTION STREAMS, IN SLOT ORDER.
         let mut instr = Vec::new();
         let mut instr_words = Vec::new();
-        for stream in info.streams_in_slot_order() {
-            let bytes = std::fs::read(dir.join(&stream.file)).map_err(|e| {
-                ArrayError::Design(format!(
-                    "cannot read {}/{}: {e}",
-                    dir.display(),
-                    stream.file
-                ))
-            })?;
+        for bytes in instr_blobs {
             let group = transport.group_id(GROUP_INSTRUCTION)?;
             let buffer = transport.alloc(
                 bytes.len() as u64,
@@ -164,7 +228,7 @@ impl<T: Transport> ArrayDesign<T> {
             instr_words,
             slots,
             bound,
-            dir: dir.to_path_buf(),
+            label,
         })
     }
 
@@ -196,13 +260,13 @@ impl<T: Transport> ArrayDesign<T> {
         let slots = self.slots.get(index).ok_or_else(|| {
             ArrayError::Design(format!(
                 "{}: no data buffer {index}",
-                self.dir.display()
+                self.label
             ))
         })?;
         if slot >= slots.len() {
             return Err(ArrayError::Design(format!(
                 "{}: data buffer {index} has no slot {slot}",
-                self.dir.display()
+                self.label
             )));
         }
         self.bound[index] = slot;
@@ -219,13 +283,13 @@ impl<T: Transport> ArrayDesign<T> {
         let capacity = self.info.buffers.get(index).copied().ok_or_else(|| {
             ArrayError::Design(format!(
                 "{}: no data buffer {index}",
-                self.dir.display()
+                self.label
             ))
         })?;
         if data.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
                 "{}: {} bytes for data buffer {index}, and the design allows {capacity}",
-                self.dir.display(),
+                self.label,
                 data.len()
             )));
         }
@@ -250,13 +314,13 @@ impl<T: Transport> ArrayDesign<T> {
         let capacity = self.info.buffers.get(index).copied().ok_or_else(|| {
             ArrayError::Design(format!(
                 "{}: no data buffer {index}",
-                self.dir.display()
+                self.label
             ))
         })?;
         if data.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
                 "{}: {} bytes for data buffer {index}, and the design allows {capacity}",
-                self.dir.display(),
+                self.label,
                 data.len()
             )));
         }
@@ -276,7 +340,7 @@ impl<T: Transport> ArrayDesign<T> {
         let instr = self.instr.get(slot).ok_or_else(|| {
             ArrayError::Design(format!(
                 "{}: no instruction slot {slot}",
-                self.dir.display()
+                self.label
             ))
         })?;
         let args: Vec<&T::Buffer> = self
@@ -302,7 +366,7 @@ impl<T: Transport> ArrayDesign<T> {
         if out.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
                 "{}: {} bytes out of data buffer {index}, and the design allows {capacity}",
-                self.dir.display(),
+                self.label,
                 out.len()
             )));
         }

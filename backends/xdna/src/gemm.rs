@@ -33,24 +33,7 @@
 
 use crate::array::{ArrayDesign, ArrayError};
 use crate::transport::Transport;
-
-/// f32 to bf16, round to nearest even.
-///
-/// The same rounding the C++ runtime's `bf16_fill` does: add 0x7fff and the
-/// low bit of the mantissa's top half, then take the top half. Round-to-
-/// nearest-EVEN, so a value exactly halfway between two bf16 neighbours
-/// goes to the even one -- and a value that is exactly halfway is the case
-/// that decides a number in the last digit.
-fn to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding = 0x7fffu64 + ((bits >> 16) & 1) as u64;
-    ((bits as u64 + rounding) >> 16) as u16
-}
-
-/// bf16 to f32.
-fn from_bf16(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
+use npum_format::{bf16_to_f32, f32_to_bf16};
 
 /// The element size of an operand dtype, as the manifest spells it.
 fn elem_bytes(dtype: &str) -> Option<usize> {
@@ -153,7 +136,7 @@ pub fn gemm<T: Transport>(
     // The real rows first, then the padded tail as zeros.
     let mut a_packed = vec![0u8; rows * k * a_bytes];
     for i in 0..(n_real * k) {
-        a_packed[i * 2..i * 2 + 2].copy_from_slice(&to_bf16(a[i]).to_le_bytes());
+        a_packed[i * 2..i * 2 + 2].copy_from_slice(&f32_to_bf16(a[i]).to_le_bytes());
     }
     design.write_bound(0, &a_packed)?;
 
@@ -172,7 +155,7 @@ pub fn gemm<T: Transport>(
     for r in 0..n_real {
         for j in 0..n {
             let bits = u16::from_le_bytes([c_packed[(r * n + j) * 2], c_packed[(r * n + j) * 2 + 1]]);
-            let mut value = from_bf16(bits);
+            let mut value = bf16_to_f32(bits);
             if let Some(bias) = bias {
                 value += bias[j];
             }
