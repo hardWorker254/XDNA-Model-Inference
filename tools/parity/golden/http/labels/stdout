@@ -1,0 +1,4 @@
+
+  serving http://127.0.0.1:<PORT>/v1/classify   (model vit-base-patch16-224)
+  POST multipart/form-data: image (required, PNG or JPEG), top_k (default 1)
+  1000 labels, 224px input

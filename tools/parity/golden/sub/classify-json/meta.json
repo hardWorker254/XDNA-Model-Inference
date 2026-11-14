@@ -1,0 +1,19 @@
+{
+  "case": "sub/classify-json",
+  "kind": "cli",
+  "binary": "npuimage",
+  "argv": [
+    "classify",
+    "vit-base-patch16-224",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/bus.jpg",
+    "--json"
+  ],
+  "http": null,
+  "why": "the object the server's /v1/classify returns: the endpoint and the CLI must not drift",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:20:57",
+  "rules": [
+    "timing-s"
+  ]
+}

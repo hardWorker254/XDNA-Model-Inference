@@ -10,9 +10,9 @@
     "npu3"
   ],
   "http": null,
-  "why": "a misspelled generation is refused and not defaulted: a silent fallback to npu1 on an npu2 machine is how a wrong-but-plausible answer arrives",
+  "why": "the generation is CARRIED into the design lookup, not defaulted: the refusal names `device npu3`, where a default would have named npu1 and a misspelling would have looked like a working command",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T14:41:28",
+  "recorded_at": "2026-11-14T15:21:01",
   "rules": []
 }

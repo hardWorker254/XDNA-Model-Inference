@@ -1,0 +1,20 @@
+{
+  "case": "http/root",
+  "kind": "http",
+  "binary": "npuembeddings",
+  "argv": [],
+  "http": {
+    "method": "GET",
+    "path": "/",
+    "serves": "all-MiniLM-L6-v2"
+  },
+  "why": "the root: what the server says it is",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:01",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "port"
+  ]
+}

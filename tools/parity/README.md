@@ -142,14 +142,42 @@ both are worth writing down:
   own binary lives in, whatever `--root` says. The Rust runtime honours
   `--root`, which is the fix. The `sub/list` case therefore only compares
   the two runtimes when the oracle's default root holds the same containers
-  as the fixture root.
-* **The embedding, classification and transcription paths need a design
-  set**, and there is none on this machine for those geometries. So those
-  goldens are not recorded, and the eight HTTP endpoints are not either:
-  the server loads the model and its design set BEFORE it binds the port,
-  so a server with no design set never listens.
+  as the fixture root -- and the harness copies them there, because the
+  oracle's design-set lookup reads ITS tree too.
 
-What IS recorded, and what does compare byte for byte today:
+## The design sets
+
+The embedding, classification and transcription paths need a COMPILED design
+set: a `design.json` with an `xclbin` and the instruction binaries beside
+it. That is the OUTPUT of MLIR-AIE -- it cannot be downloaded, and it
+cannot be made without the toolchain.
+
+The toolchain is in the venv (`aiecc`, `aie-opt` and `aie.iron` are all
+there), and two things have to be on the PATH for the exporters to work:
+
+```sh
+export PATH="$PWD/.venv/bin:/opt/xilinx/xrt/bin:$PATH"
+export PYTHONPATH=/opt/xilinx/xrt/python      # pyxrt, for the validation step
+export NPU_RUNTIME=xrt                        # the exporters RUN the kernel
+```
+
+The last one is the surprising one: the exporter validates its own output
+by running the compiled kernel, and without a NPU runtime it cannot. It
+needs the device, not a simulator.
+
+With those, one model is one command:
+
+```sh
+python tools/export/export_gemm_rtp.py --target all-MiniLM-L6-v2 --arch 1 \
+    --out tools/parity/fixtures/root/runtime
+```
+
+and it writes `runtime/artifacts/<model>/artifacts_npu1/{gemm_rtp,gelu,layernorm,softmax}/`.
+
+## What is recorded, and what compares byte for byte today
+
+Forty-six of the forty-seven cases are recorded. Twenty-one of them compare
+byte for byte:
 
 * the three `--help` texts and the no-argument behaviour;
 * the `list` table, its states and its legend;
@@ -158,6 +186,14 @@ What IS recorded, and what does compare byte for byte today:
   unknown model, a missing argument, a container of another family, a
   `--serve=8080`;
 * the flag semantics: the last occurrence wins, a flag after the
-  positionals, an unknown `--npu-ops` code;
-* the pose, hands, mppose and OCR transcripts, as goldens for the numerics
-  work to come.
+  positionals, an unknown `--npu-ops` code.
+
+Four are DECLARED DIVERGENCES, with the reason in `divergences.txt`: the
+`add` crash, `list`'s `--root`, the generation that the C++ does not check
+by name, and the two prefix refusals whose wording matches and whose
+preceding banner does not exist yet.
+
+The remaining nineteen are the numerics -- the embedding, the
+classification, the transcription, the pose, the hands, the whole-body pose,
+the OCR, and the eight HTTP endpoints -- and they are the goldens for the
+work to come.

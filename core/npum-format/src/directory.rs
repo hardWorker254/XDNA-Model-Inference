@@ -89,6 +89,16 @@ impl Config {
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         self.fields.get(key).and_then(|v| v.as_bool())
     }
+
+    /// One key, as an OBJECT.
+    ///
+    /// The absence of the key is `None` and not an empty object: a config
+    /// with an empty `prompts` table and a config with NO `prompts` table
+    /// are different facts, and the second one is what a model with no task
+    /// prefixes looks like.
+    pub fn get_object(&self, key: &str) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.fields.get(key).and_then(|v| v.as_object())
+    }
 }
 
 /// One tensor's entry in the directory.

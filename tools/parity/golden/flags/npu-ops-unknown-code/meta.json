@@ -13,6 +13,6 @@
   "why": "an operation code that does not exist is refused by name, and the valid codes are listed; a misspelled code that was silently ignored would leave the operation on the host and the user would not know",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:02:21",
+  "recorded_at": "2026-11-14T15:21:01",
   "rules": []
 }

@@ -40,3 +40,23 @@ sub/list: the C++ runtime's `list` IGNORES `--root` and reports the tree its
           differently the moment the two trees held different models, and
           the one that says what is installed must say what is installed
           WHERE THE READER IS.
+
+error/dev-unknown-generation: the C++ runtime does NOT check the generation
+          by name. `--dev npu3` is carried into the design search and comes
+          back as a refusal that happens to name it -- a refusal that is
+          right for the wrong reason, because the answer depends on there
+          being no design set for it. The Rust runtime refuses the
+          generation BY NAME, which is the fix: the generation is the
+          DEVICE's, and a misspelled one is a misspelling whichever design
+          sets happen to be on disk.
+
+error/prefix-unknown-name: the REFUSAL is word for word the oracle's. What
+          differs is what precedes it: the C++ runtime loads the model and
+          prints the whole encode banner -- the unpinned-weights warning,
+          the design set it picked, the geometry, the tools -- before it
+          gets to the prefix. The Rust runtime has no encode path yet, so
+          there is no banner to print. This divergence is removed when the
+          encode path lands, and not before.
+
+error/prefix-on-model-without-table: the same, for the other half of the
+          prefix refusal: same wording, same absence of the banner.

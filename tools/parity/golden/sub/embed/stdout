@@ -1,0 +1,43 @@
+  artifacts  <ROOT>/runtime/artifacts/all-MiniLM-L6-v2/artifacts_npu1 (picked from the container's geometry; no --artifacts given)
+NpuEmbeddings C++ runtime -- full encode
+  bo-mode    host_only (data-buffer allocation)
+  model      all-MiniLM-L6-v2: 78 tensors, 90.23 MB, checkpoint 75ba77256ecf2dbf
+  shape      sentence-transformers/all-MiniLM-L6-v2: 6 layers, hidden 384, 12 heads x 32, ffn 1536, mean pooling
+  designs    ONE xclbin, 18 streams (3 batch tiers), one hw_context
+  datapath   bfp16-emulated MMAC, C as bf16
+  device     npu1 (arch 1)
+  toolchain  mlir_aie 1.4.3.dev55+g10767b5, peano 22.0.0.2026090201+a36c62b9, mlir-aie HEAD unavailable
+  shape      batch 16 x seq 64  (M = 1024)
+  tiers      4, 8, 16  (requests are right-sized, not padded)
+  gelu   GELU       on the HOST (fp32) -- 6 fewer NPU dispatches
+  softm  softmax    on the HOST (fp32) -- 6 fewer NPU dispatches
+  layn   LayerNorm  on the HOST (fp32) -- 13 fewer NPU dispatches
+  attn   attention, as two GEMMs on the HOST (fp32) -- QK^T and softmax.V as host passes, no attn_qk/attn_av dispatches
+  bo-align   last data buffer aligned to 4096 B
+  weights    0.00 MB staged on the device once, not per call
+  pipeline   4 concurrent encodes of 16, one NPU mutex, 6 host threads per lane
+  tokenizer  30522 tokens, from the .npum
+  input      4 texts
+  embedded   4 texts in <S> s  ->  <RATE> seq/s
+
+  time split (summed over 4 lanes; wall was <MS> ms)
+    gemm + epilogue             <MS> ms    <PCT>%
+      A upload (sync)           <MS> ms    <PCT>%
+      dispatch (wait)           <MS> ms    <PCT>%
+      C download                <MS> ms    <PCT>%
+    attention (all)             <MS> ms   <PCT>%
+      QK^T (of attention)       <MS> ms   <PCT>%
+      A*V (of attention)        <MS> ms   <PCT>%
+    host LayerNorm              <MS> ms   <PCT>%
+    host softmax                <MS> ms   <PCT>%
+    host GELU                   <MS> ms   <PCT>%
+    bias epilogue               <MS> ms    <PCT>%
+    t_npu                       <MS> ms   (whole attention block as counted by the NPU path)
+    busy                        <MS> ms   (sum of the rows above)
+    dispatches                    0     (count, not a time)
+    busy / wall                <RATIO> x   (sum of passes / wall -- the pipelining achieved)
+
+  [0] -0.0724 +0.0001 -0.0214 -0.0435 -0.0389 +0.1308 ...
+  [1] +0.0122 +0.0324 +0.1048 +0.0001 -0.0272 +0.0266 ...
+  [2] +0.0561 +0.1008 +0.0826 -0.0447 -0.0255 +0.0139 ...
+  [3] -0.0149 +0.0238 -0.0032 +0.0370 -0.0909 +0.0041 ...

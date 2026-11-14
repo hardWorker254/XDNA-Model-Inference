@@ -1,0 +1,1 @@
+{"error":{"message":"expected Content-Type: multipart/form-data with a boundary; got 'application/json'. This endpoint takes the audio as a form part -- not as raw bytes, and not as JSON.","type":"invalid_request_error"}}

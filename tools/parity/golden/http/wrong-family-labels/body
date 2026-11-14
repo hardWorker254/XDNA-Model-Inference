@@ -1,0 +1,1 @@
+{"error":{"message":"unknown path /v1/labels -- this model serves /v1/embeddings. `npuembeddings serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.","type":"not_found"}}

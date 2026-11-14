@@ -87,9 +87,12 @@ RULES: list[Rule] = [
     ),
     _rule(
         "timing-ms",
-        re.compile(r"\b\d+\.\d+ ms\b"),
+        re.compile(r"\b\d+(?:\.\d+)? ms\b"),
         "<MS> ms",
-        "a duration; it differs between two runs of the same binary",
+        "a duration; it differs between two runs of the same binary. The "
+        "integer form is here because a whole number of milliseconds is "
+        "still a duration: 'wall was 132 ms' moves just as much as "
+        "'0.13 s' does",
     ),
     _rule(
         "timing-s",
@@ -109,6 +112,27 @@ RULES: list[Rule] = [
                    r':\s*)\d+\.\d+'),
         r"\1<MS>",
         "the timings block of a JSON answer; same reason as timing-ms",
+    ),
+    _rule(
+        "throughput",
+        re.compile(r"\b\d+\.\d+(?= seq/s)"),
+        "<RATE>",
+        "a rate: texts per second. Same reason as timing-ms -- it is a "
+        "duration divided by something, and it moves every run",
+    ),
+    _rule(
+        "percentage",
+        re.compile(r"\b\d+\.\d+ ?%"),
+        "<PCT>%",
+        "a share of a duration; same reason as timing-ms, and it moves "
+        "whenever the durations it is a share of move",
+    ),
+    _rule(
+        "ratio",
+        re.compile(r"\b\d+\.\d+(?= x\b)"),
+        "<RATIO>",
+        "a ratio of two durations -- the pipelining achieved. Same reason as "
+        "timing-ms",
     ),
     _rule(
         "port",

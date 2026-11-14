@@ -1,0 +1,21 @@
+{
+  "case": "http/transcriptions",
+  "kind": "http",
+  "binary": "npuaudio",
+  "argv": [],
+  "http": {
+    "method": "POST",
+    "path": "/v1/audio/transcriptions",
+    "serves": "whisper-tiny"
+  },
+  "why": "the speech endpoint's body",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:06",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "port",
+    "timing-s"
+  ]
+}

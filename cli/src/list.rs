@@ -232,13 +232,21 @@ fn pixel_command_note(kind: &str) -> String {
 /// question -- "is there a design set this model could run on" -- and
 /// neither is a claim that the design matches: that is `design_fits()`'s
 /// job, and it is a different question with a different answer.
-fn have_design_on_disk(root: &Path, name: &str) -> bool {
+///
+/// `set` is the stream set's name: `gemm_rtp` for the encoder stack, and
+/// `gemm_rtp_dec` for a speech-to-text model's decoder. They are TWO
+/// DIRECTORIES BESIDE EACH OTHER, not two models -- which is the thing
+/// that is easy to get wrong, because the decoder's streams have their own
+/// shapes and their own directory and therefore look like a separate set
+/// belonging to a separate model.
+fn have_design_on_disk(root: &Path, name: &str, set: &str) -> bool {
     if name.is_empty() {
         return false;
     }
     let bases = [
-        root.join("artifacts"),
         root.join("runtime").join("artifacts"),
+        root.join("artifacts"),
+        root.join("runtime"),
         root.to_path_buf(),
     ];
     for base in bases {
@@ -248,7 +256,7 @@ fn have_design_on_disk(root: &Path, name: &str) -> bool {
             } else {
                 base.join(name).join(sub)
             };
-            if dir.join("gemm_rtp").join("design.json").is_file() {
+            if dir.join(set).join("design.json").is_file() {
                 return true;
             }
         }
@@ -265,19 +273,23 @@ fn catalogue_state(root: &Path, _entry: &CatalogueEntry, installed: Option<&Inst
         return "no encoder".into();
     }
     if is_stt_arch(&m.arch) {
+        // A speech-to-text model needs TWO sets: the encoder stack and the
+        // decoder's seven streams. One is not enough, and a row that said
+        // "ready" for one of the two would send the reader to `transcribe`
+        // and get a refusal.
         let both = (m.carries_design && m.carries_design_dec)
-            || (have_design_on_disk(root, &m.name)
-                && have_design_on_disk(root, &format!("{}_dec", m.name)));
+            || (have_design_on_disk(root, &m.name, "gemm_rtp")
+                && have_design_on_disk(root, &m.name, "gemm_rtp_dec"));
         return if both { "ready" } else { "no design" }.into();
     }
     if is_vit_arch(&m.arch) {
-        let have = m.carries_design || have_design_on_disk(root, &m.name);
+        let have = m.carries_design || have_design_on_disk(root, &m.name, "gemm_rtp");
         return if have { "ready" } else { "no design" }.into();
     }
     if m.gemm_layout == "host" {
         return "cpu".into();
     }
-    let have = m.carries_design || have_design_on_disk(root, &m.name);
+    let have = m.carries_design || have_design_on_disk(root, &m.name, "gemm_rtp");
     if have { "ready" } else { "no design" }.into()
 }
 
@@ -301,7 +313,7 @@ fn installed_state(root: &Path, m: &Installed) -> String {
     if m.gemm_layout == "host" {
         return "cpu".into();
     }
-    let have = m.carries_design || have_design_on_disk(root, &m.name);
+    let have = m.carries_design || have_design_on_disk(root, &m.name, "gemm_rtp");
     if have { "ready" } else { "no design" }.into()
 }
 

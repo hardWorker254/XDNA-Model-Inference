@@ -1,0 +1,20 @@
+{
+  "case": "http/wrong-family-labels",
+  "kind": "http",
+  "binary": "npuembeddings",
+  "argv": [],
+  "http": {
+    "method": "GET",
+    "path": "/v1/labels",
+    "serves": "all-MiniLM-L6-v2"
+  },
+  "why": "the same, for the labels endpoint on an embedder",
+  "expect_code": 404,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:06",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "port"
+  ]
+}

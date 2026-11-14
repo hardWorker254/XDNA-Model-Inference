@@ -1,0 +1,19 @@
+{
+  "case": "http/labels",
+  "kind": "http",
+  "binary": "npuimage",
+  "argv": [],
+  "http": {
+    "method": "GET",
+    "path": "/v1/labels",
+    "serves": "vit-base-patch16-224"
+  },
+  "why": "the classifier's whole vocabulary, so a client can turn an id into a name without the container",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:02",
+  "rules": [
+    "port",
+    "timing-s"
+  ]
+}

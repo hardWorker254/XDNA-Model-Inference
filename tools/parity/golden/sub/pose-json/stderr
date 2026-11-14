@@ -15,4 +15,4 @@ NpuEmbeddings -- body pose (YOLOv8-pose) on the CPU
              threshold, nms, inverse letterbox host  host-side by construction: a list of survivors, not a tensor
   <FIXTURE>/bus.jpg <S> s  3 people  (72 convs host, 0 dispatches)
              <MS> ms front end, <MS> ms network, <MS> ms decode, 810x1080 px source
-             host conv split: <MS> ms gemm, <MS> ms im2col, <MS> ms [M,N] transpose, <MS> ms weight transpose, <MS> ms elementwise (18.6x torch's 20.5)
+             host conv split: <MS> ms gemm, <MS> ms im2col, <MS> ms [M,N] transpose, <MS> ms weight transpose, <MS> ms elementwise (18.7x torch's 20.5)

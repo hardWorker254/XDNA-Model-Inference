@@ -36,7 +36,14 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
     let Some((model, input)) = args.positional.first().zip(args.positional.get(1)) else {
         return crate::needs_a_model("embed");
     };
+    let prefix = args.value("--prefix").map(|s| s.to_string());
     with_model(model, npum_families::Family::Embed, root, |path, arch| {
+        if let Some(prefix) = prefix.as_deref() {
+            if let Some(reason) = refuse_unknown_prefix(path, prefix) {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        }
         let texts = match std::fs::read_to_string(input) {
             Ok(t) => t,
             Err(e) => {
@@ -49,6 +56,42 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
         eprintln!("  inputs     {n} line(s)");
         0
     })
+}
+
+/// The refusal for a `--prefix` this model does not have, if it is one.
+///
+/// Two refusals, and they are DIFFERENT refusals:
+///
+/// * a model with NO task prefixes at all -- its container carries no
+///   `prompts` table -- is refused because nothing would be prepended, and
+///   a vector that is not what was asked for is a vector that looks right;
+/// * a model WITH a table, asked for a prefix that is not in it, is refused
+///   with the table's names, because the reader typed one of them wrong
+///   and the list is the answer.
+///
+/// The names are listed in SORTED order, and not in the table's order: a
+/// list that a reader has to scan is more useful sorted, and the table's
+/// order is the order the checkpoint happened to write them in.
+fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String> {
+    let container = npum_format::Container::open(path).ok()?;
+    let config = container.config();
+    let Some(prompts) = config.get_object("prompts") else {
+        return Some(format!(
+            "--prefix '{prefix}' was given, but this model has no task \
+             prefixes -- its container carries no 'prompts' table, so nothing \
+             would be prepended. Refusing rather than returning vectors that \
+             are not what was asked for."
+        ));
+    };
+    let mut names: Vec<&str> = prompts.keys().map(|k| k.as_str()).collect();
+    names.sort_unstable();
+    if names.iter().any(|n| *n == prefix) {
+        return None;
+    }
+    Some(format!(
+        "--prefix '{prefix}' is not one of this model's task prefixes: [{}]",
+        names.join(", ")
+    ))
 }
 
 /// `add`.

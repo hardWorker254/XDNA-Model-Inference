@@ -9,10 +9,12 @@
   "why": "the same help, with the image verbs and without the others",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:02:17",
+  "recorded_at": "2026-11-14T15:20:49",
   "rules": [
     "container-extension",
     "container-extension-path",
+    "percentage",
+    "timing-ms",
     "timing-s"
   ]
 }

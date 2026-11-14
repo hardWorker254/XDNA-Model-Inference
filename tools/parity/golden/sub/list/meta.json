@@ -6,10 +6,10 @@
     "list"
   ],
   "http": null,
-  "why": "the catalogue table: its columns, its states and its notes are what a reader checks before anything else",
+  "why": "the catalogue table: its columns, its states and its notes are what a reader checks before anything else. NOTE: the C++ runtime's `list` IGNORES `--root` and reports the tree its own binary lives in, so this case compares the two runtimes only when the oracle's default root holds the same containers as the fixture root. The Rust runtime honours `--root`, which is the fix",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:04:30",
+  "recorded_at": "2026-11-14T15:20:49",
   "rules": [
     "root"
   ]

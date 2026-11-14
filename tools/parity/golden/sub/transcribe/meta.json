@@ -1,0 +1,18 @@
+{
+  "case": "sub/transcribe",
+  "kind": "cli",
+  "binary": "npuaudio",
+  "argv": [
+    "transcribe",
+    "whisper-tiny",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/tone.wav"
+  ],
+  "http": null,
+  "why": "the transcript, and the status block that goes to stderr",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:20:52",
+  "rules": [
+    "timing-s"
+  ]
+}

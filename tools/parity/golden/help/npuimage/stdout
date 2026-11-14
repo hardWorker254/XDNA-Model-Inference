@@ -51,17 +51,17 @@ XDNA2/npu2; --dev selects the generation)
         CPU BY DEFAULT, and that is a measurement rather than a
         preference. --npu-ops conv moves the 72 convolutions to
         the array and nothing else, needs a container packed with --npu
-        and a design set, and is SLOWER here: 258 ms of network on 16
-        threads against 384 ms dispatched as GEMMs, because N must be a
+        and a design set, and is SLOWER here: <MS> ms of network on 16
+        threads against <MS> ms dispatched as GEMMs, because N must be a
         multiple of 128 (2.6x arithmetic padding waste before anything
         runs), the stem alone is 100 of the 436 dispatches, and a
         dispatch costs 660 us of which 140 us is the device's GEMM. Per
         layer 19 of the 72 are faster on the array and an oracle
-        splitting each onto its faster side measured 146 ms -- 2.6%.
+        splitting each onto its faster side measured <MS> ms -- <PCT>%.
         The status block prints both sides, per image.
-        MEASURED on the CPU path, 640x640 input, i8: 29 ms front end,
-        258 ms network of which 88 ms is the GEMM, 57 ms im2col, 10 ms
-        the weight transpose and 7 ms the output transpose, 1 ms decode.
+        MEASURED on the CPU path, 640x640 input, i8: <MS> ms front end,
+        <MS> ms network of which <MS> ms is the GEMM, <MS> ms im2col, <MS> ms
+        the weight transpose and <MS> ms the output transpose, <MS> ms decode.
 
         The same model over HTTP: `npuimage serve <model>`, which
         answers POST /v1/pose. Multipart with one `image` part (PNG or

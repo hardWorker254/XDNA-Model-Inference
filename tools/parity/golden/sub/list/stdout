@@ -10,13 +10,13 @@ Models (root <ROOT>)
   embeddinggemma-300m  available     24    768     mean 1155 MB dl  MQA+RoPE+GeGLU on the array (4 GEMMs/layer); gated, needs HF_TOKEN
   nomic-embed-text-v1.5 cpu           12    768     mean    549 MB  RoPE + gated SwiGLU (arch=2); same array designs as bge-base; needs --prefix (search_document / search_query / clustering / classification)
   gte-multilingual-base available     12    768      cls 582 MB dl  multilingual, XLM-R tokenizer; NTK RoPE + gated GeGLU (arch=3); same array designs as bge-base/nomic
-  whisper-tiny         no design      4    384      n/a    153 MB  smallest Whisper: 4+4 layers, 80 mel bins; greedy, no timestamps
+  whisper-tiny         ready          4    384      n/a    153 MB  smallest Whisper: 4+4 layers, 80 mel bins; greedy, no timestamps
   whisper-base         available      6    512      n/a 290 MB dl  6+6 layers; clearly better than tiny on real speech
   whisper-small        available     12    768      n/a 968 MB dl  12+12 layers; the first size where quality clearly beats base
   whisper-medium       available     24   1024      n/a 3100 MB dl  24+24 layers; 4x the dispatches of base for a modest gain
   whisper-large-v3     available     32   1280      n/a 3100 MB dl  32+32 layers, 128 mel bins; the audio frontend dominates its runtime
   whisper-large-v3-turbo available     32   1280      n/a 1620 MB dl  large-v3's encoder with a 4-layer decoder: ~4x the speed, some cost
-  vit-base-patch16-224 no design     12    768      n/a    346 MB  image classifier: 4 GEMMs/layer on the SAME designs as bge-base, patch_embed rides attn_out; 197 positions, head on the host
+  vit-base-patch16-224 ready         12    768      n/a    346 MB  image classifier: 4 GEMMs/layer on the SAME designs as bge-base, patch_embed rides attn_out; 197 positions, head on the host
 
   Locally packed (not in the catalogue):
   mediapipe-hands      hands          -      -      n/a      9 MB  npuimage hands <name> <image>; CPU only unless packed with --npu

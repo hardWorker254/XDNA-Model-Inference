@@ -123,6 +123,27 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
         }
     }
 
+    // The generation is checked against the names this build knows, and it
+    // is checked HERE -- before any design is looked for.
+    //
+    // The C++ runtime did not check it: `--dev npu3` was carried into the
+    // design search and came back as a refusal that named the generation it
+    // did not recognise. That is a refusal that happens to be right, and it
+    // is right for the wrong reason -- the answer depends on there being no
+    // design set for it.
+    //
+    // Here the generation is the DEVICE's, and an override that names a
+    // generation that does not exist is a refusal by name.
+    if let Some(device) = args.value("--dev") {
+        if device != "npu1" && device != "npu2" {
+            eprintln!(
+                "error: --dev '{device}' is not a generation this build knows. \
+                 The generations are npu1 and npu2."
+            );
+            return EXIT_REFUSED;
+        }
+    }
+
     let root = resolve_root(&args, argv);
 
     match verb {

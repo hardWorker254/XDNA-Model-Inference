@@ -11,6 +11,6 @@
   "why": "`transcribe` belongs to npuaudio; the refusal names the program to run and prints the roster",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:02:21",
+  "recorded_at": "2026-11-14T15:21:00",
   "rules": []
 }

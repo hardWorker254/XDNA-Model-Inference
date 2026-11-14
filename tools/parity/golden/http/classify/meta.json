@@ -1,0 +1,19 @@
+{
+  "case": "http/classify",
+  "kind": "http",
+  "binary": "npuimage",
+  "argv": [],
+  "http": {
+    "method": "POST",
+    "path": "/v1/classify",
+    "serves": "vit-base-patch16-224"
+  },
+  "why": "the classification endpoint's body, 1:1 with `classify --json`",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:04",
+  "rules": [
+    "port",
+    "timing-s"
+  ]
+}

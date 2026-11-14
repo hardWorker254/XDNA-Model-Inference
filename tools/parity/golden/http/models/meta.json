@@ -1,0 +1,20 @@
+{
+  "case": "http/models",
+  "kind": "http",
+  "binary": "npuembeddings",
+  "argv": [],
+  "http": {
+    "method": "GET",
+    "path": "/v1/models",
+    "serves": "all-MiniLM-L6-v2"
+  },
+  "why": "the catalogue over HTTP",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:02",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "port"
+  ]
+}

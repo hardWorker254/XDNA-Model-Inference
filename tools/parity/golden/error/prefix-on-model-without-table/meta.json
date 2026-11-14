@@ -13,6 +13,6 @@
   "why": "a prefix for a model with no prompt table is refused too -- the same mistake in the other direction",
   "expect_code": 2,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T14:41:28",
+  "recorded_at": "2026-11-14T15:21:01",
   "rules": []
 }

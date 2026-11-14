@@ -1,0 +1,24 @@
+
+  npu        context budget -- 2 requested + 0 foreign = 2 of 6 (measured on NPU1 (six concurrent hw_contexts; XRT exposes no usable-count query))
+NpuEmbeddings -- Whisper speech to text on the AMD NPU
+  model      whisper-tiny: d_model 384, 4+4 layers, 6 heads x 64, 80 mel bins, vocab 51865
+  designs    <ROOT>/runtime/artifacts/whisper-tiny/artifacts_npu1
+  datapath   bfp16-emulated MMAC, C as bf16
+  ops        (npu = dispatched, host = this process)
+             transform, 400 points      host  3001 mixed-radix transforms of 400 points, fp64
+             slaney mel bank            host  the checkpoint's own filter bank, 201 x n_mels
+             conv1, conv2               host  fp32, d^2 MACs; --npu-ops conv sends it to the array
+             encoder GEMMs, 4 layers    host  qkv, attn_out, ffn_up, ffn_down, M=512 rows; --npu-ops gemm sends them to the array
+             decoder GEMMs, 4 layers    host  self_qkv, self_attn_out, cross_q, cross_kv, cross_attn_out, ffn_up, ffn_down, M=64/128/256 rows per tier; --npu-ops gemm sends them to the array
+             layer_norm                 host  fp32 on this process; --npu-ops layn sends it to the array
+             gelu                       host  fp32 on this process; --npu-ops gelu sends it to the array
+             softmax                    host  fp32 on this process; --npu-ops softm sends it to the array
+             attention                  host  one score row at a time: 1500 x 6 x 1500 = 51 MB at full length
+             logits + argmax            host  tied embedding, 51865 x 384 on the last row only
+             decode + merge             host  the container's own BPE table; the window merge is transformers' longest-common-sequence over ids
+  setup      <S> s (device, two design sets, weights staged on it)
+  language   en   ASSUMED: this build does not detect languages, so --language defaults to en and says so here
+  task       transcribe
+  long form  30 s windows, 5 s stride each side, so windows start 20 s apart
+  chunks     1 of <S> s of audio
+  time       mel <S> s, conv <S> s, encoder <S> s, decoder <S> s, 0 dispatches

@@ -1,0 +1,7 @@
+  tokenizer  51865 ids, from the .npum
+
+  serving http://127.0.0.1:<PORT>/v1/audio/transcriptions   (model whisper-tiny)
+  POST multipart/form-data: file (required), model, language, task,
+              response_format (json | verbose_json | text)
+  80 mel bins, 1500 encoder positions, greedy, temperature 0, no timestamps
+

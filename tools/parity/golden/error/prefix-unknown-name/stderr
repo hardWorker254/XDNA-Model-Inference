@@ -1,0 +1,1 @@
+error: --prefix 'no_such_prefix' is not one of this model's task prefixes: [classification, clustering, search_document, search_query]

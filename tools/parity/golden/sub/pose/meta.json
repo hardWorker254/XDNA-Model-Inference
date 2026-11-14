@@ -11,7 +11,7 @@
   "why": "the boxes, the joints and the scores",
   "expect_code": null,
   "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
-  "recorded_at": "2026-11-14T15:02:18",
+  "recorded_at": "2026-11-14T15:20:57",
   "rules": [
     "timing-ms",
     "timing-s",

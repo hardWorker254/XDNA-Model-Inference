@@ -1,0 +1,14 @@
+NpuEmbeddings -- ViT image classification on the AMD NPU
+  model      vit-base-patch16-224: hidden 768, 12 pre-LN layers, 12 heads x 64, 224px at patch 16 -> 197 positions, 1000 labels
+  designs    <ROOT>/runtime/artifacts/vit-base-patch16-224/artifacts_npu1
+  weights    3.7 MB staged on the array, bf16 operands
+  ops        (npu = dispatched, host = this process)
+             patch_embed, 5th GEMM      host  the same attn_out shape, computed here; --npu-ops conv dispatches it, and it is the only convolution this architecture has
+             12 x qkv/attn_out/ffn      host  qkv, attn_out, ffn_up, ffn_down, M=1024 rows per dispatch; --npu-ops gemm moves them to the array
+             image front end            host  decode, PIL-equivalent resize to 224px, (x/255 - mean)/std, im2col
+             layernorm                  host  fp32 with this container's layer_norm_eps 1e-12; --npu-ops layn moves it
+             gelu                       host  exact erf, fp32; --npu-ops gelu moves it
+             softmax                    host  O(seq^2) on the host: 197x197 scores x 12 heads in fp32; --npu-ops softm moves it to softmax/, its own hw_context, at a MEASURED <S> s against <S> s on the --npu-ops gemm arm
+             classifier head            host  768x1000 matvec: 1000 is not a multiple of tile_n*cols, so no legal B panel of that width exists for this array
+  setup      <S> s (device, 1 design set, weights staged on it)
+  measured   every figure below is THIS run's measurement of THIS image, not a throughput claim. Attention at these 197 positions has been measured in this repository (NPU_OPS.md, the attn cell), and the array came out SLOWER: <S> s of encoder with --npu-ops gemm,attn against <S> s with --npu-ops gemm.

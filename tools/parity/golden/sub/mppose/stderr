@@ -11,5 +11,5 @@ NpuEmbeddings -- mppose (MediaPipe person det + pose landmarks) on the CPU
              image front end            host  bilinear letterbox to 224px, normalise in float and pad with 0 in TENSOR space; per person a rotated INTER_AREA crop to 256px
              threshold, nms, inverse letterbox host  host-side by construction: a list of survivors, not a tensor
   setup      <S> s (both graphs read, weights transposed once)
-  <FIXTURE>/bus.jpg 810x1080  1 detection -> 1 pose  <MS> ms (front <MS> / det <MS> / nms <MS> / crop <MS> / pose <MS> / post 4.2)
+  <FIXTURE>/bus.jpg 810x1080  1 detection -> 1 pose  <MS> ms (front <MS> / det <MS> / nms <MS> / crop <MS> / pose <MS> / post 4.5)
              crop: angle -36.6338 deg, square 565x565, pad_bias -36.0 337.0, crop mean 0.3110

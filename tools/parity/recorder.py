@@ -200,10 +200,14 @@ def has_design_set(root: Path, model: str) -> bool:
     for base in bases:
         for sub in ("", "artifacts_npu1", "artifacts_npu2"):
             directory = base / model / sub if sub else base / model
-            design = directory / "gemm_rtp" / "design.json"
-            if not design.is_file():
+            set_dir = directory / "gemm_rtp"
+            if not (set_dir / "design.json").is_file():
                 continue
-            if any(directory.glob("*.xclbin")) or any(directory.glob("insts*.bin")):
+            # The compiled program lives BESIDE the design.json, inside the
+            # set's own directory -- not beside the model. A check that
+            # looked one level up would find the design.json and no program,
+            # and would call that a design set.
+            if any(set_dir.glob("*.xclbin")) or any(set_dir.glob("insts*.bin")):
                 return True
     return False
 

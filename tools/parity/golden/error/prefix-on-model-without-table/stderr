@@ -1,1 +1,1 @@
-error: no NPU design set matches all-MiniLM-L6-v2 (hidden 384, datapath bfp16, device npu1) under <ROOT> -- name one with --artifacts, or export one for this generation with tools/export/export_gemm_rtp.py
+error: --prefix 'search_document' was given, but this model has no task prefixes -- its container carries no 'prompts' table, so nothing would be prepended. Refusing rather than returning vectors that are not what was asked for.

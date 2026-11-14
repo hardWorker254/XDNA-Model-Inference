@@ -1,0 +1,21 @@
+{
+  "case": "http/wrong-family-embeddings",
+  "kind": "http",
+  "binary": "npuaudio",
+  "argv": [],
+  "http": {
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "serves": "whisper-tiny"
+  },
+  "why": "a wrong path is a 404 that NAMES THE RIGHT ONE, and never another endpoint's answer",
+  "expect_code": 404,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:21:06",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "port",
+    "timing-s"
+  ]
+}

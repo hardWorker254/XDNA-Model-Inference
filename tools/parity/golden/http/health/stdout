@@ -1,0 +1,23 @@
+  artifacts  <ROOT>/runtime/artifacts/all-MiniLM-L6-v2/artifacts_npu1 (picked from the container's geometry; no --artifacts given)
+NpuEmbeddings C++ runtime -- full encode
+  bo-mode    host_only (data-buffer allocation)
+  model      all-MiniLM-L6-v2: 78 tensors, 90.23 MB, checkpoint 75ba77256ecf2dbf
+  shape      sentence-transformers/all-MiniLM-L6-v2: 6 layers, hidden 384, 12 heads x 32, ffn 1536, mean pooling
+  designs    ONE xclbin, 18 streams (3 batch tiers), one hw_context
+  datapath   bfp16-emulated MMAC, C as bf16
+  device     npu1 (arch 1)
+  toolchain  mlir_aie 1.4.3.dev55+g10767b5, peano 22.0.0.2026090201+a36c62b9, mlir-aie HEAD unavailable
+  shape      batch 16 x seq 64  (M = 1024)
+  tiers      4, 8, 16  (requests are right-sized, not padded)
+  gelu   GELU       on the HOST (fp32) -- 6 fewer NPU dispatches
+  softm  softmax    on the HOST (fp32) -- 6 fewer NPU dispatches
+  layn   LayerNorm  on the HOST (fp32) -- 13 fewer NPU dispatches
+  attn   attention, as two GEMMs on the HOST (fp32) -- QK^T and softmax.V as host passes, no attn_qk/attn_av dispatches
+  bo-align   last data buffer aligned to 16384 B
+  weights    0.00 MB staged on the device once, not per call
+  pipeline   4 concurrent encodes of 16, one NPU mutex, 6 host threads per lane
+  tokenizer  30522 tokens, from the .npum
+
+  serving http://127.0.0.1:<PORT>/v1/embeddings   (model all-MiniLM-L6-v2-npu, seq 64)
+  POST {"input": "text" | ["a","b"], "encoding_format": "float"|"base64"}
+

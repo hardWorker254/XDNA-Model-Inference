@@ -1,0 +1,18 @@
+{
+  "case": "sub/classify",
+  "kind": "cli",
+  "binary": "npuimage",
+  "argv": [
+    "classify",
+    "vit-base-patch16-224",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/bus.jpg"
+  ],
+  "http": null,
+  "why": "the label and the score",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:20:56",
+  "rules": [
+    "timing-s"
+  ]
+}
