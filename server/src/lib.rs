@@ -136,6 +136,84 @@ impl Transcriber {
     }
 }
 
+/// The classifier endpoint's engine.
+///
+/// The ViT's weights and the geometry they describe. Unlike the speech
+/// engine this one holds no STATE between requests -- the encoder is a
+/// function of the image -- so it needs no lock.
+pub struct Classifier {
+    vit: npum_cpu::vit::Vit,
+}
+
+impl Classifier {
+    /// Build an engine from a container.
+    pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
+        let vit = npum_cpu::vit::Vit::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self { vit })
+    }
+
+    /// How many labels.
+    pub fn num_labels(&self) -> usize {
+        self.vit.geometry().num_labels as usize
+    }
+
+    /// The input's side, in pixels.
+    pub fn image_size(&self) -> i64 {
+        self.vit.geometry().image_size
+    }
+
+    /// The patch's side, in pixels.
+    pub fn patch_size(&self) -> i64 {
+        self.vit.geometry().patch_size
+    }
+
+    /// Classify an image's BYTES.
+    ///
+    /// The name is what the refusals name: the upload's name, so a client
+    /// that sent the wrong file is told which file.
+    ///
+    /// The three timings are this run's measurement of this image, and they
+    /// are reported because the answer's cost is part of the answer: a
+    /// client that sizes a fleet reads them.
+    pub fn classify_bytes(
+        &self,
+        image: &[u8],
+        name: &str,
+    ) -> std::result::Result<Classification, String> {
+        let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
+        let geometry = self.vit.geometry();
+        let front = std::time::Instant::now();
+        let patches = npum_cpu::vit_image::preprocess(&decoded, geometry)?;
+        let front_end_s = front.elapsed().as_secs_f64();
+        let enc = std::time::Instant::now();
+        let hidden = self.vit.encode(&patches);
+        let encoder_s = enc.elapsed().as_secs_f64();
+        let head = std::time::Instant::now();
+        let d = geometry.hidden as usize;
+        let logits = self.vit.classify(&hidden[..d]);
+        let prediction = npum_cpu::vit::predict(&logits, self.vit.labels())?;
+        let head_s = head.elapsed().as_secs_f64();
+        Ok(Classification {
+            prediction,
+            front_end_s,
+            encoder_s,
+            head_s,
+        })
+    }
+}
+
+/// One classification and what it cost.
+pub struct Classification {
+    /// The label, its name and its probability.
+    pub prediction: npum_cpu::vit::Prediction,
+    /// The front end's time.
+    pub front_end_s: f64,
+    /// The encoder's time.
+    pub encoder_s: f64,
+    /// The head's time.
+    pub head_s: f64,
+}
+
 /// A tensor's values.
 fn tensor_f32(container: &npum_format::Container, name: &str) -> std::result::Result<Vec<f32>, String> {
     let bytes = container

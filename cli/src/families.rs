@@ -294,6 +294,19 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
     let Some(model) = args.positional.first() else {
         return crate::needs_a_model("classify");
     };
+    // Every leading non-flag argument after the model is an image, so
+    // `classify <model> a.png b.png --top-k` classifies both.
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: `classify` needs an image:");
+        eprintln!("    npuimage classify <model> <image.png> [more.png ...]");
+        eprintln!("    npuimage serve <model>            (POST /v1/classify)");
+        eprintln!(
+            "  (PNG and JPEG; anything else is refused rather than guessed at. \
+             --top-k prints the runners-up to stderr, --json to stdout)"
+        );
+        return crate::EXIT_REFUSED;
+    }
     with_model(model, npum_families::Family::Cls, root, |path, arch| {
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Cls) {
             eprintln!("error: {reason}");
@@ -318,12 +331,100 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
         };
         let designs = crate::vit::find_designs(root, &geometry.model_name)
             .unwrap_or_else(|| root.join("runtime").join("artifacts").join(&geometry.model_name));
+        // The setup is the weights arriving: the container is open, and the
+        // head and the stack are read before the block is printed, because
+        // the block reports how long that took.
+        let vit = match npum_cpu::vit::Vit::open(path) {
+            Ok(v) => v,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
         crate::vit::print_block(&geometry, &designs, started.elapsed().as_secs_f64());
-        if let Some(reason) = refuse_not_ported(npum_families::Family::Cls) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
         let _ = arch;
+
+        let json = args.switch("--json");
+        let top_k = args.value_i64("--top-k").unwrap_or(0) > 0;
+        let mut out = String::from("[\n");
+        for (i, image) in images.iter().enumerate() {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let front = std::time::Instant::now();
+            let patches = match npum_cpu::vit_image::preprocess(&decoded, &geometry) {
+                Ok(p) => p,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let front_end_s = front.elapsed().as_secs_f64();
+
+            let enc = std::time::Instant::now();
+            let hidden = vit.encode(&patches);
+            let encoder_s = enc.elapsed().as_secs_f64();
+
+            let head = std::time::Instant::now();
+            let d = geometry.hidden as usize;
+            let logits = vit.classify(&hidden[..d]);
+            let prediction = match npum_cpu::vit::predict(&logits, vit.labels()) {
+                Ok(p) => p,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let head_s = head.elapsed().as_secs_f64();
+
+            if json {
+                out.push_str("  ");
+                out.push_str(&crate::vit::prediction_json(
+                    &prediction,
+                    image,
+                    front_end_s,
+                    encoder_s,
+                    head_s,
+                ));
+                out.push_str(if i + 1 < images.len() { ",\n" } else { "\n" });
+            } else {
+                eprintln!(
+                    "  {:<40} {:.2} s  0 dispatches",
+                    image,
+                    front_end_s + encoder_s + head_s
+                );
+                if top_k {
+                    // A ranking of the whole row, not the top two: the
+                    // argmax is on stdout alone and the runners-up are a
+                    // status detail, so the full sort is printed rather than
+                    // a truncated one that would read as "there is nothing
+                    // else close".
+                    let mut order: Vec<usize> = (0..prediction.logits.len()).collect();
+                    order.sort_by(|a, b| {
+                        prediction.logits[*b]
+                            .partial_cmp(&prediction.logits[*a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    for (k, index) in order.iter().take(10).enumerate() {
+                        eprintln!(
+                            "    {:2}  {:<40} logit {:+.4}",
+                            k + 1,
+                            vit.labels().get(*index).cloned().unwrap_or_default(),
+                            prediction.logits[*index]
+                        );
+                    }
+                }
+                println!("{}", prediction.name);
+            }
+        }
+        if json {
+            out.push_str("]\n");
+            print!("{out}");
+        }
         0
     })
 }

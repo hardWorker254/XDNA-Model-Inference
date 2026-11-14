@@ -57,6 +57,8 @@ pub struct ServerState {
     pub encoder: Option<crate::Embedder>,
     /// The speech endpoint's engine, for the speech family.
     pub transcriber: Option<Arc<crate::Transcriber>>,
+    /// The classifier endpoint's engine, for the image family.
+    pub classifier: Option<Arc<crate::Classifier>>,
 }
 
 impl ServerState {
@@ -73,6 +75,7 @@ impl ServerState {
             not_found: String::new(),
             encoder: None,
             transcriber: None,
+            classifier: None,
         }
     }
 }
@@ -320,26 +323,188 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
 
 /// `POST /v1/classify`.
 ///
-/// The endpoint that needs the numbers refuses, because the numbers are
-/// not here yet: an answer that looked like a classification and was
-/// not one is worse than a 500 that says why.
-async fn classify(State(state): State<Shared>, mut multipart: Multipart) -> Response {
+/// The image arrives as a FORM PART and the answer is the same object
+/// `classify --json` prints -- one object, not an array.
+///
+/// # THE ORDER OF THE REFUSALS
+///
+/// The C++'s order: the media type, then the multipart parse, then the
+/// image part, then the `top_k`. A client that sent a JSON body gets the
+/// media type's refusal and not a complaint about a missing 'image' part.
+async fn classify(
+    State(state): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     if !state.arch.contains("vit") {
         return not_found(&state, "/v1/classify");
     }
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("image") {
-            break;
+    let Some(classifier) = &state.classifier else {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body(
+                "the classifier is not here: the server was started without the \
+                 image family's weights",
+                "not_implemented",
+            ),
+        );
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(boundary) = crate::multipart::boundary(content_type) else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                &format!(
+                    "expected Content-Type: multipart/form-data with a boundary; \
+                     got '{content_type}'. This endpoint takes the image as a \
+                     form part -- not as raw bytes, and not as JSON."
+                ),
+                "invalid_request_error",
+            ),
+        );
+    };
+    let parts = match crate::multipart::parse(&body, &boundary) {
+        Ok(parts) => parts,
+        Err(reason) => {
+            return json(
+                StatusCode::BAD_REQUEST,
+                error_body(&format!("multipart: {reason}"), "invalid_request_error"),
+            )
+        }
+    };
+
+    let mut image = None;
+    let mut n_image = 0usize;
+    for part in &parts {
+        if part.name == "image" {
+            n_image += 1;
+            image = Some(part);
         }
     }
-    json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        error_body(
-            "the classifier is not ported yet: the image front end, the patch \
-             embedding and the classification head are not in this runtime",
-            "not_implemented",
-        ),
-    )
+    if n_image > 1 {
+        return json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                &format!(
+                    "the request carries {n_image} 'image' parts; which one is the \
+                     picture is not a question to answer by taking the first"
+                ),
+                "invalid_request_error",
+            ),
+        );
+    }
+    let Some(image) = image.filter(|p| !p.data.is_empty()) else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                "'image' is required, and the one that arrived was empty",
+                "invalid_request_error",
+            ),
+        );
+    };
+    if image.data.len() > 64 * 1024 * 1024 {
+        return json(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_body(
+                &format!(
+                    "the upload is {} MB; this build caps a request at 64 MB",
+                    image.data.len() / (1 << 20)
+                ),
+                "invalid_request_error",
+            ),
+        );
+    }
+
+    let field = |name: &str| -> String {
+        parts
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| String::from_utf8_lossy(&p.data).into_owned())
+            .unwrap_or_default()
+    };
+    let n_labels = classifier.num_labels();
+    let mut top_k = 1usize;
+    let want = field("top_k");
+    if !want.is_empty() {
+        match want.trim().parse::<i64>() {
+            Ok(k) if k >= 1 => {
+                // Capped at the vocabulary rather than refused: top_k=1000 on
+                // a 1000-label model is a request for everything, not a
+                // mistake, and the array it returns is simply the whole
+                // vocabulary.
+                top_k = (k as usize).min(n_labels);
+            }
+            _ => {
+                return json(
+                    StatusCode::BAD_REQUEST,
+                    error_body(
+                        &format!(
+                            "top_k='{want}' is not an integer of at least 1. This \
+                             build would otherwise answer with its own default, and \
+                             a client asking for the runners-up would not know it \
+                             did not get them."
+                        ),
+                        "invalid_request_error",
+                    ),
+                );
+            }
+        }
+    }
+
+    let label = if image.filename.is_empty() {
+        "upload".to_string()
+    } else {
+        image.filename.clone()
+    };
+    let data = image.data.clone();
+    let engine = classifier.clone();
+    let name = label.clone();
+    let outcome = tokio::task::spawn_blocking(move || engine.classify_bytes(&data, &name))
+        .await
+        .unwrap_or_else(|e| Err(format!("the classification task failed: {e}")));
+
+    match outcome {
+        Ok(classification) => {
+            let body = npum_cpu::vit::prediction_json(
+                &classification.prediction,
+                &label,
+                top_k,
+                classification.front_end_s,
+                classification.encoder_s,
+                classification.head_s,
+            );
+            json(StatusCode::OK, body)
+        }
+        Err(reason) => {
+            // 400 for what the CALLER sent (a format the front end refuses,
+            // a geometry the container will not take) and 500 only for what
+            // is ours.
+            let callers_fault = reason.contains("PNG")
+                || reason.contains("JPEG")
+                || reason.contains("magic")
+                || reason.contains("truncated")
+                || reason.contains("square")
+                || reason.contains("shortest-edge");
+            json(
+                if callers_fault {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                error_body(
+                    &reason,
+                    if callers_fault {
+                        "invalid_request_error"
+                    } else {
+                        "internal_error"
+                    },
+                ),
+            )
+        }
+    }
 }
 
 /// `POST /v1/pose`.

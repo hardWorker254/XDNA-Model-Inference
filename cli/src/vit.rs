@@ -29,28 +29,11 @@ use npum_format::Container;
 use std::path::{Path, PathBuf};
 
 /// The ViT's geometry, as the container states it.
-pub struct Geometry {
-    /// The container's name.
-    pub model_name: String,
-    /// The model's width.
-    pub hidden: i64,
-    /// How many layers.
-    pub layers: i64,
-    /// How many heads.
-    pub heads: i64,
-    /// One head's width.
-    pub head_dim: i64,
-    /// The input's side, in pixels.
-    pub image_size: i64,
-    /// The patch's side, in pixels.
-    pub patch_size: i64,
-    /// The positions, the patches and the CLS row.
-    pub n_pos: i64,
-    /// How many labels.
-    pub num_labels: i64,
-    /// The layer norm's epsilon.
-    pub ln_eps: f64,
-}
+///
+/// The CPU backend's geometry, not a second one: the block prints the
+/// numbers and the arithmetic reads them, and two copies of the same
+/// facts are two copies to drift.
+pub use npum_cpu::vit::Geometry;
 
 /// Read the geometry out of a container.
 ///
@@ -58,23 +41,7 @@ pub struct Geometry {
 /// is refused by the C++'s reader, and a default here would be a
 /// classifier that answers about a model nobody chose.
 pub fn read_geometry(container: &Container, path: &Path) -> Option<Geometry> {
-    let config = container.config();
-    let model_name = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    Some(Geometry {
-        model_name,
-        hidden: config.get_i64("hidden")?,
-        layers: config.get_i64("num_layers")?,
-        heads: config.get_i64("num_heads")?,
-        head_dim: config.get_i64("head_dim")?,
-        image_size: config.get_i64("image_size")?,
-        patch_size: config.get_i64("patch_size")?,
-        n_pos: config.get_i64("max_seq_len")?,
-        num_labels: config.get_i64("num_labels")?,
-        ln_eps: config.get_f64("layer_norm_eps").unwrap_or(1e-12),
-    })
+    Geometry::read(container, path)
 }
 
 /// The bytes a host-layout container stages, and what the block calls them.
@@ -231,6 +198,20 @@ fn trim_zeros(text: &str) -> String {
     let trimmed = text.trim_end_matches('0');
     let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
     trimmed.to_string()
+}
+
+/// The prediction, as the JSON object.
+///
+/// The CPU backend's function: the CLI and the server must not drift, and
+/// two implementations of one JSON shape is how they drift.
+pub fn prediction_json(
+    prediction: &npum_cpu::vit::Prediction,
+    image: &str,
+    front_end_s: f64,
+    encoder_s: f64,
+    head_s: f64,
+) -> String {
+    npum_cpu::vit::prediction_json(prediction, image, 1, front_end_s, encoder_s, head_s)
 }
 
 /// The design set's directory for a model, if there is one.

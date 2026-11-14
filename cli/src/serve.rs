@@ -90,6 +90,7 @@ pub fn serve(
     // branch, because the block reports the setup time and the setup is
     // the engine's construction.
     let mut speech: Option<npuembeddings_server::Transcriber> = None;
+    let mut image: Option<npuembeddings_server::Classifier> = None;
     match family {
         npum_families::Family::Embed => {
             let status = crate::status::read_container(&container, &path);
@@ -118,7 +119,17 @@ pub fn serve(
                         .join(&geometry.model_name)
                 },
             );
-            crate::vit::print_block(&geometry, &designs, 0.0);
+            let started = std::time::Instant::now();
+            let classifier = match npuembeddings_server::Classifier::open(&path) {
+                Ok(c) => c,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let setup_s = started.elapsed().as_secs_f64();
+            crate::vit::print_block(&geometry, &designs, setup_s);
+            image = Some(classifier);
         }
         npum_families::Family::Stt => {
             // The context budget, BEFORE the session builds anything, and the
@@ -194,6 +205,9 @@ pub fn serve(
             transcriber.vocab_size()
         );
         state.transcriber = Some(std::sync::Arc::new(transcriber));
+    }
+    if let Some(classifier) = image {
+        state.classifier = Some(std::sync::Arc::new(classifier));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -281,7 +295,12 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 state.model_id
             );
             println!("  POST multipart/form-data: image (required, PNG or JPEG), top_k (default 1)");
-            println!("  1000 labels, 224px input");
+            let (labels, size) = state
+                .classifier
+                .as_ref()
+                .map(|c| (c.num_labels(), c.image_size()))
+                .unwrap_or((0, 0));
+            println!("  {labels} labels, {size}px input");
         }
         arch if arch.contains("pose") || arch.contains("mediapipe") => {
             println!(

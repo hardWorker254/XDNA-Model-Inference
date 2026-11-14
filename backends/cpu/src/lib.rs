@@ -36,6 +36,8 @@
 
 pub mod bert;
 pub mod kernels;
+pub mod vit;
+pub mod vit_image;
 pub mod whisper;
 pub mod whisper_features;
 pub mod whisper_session;
