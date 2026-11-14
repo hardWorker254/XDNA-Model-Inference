@@ -26,7 +26,7 @@
 //! on a Whisper container gets a 404 that says which endpoint to use, and
 //! not a transcription.
 
-use axum::extract::{Multipart, State};
+use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -59,6 +59,8 @@ pub struct ServerState {
     pub transcriber: Option<Arc<crate::Transcriber>>,
     /// The classifier endpoint's engine, for the image family.
     pub classifier: Option<Arc<crate::Classifier>>,
+    /// The pose endpoint's engine, for the pose family.
+    pub pose: Option<Arc<crate::PoseDetector>>,
 }
 
 impl ServerState {
@@ -76,6 +78,7 @@ impl ServerState {
             encoder: None,
             transcriber: None,
             classifier: None,
+            pose: None,
         }
     }
 }
@@ -509,25 +512,213 @@ async fn classify(
 
 /// `POST /v1/pose`.
 ///
-/// The endpoint that needs the numbers refuses, for the reason the
-/// classifier's does.
-async fn pose(State(state): State<Shared>, mut multipart: Multipart) -> Response {
-    if !state.arch.contains("pose") && !state.arch.contains("mediapipe") {
+/// The image arrives as a FORM PART and the answer is the same object
+/// `pose` prints -- byte for byte, because both call
+/// `pose_decode::result_json`.
+///
+/// # THE ORDER OF THE REFUSALS
+///
+/// The classifier's, for the classifier's reason: the media type, then the
+/// multipart parse, then the image part, then the fields. A client that
+/// sent a JSON body gets the media type's refusal and not a complaint about
+/// a missing 'image' part.
+async fn pose(
+    State(state): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.arch.contains("pose") {
         return not_found(&state, "/v1/pose");
     }
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("image") {
-            break;
+    let Some(detector) = &state.pose else {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body(
+                "the pose detector is not here: the server was started without \
+                 the pose family's weights",
+                "not_implemented",
+            ),
+        );
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(boundary) = crate::multipart::boundary(content_type) else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                &format!(
+                    "expected Content-Type: multipart/form-data with a boundary; \
+                     got '{content_type}'. This endpoint takes the image as a \
+                     form part -- not as raw bytes, and not as JSON."
+                ),
+                "invalid_request_error",
+            ),
+        );
+    };
+    let parts = match crate::multipart::parse(&body, &boundary) {
+        Ok(parts) => parts,
+        Err(reason) => {
+            return json(
+                StatusCode::BAD_REQUEST,
+                error_body(&format!("multipart: {reason}"), "invalid_request_error"),
+            )
+        }
+    };
+    let mut image = None;
+    let mut n_image = 0usize;
+    for part in &parts {
+        if part.name == "image" {
+            n_image += 1;
+            image = Some(part);
         }
     }
-    json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        error_body(
-            "the pose detector is not ported yet: the network, the NMS and the \
-             keypoint decoding are not in this runtime",
-            "not_implemented",
-        ),
-    )
+    if n_image > 1 {
+        return json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                &format!(
+                    "the request carries {n_image} 'image' parts; which one is \
+                     the picture is not a question to answer by taking the first"
+                ),
+                "invalid_request_error",
+            ),
+        );
+    }
+    let Some(image) = image.filter(|p| !p.data.is_empty()) else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                "'image' is required, and the one that arrived was empty",
+                "invalid_request_error",
+            ),
+        );
+    };
+    if image.data.len() > 64 * 1024 * 1024 {
+        return json(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_body(
+                &format!(
+                    "the upload is {} MB; this build caps a request at 64 MB",
+                    image.data.len() / (1 << 20)
+                ),
+                "invalid_request_error",
+            ),
+        );
+    }
+
+    let field = |name: &str| -> String {
+        parts
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| String::from_utf8_lossy(&p.data).into_owned())
+            .unwrap_or_default()
+    };
+    // The thresholds, defaulted from the CLI's predict defaults and moved
+    // per request: a request that names none gets the defaults, and naming
+    // them changes nothing outside this request.
+    let mut params = npum_cpu::pose_decode::DecodeParams::default();
+    for (name, slot) in [
+        ("conf", 0usize),
+        ("iou", 1),
+        ("kpt", 2),
+        ("max_det", 3),
+    ] {
+        let want = field(name);
+        if want.trim().is_empty() {
+            continue;
+        }
+        let parsed = want.trim().parse::<f64>();
+        match (slot, parsed) {
+            (3, Ok(v)) if v >= 1.0 => params.max_det = v as i64,
+            (3, _) => {
+                return json(
+                    StatusCode::BAD_REQUEST,
+                    error_body(
+                        &format!("max_det='{want}' is not an integer of at least 1"),
+                        "invalid_request_error",
+                    ),
+                )
+            }
+            (_, Ok(v)) => match slot {
+                0 => params.conf = v,
+                1 => params.iou = v,
+                _ => params.keypoint = v,
+            },
+            (_, Err(_)) => {
+                return json(
+                    StatusCode::BAD_REQUEST,
+                    error_body(
+                        &format!("{name}='{want}' is not a number"),
+                        "invalid_request_error",
+                    ),
+                )
+            }
+        }
+    }
+
+    let label = if image.filename.is_empty() {
+        "upload".to_string()
+    } else {
+        image.filename.clone()
+    };
+    let data = image.data.clone();
+    let engine = detector.clone();
+    let name = label.clone();
+    let request_params = params.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        engine.detect_bytes(&data, &name, &request_params)
+    })
+        .await
+        .unwrap_or_else(|e| Err(format!("the detection task failed: {e}")));
+
+    match outcome {
+        Ok(result) => {
+            let geometry = detector.geometry();
+            let detection = npum_cpu::pose_decode::Detection {
+                people: result.people,
+                front_end_s: result.front_end_s,
+                network_s: result.network_s,
+                decode_s: result.decode_s,
+                total_s: result.total_s,
+                width: result.width,
+                height: result.height,
+                scale: result.scale,
+                pad_x: result.pad_x,
+                pad_y: result.pad_y,
+                dispatches: 0,
+                convs_host: geometry.convs.len().saturating_sub(1) as i64,
+            };
+            json(
+                StatusCode::OK,
+                npum_cpu::pose_decode::result_json(&detection, geometry, &params, &label, false),
+            )
+        }
+        Err(reason) => {
+            let callers_fault = reason.contains("PNG")
+                || reason.contains("JPEG")
+                || reason.contains("magic")
+                || reason.contains("truncated")
+                || reason.contains("square")
+                || reason.contains("shortest-edge");
+            json(
+                if callers_fault {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                error_body(
+                    &reason,
+                    if callers_fault {
+                        "invalid_request_error"
+                    } else {
+                        "internal_error"
+                    },
+                ),
+            )
+        }
+    }
 }
 
 /// `POST /v1/audio/transcriptions`.

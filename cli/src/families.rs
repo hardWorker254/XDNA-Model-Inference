@@ -434,15 +434,149 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
     let Some(model) = args.positional.first() else {
         return crate::needs_a_model("pose");
     };
+    // Every leading non-flag argument after the model is an image, so
+    // `pose <model> a.png b.png --text` runs both.
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: `pose` needs an image:");
+        eprintln!("    npuimage pose <model> <image.png> [more.png ...]");
+        eprintln!("    npuimage serve <model>            (POST /v1/pose)");
+        eprintln!(
+            "  (PNG and JPEG; anything else is refused rather than guessed at. \
+             --text prints a human summary instead of the JSON object, \
+             --conf/--iou/--kpt/--max-det move the thresholds, --pose-dump FILE \
+             writes every graph node's output)"
+        );
+        return crate::EXIT_REFUSED;
+    }
     with_model(model, npum_families::Family::Pose, root, |path, arch| {
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Pose) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        eprintln!("  model      {}: {}", path.display(), arch);
-        if let Some(reason) = refuse_not_ported(npum_families::Family::Pose) {
-            eprintln!("error: {reason}");
+        // `--npu-ops conv` is a valid pose request and a valid question, and
+        // this runtime has no answer to it yet: the host path is the ported
+        // one. Accepting the flag and running the host would leave the
+        // command line saying "array" about a run that dispatched nothing.
+        if args
+            .value("--npu-ops")
+            .map(|v| v.split(',').any(|c| c.trim() == "conv"))
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "error: --npu-ops conv: the pose family runs its convolutions on \
+                 the host in this runtime, and the array path is not ported yet. \
+                 Accepting the flag and running the host would make the command \
+                 line say something the run did not do."
+            );
             return crate::EXIT_REFUSED;
+        }
+        let started = std::time::Instant::now();
+        let network = match npum_cpu::pose::Network::open(path) {
+            Ok(n) => n,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let setup_s = started.elapsed().as_secs_f64();
+        let geometry = network.geometry().clone();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        let params = crate::pose::params_from(args);
+        crate::pose::print_block(&name, &geometry, network.threads(), setup_s);
+        let _ = arch;
+
+        let text = args.switch("--text");
+        let dump = args.value("--pose-dump").map(std::path::PathBuf::from);
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let all = std::time::Instant::now();
+            let front = std::time::Instant::now();
+            let (input, letterbox) =
+                match npum_cpu::pose_decode::letterbox_normalise(&decoded, &geometry) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        eprintln!("error: {reason}");
+                        return crate::EXIT_REFUSED;
+                    }
+                };
+            let front_end_s = front.elapsed().as_secs_f64();
+
+            if let Some(dump) = dump.as_deref() {
+                if let Err(reason) = crate::pose::write_dump(dump, &network, &input) {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+
+            let net = std::time::Instant::now();
+            let (head, timings) = match network.run_timed(&input) {
+                Ok(h) => h,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let network_s = net.elapsed().as_secs_f64();
+
+            let dec = std::time::Instant::now();
+            let people = match npum_cpu::pose_decode::decode(&head, &geometry, &letterbox, &params) {
+                Ok(p) => p,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let decode_s = dec.elapsed().as_secs_f64();
+
+            let run = crate::pose::Run {
+                people,
+                width: letterbox.src_w,
+                height: letterbox.src_h,
+                total_s: all.elapsed().as_secs_f64(),
+                front_end_s,
+                network_s,
+                decode_s,
+                timings,
+            };
+            crate::pose::print_run(image, &run, &geometry);
+            if text {
+                print!("{}", crate::pose::text_summary(image, &run));
+            } else {
+                let detection = npum_cpu::pose_decode::Detection {
+                    people: run.people,
+                    front_end_s,
+                    network_s,
+                    decode_s,
+                    total_s: run.total_s,
+                    width: run.width,
+                    height: run.height,
+                    scale: letterbox.scale,
+                    pad_x: letterbox.pad_x,
+                    pad_y: letterbox.pad_y,
+                    dispatches: 0,
+                    convs_host: geometry.convs.len().saturating_sub(1) as i64,
+                };
+                print!(
+                    "{}",
+                    npum_cpu::pose_decode::result_json(
+                        &detection,
+                        &geometry,
+                        &params,
+                        image,
+                        false
+                    )
+                );
+            }
         }
         0
     })

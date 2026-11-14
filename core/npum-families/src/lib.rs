@@ -128,7 +128,7 @@ impl Family {
             Family::Cls => {
                 Some("the image front end, the patch embedding and the classification head")
             }
-            Family::Pose => Some("the YOLOv8n-pose network, the NMS and the keypoint decoding"),
+            Family::Pose => None,
             Family::Hands => Some("the MediaPipe hand network and its decoding"),
             Family::MpPose => Some("the MediaPipe pose network and its decoding"),
             Family::Ocr => Some("the text detector, the recogniser and the box merging"),

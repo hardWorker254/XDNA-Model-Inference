@@ -91,6 +91,7 @@ pub fn serve(
     // the engine's construction.
     let mut speech: Option<npuembeddings_server::Transcriber> = None;
     let mut image: Option<npuembeddings_server::Classifier> = None;
+    let mut pose: Option<npuembeddings_server::PoseDetector> = None;
     match family {
         npum_families::Family::Embed => {
             let status = crate::status::read_container(&container, &path);
@@ -177,6 +178,24 @@ pub fn serve(
             crate::stt::print_schedule(setup_s, &options, args.value("--language").is_some());
             speech = Some(transcriber);
         }
+        npum_families::Family::Pose => {
+            let started = std::time::Instant::now();
+            let detector = match npuembeddings_server::PoseDetector::open(&path) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let setup_s = started.elapsed().as_secs_f64();
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let geometry = detector.geometry().clone();
+            crate::pose::print_block(&name, &geometry, detector.threads(), setup_s);
+            pose = Some(detector);
+        }
         _ => {
             // The families whose block is not written yet refuse to start.
             // A server that answered a request it cannot answer would be
@@ -208,6 +227,9 @@ pub fn serve(
     }
     if let Some(classifier) = image {
         state.classifier = Some(std::sync::Arc::new(classifier));
+    }
+    if let Some(detector) = pose {
+        state.pose = Some(std::sync::Arc::new(detector));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -308,6 +330,13 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 state.model_id
             );
             println!("  POST multipart/form-data: image (required, PNG or JPEG), conf, iou, kpt, max_det");
+            let size = state
+                .pose
+                .as_ref()
+                .map(|p| p.geometry().input_size)
+                .unwrap_or(0);
+            let max_det = npum_cpu::pose_decode::DecodeParams::default().max_det;
+            println!("  {size}x{size} input, {max_det} people max, host backend");
         }
         _ => {
             println!(

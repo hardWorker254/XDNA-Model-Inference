@@ -398,9 +398,14 @@ fn apply_axis_line(
             let mut acc = 0.0f64;
             for x in 0..n {
                 let value = input[((xmin + x) * stride_in + c) as usize] as f64;
-                // An FMA, and not a multiply and an add: the oracle's
-                // compiler contracts `acc += w * x` into one rounding.
-                acc = w[x as usize].mul_add(value, acc);
+                // A multiply and an add, NOT an FMA: the oracle's compiler
+                // leaves `acc += w * x` uncontracted here (only bicubic_eval's
+                // polynomial gets vfmadd in the object file), and a fused
+                // accumulate rounds once where the oracle rounds twice. On the
+                // pose letterbox that disagreeing rounding moves about one
+                // output pixel in a thousand down one 8-bit level, which is a
+                // keypoint wrong in the last digit and no way to explain it.
+                acc += w[x as usize] * value;
             }
             output[(i * stride_out + c) as usize] = resample_round(acc, ww);
         }
@@ -435,7 +440,8 @@ fn apply_axis_across(
             let mut acc = 0.0f64;
             for x in 0..n {
                 let value = input[(l * nchan + c + (xmin + x) * tap_stride) as usize] as f64;
-                acc = w[x as usize].mul_add(value, acc);
+                // Uncontracted, for the reason apply_axis_line states.
+                acc += w[x as usize] * value;
             }
             output[((i * nlines + l) * nchan + c) as usize] = resample_round(acc, ww);
         }

@@ -36,6 +36,8 @@
 
 pub mod bert;
 pub mod kernels;
+pub mod pose;
+pub mod pose_decode;
 pub mod vit;
 pub mod vit_image;
 pub mod whisper;

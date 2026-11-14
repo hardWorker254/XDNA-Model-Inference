@@ -214,6 +214,94 @@ pub struct Classification {
     pub head_s: f64,
 }
 
+/// The pose endpoint's engine.
+///
+/// The YOLOv8-pose network and the geometry it describes. Like the
+/// classifier this holds no state between requests -- a detection is a
+/// function of the image and the thresholds -- so it needs no lock.
+pub struct PoseDetector {
+    net: npum_cpu::pose::Network,
+}
+
+impl PoseDetector {
+    /// Build an engine from a container.
+    pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
+        let net = npum_cpu::pose::Network::open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self { net })
+    }
+
+    /// The model's geometry.
+    pub fn geometry(&self) -> &npum_cpu::pose::Geometry {
+        self.net.geometry()
+    }
+
+    /// How many threads the host convolutions use.
+    pub fn threads(&self) -> usize {
+        self.net.threads()
+    }
+
+    /// Detect people in an image's BYTES.
+    ///
+    /// The name is what the answer calls the image: the upload's filename,
+    /// so a client that sent several pictures can tell the answers apart.
+    pub fn detect_bytes(
+        &self,
+        image: &[u8],
+        name: &str,
+        params: &npum_cpu::pose_decode::DecodeParams,
+    ) -> std::result::Result<PoseResult, String> {
+        let all = std::time::Instant::now();
+        let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
+        let geometry = self.net.geometry();
+        let front = std::time::Instant::now();
+        let (input, letterbox) = npum_cpu::pose_decode::letterbox_normalise(&decoded, geometry)?;
+        let front_end_s = front.elapsed().as_secs_f64();
+        let net = std::time::Instant::now();
+        let (head, _) = self.net.run_timed(&input)?;
+        let network_s = net.elapsed().as_secs_f64();
+        let dec = std::time::Instant::now();
+        let people = npum_cpu::pose_decode::decode(&head, geometry, &letterbox, params)?;
+        let decode_s = dec.elapsed().as_secs_f64();
+        Ok(PoseResult {
+            people,
+            width: letterbox.src_w,
+            height: letterbox.src_h,
+            scale: letterbox.scale,
+            pad_x: letterbox.pad_x,
+            pad_y: letterbox.pad_y,
+            front_end_s,
+            network_s,
+            decode_s,
+            total_s: all.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+/// One pose request and what it cost.
+pub struct PoseResult {
+    /// The people, in the source image's pixels.
+    pub people: Vec<npum_cpu::pose_decode::Person>,
+    /// The source's width.
+    pub width: i64,
+    /// The source's height.
+    pub height: i64,
+    /// Model pixels per source pixel.
+    pub scale: f64,
+    /// The left padding, in model pixels.
+    pub pad_x: i64,
+    /// The top padding, in model pixels.
+    pub pad_y: i64,
+    /// The front end's time.
+    pub front_end_s: f64,
+    /// The network's time.
+    pub network_s: f64,
+    /// The decode's time.
+    pub decode_s: f64,
+    /// The whole request's time.
+    pub total_s: f64,
+}
+
 /// A tensor's values.
 fn tensor_f32(container: &npum_format::Container, name: &str) -> std::result::Result<Vec<f32>, String> {
     let bytes = container

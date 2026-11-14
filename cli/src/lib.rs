@@ -37,6 +37,7 @@ pub mod families;
 pub mod flags;
 pub mod help;
 pub mod list;
+pub mod pose;
 pub mod root;
 pub mod serve;
 pub mod status;

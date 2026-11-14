@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 npum-format.workspace = true
 npum-model.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
