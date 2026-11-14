@@ -1,0 +1,17 @@
+{
+  "case": "error/missing-argument-serve",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "serve"
+  ],
+  "http": null,
+  "why": "`serve` needs a model; the refusal comes before the listener opens",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": [
+    "container-extension",
+    "container-extension-path"
+  ]
+}

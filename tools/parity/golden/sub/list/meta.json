@@ -1,0 +1,16 @@
+{
+  "case": "sub/list",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "list"
+  ],
+  "http": null,
+  "why": "the catalogue table: its columns, its states and its notes are what a reader checks before anything else",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:04:30",
+  "rules": [
+    "root"
+  ]
+}

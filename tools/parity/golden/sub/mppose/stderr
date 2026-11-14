@@ -1,0 +1,15 @@
+NpuEmbeddings -- mppose (MediaPipe person det + pose landmarks) on the CPU
+  model      mediapipe-pose: detector 224px, landmarks 256px, 2254 anchors over 3 levels, 39 rows of 5 (of which 33 are keypoints)
+  rotation   between the detector's keypoints 0 (mid-hip) and 1 (full body), both read from the container; the RoI is the square on the hip whose half-side is that distance
+  thresholds score 0.500, nms IoU 0.300, top_k 5000, pose conf 0.500, box enlarge 1.00 then 1.25 -- from the container, not a flag
+  normalise  detector (x/255 - 0.5)/0.5, border 0.0 in TENSOR space; landmarks (x/255 - 0.0)/1.0, border 0.0 in the raster
+  ops        (npu = dispatched, host = this process)
+             45 x conv + 28 x dwconv    host  person detector, 93 nodes; dwconv has no [M,N] GEMM to dispatch, so it would not move even with a design set
+             54 x conv + 34 x dwconv    host  landmark network, 120 nodes, once per person
+             add, maxpool, resize       host  elementwise and memory passes
+             d2s (DepthToSpace)         host  this architecture's own op: three of them build the detector's 28/14/7 pyramid out of one 7x7 map, DCR order
+             image front end            host  bilinear letterbox to 224px, normalise in float and pad with 0 in TENSOR space; per person a rotated INTER_AREA crop to 256px
+             threshold, nms, inverse letterbox host  host-side by construction: a list of survivors, not a tensor
+  setup      <S> s (both graphs read, weights transposed once)
+  <FIXTURE>/bus.jpg 810x1080  1 detection -> 1 pose  <MS> ms (front <MS> / det <MS> / nms <MS> / crop <MS> / pose <MS> / post 4.2)
+             crop: angle -36.6338 deg, square 565x565, pad_bias -36.0 337.0, crop mean 0.3110

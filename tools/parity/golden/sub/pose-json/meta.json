@@ -1,0 +1,21 @@
+{
+  "case": "sub/pose-json",
+  "kind": "cli",
+  "binary": "npuimage",
+  "argv": [
+    "pose",
+    "yolov8n-pose",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/bus.jpg",
+    "--json"
+  ],
+  "http": null,
+  "why": "the object the server's /v1/pose returns",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:18",
+  "rules": [
+    "timing-ms",
+    "timing-s",
+    "timings-json"
+  ]
+}

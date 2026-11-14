@@ -1,0 +1,70 @@
+# NpuEmbeddings -- the Rust runtime.
+#
+# One workspace, nine crates, three binaries. The layout is the one
+# RUST_MIGRATION_PLAN.md section 3 draws:
+#
+#   backends/{cpu,vulkan,xdna}   where the arithmetic happens
+#   core/npum-{format,model,tokenizers,families}   what the arithmetic is given
+#   cli                          the three executables
+#   server                      the HTTP endpoints
+#
+# THE NAME. The container format is `.npum` -- NPU Model -- and not `.npue`,
+# which stood for "NPU embedding" and stopped being true when the runtime grew
+# an audio, a vision, a pose and an OCR family. The reader accepts BOTH
+# magics; the writer emits only `.npum`.
+#
+# THE DEPENDENCY RULE, and it is a rule and not an accident: core/ knows
+# nothing about backends/, and backends/ know nothing about cli/ or server/.
+# The graph walks itself and calls a trait; which implementation answers is
+# chosen at the edge, by the CLI. A core crate that could name a backend would
+# be a core crate that could not be tested without one.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "3"
+members = [
+    "backends/cpu",
+    "backends/vulkan",
+    "backends/xdna",
+    "core/npum-families",
+    "core/npum-format",
+    "core/npum-model",
+    "core/npum-tokenizers",
+    "cli",
+    "server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Brishen/npu-embeddings"
+authors = ["NpuEmbeddings contributors"]
+
+[workspace.dependencies]
+npum-format = { path = "core/npum-format" }
+npum-model = { path = "core/npum-model" }
+npum-tokenizers = { path = "core/npum-tokenizers" }
+npum-families = { path = "core/npum-families" }
+npum-cpu = { path = "backends/cpu" }
+npum-vulkan = { path = "backends/vulkan" }
+npum-xdna = { path = "backends/xdna" }
+
+anyhow = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "tokio"] }
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

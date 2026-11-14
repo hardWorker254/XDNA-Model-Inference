@@ -1,0 +1,4 @@
+error: `transcribe` runs in npuaudio, and this is npuembeddings.
+    npuembeddings   embed, list, add, tokenize, serve
+    npuaudio        transcribe, serve
+    npuimage        classify, pose, hands, mppose, ocr, serve

@@ -1,0 +1,19 @@
+{
+  "case": "error/wrong-family-container",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "embed",
+    "whisper-tiny",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt"
+  ],
+  "http": null,
+  "why": "a Whisper container handed to the embedder is refused by name, and the refusal says which binary runs it",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": [
+    "container-extension",
+    "container-extension-path"
+  ]
+}

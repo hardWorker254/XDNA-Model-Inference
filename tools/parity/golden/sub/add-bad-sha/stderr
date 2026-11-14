@@ -1,0 +1,1 @@
+error: 'deadbeef' is not a sha256 (expected 64 hex chars). Refusing rather than storing a pin that can never match.

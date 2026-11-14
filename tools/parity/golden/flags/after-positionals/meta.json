@@ -1,0 +1,18 @@
+{
+  "case": "flags/after-positionals",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "tokenize",
+    "all-MiniLM-L6-v2",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt",
+    "--max-len",
+    "8"
+  ],
+  "http": null,
+  "why": "a flag may follow the positional arguments: the output is truncated to 8 tokens and says how many lines were truncated",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

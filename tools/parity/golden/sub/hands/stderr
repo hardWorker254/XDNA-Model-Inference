@@ -1,0 +1,13 @@
+NpuEmbeddings -- hands (MediaPipe palm + landmark) on the CPU
+  model      mediapipe-hands: palm 192px, landmark 224px, 2016 palm anchors over 2 levels, 21 landmarks
+  rotation   from palm keypoints 0 (wrist) and 2 (middle base), both read from the container
+  thresholds score 0.500, nms IoU 0.300, top_k 5000, crop enlarge 4.00 then 3.00 -- from the container, not from a flag
+  ops        (npu = dispatched, host = this process)
+             30 x conv + 23 x dwconv    host  palm detector, 87 nodes; dwconv has no [M,N] GEMM to dispatch, so it would not move even with a design set
+             31 x conv + 16 x dwconv    host  landmark network, 58 nodes, once per hand
+             add, maxpool, pad_c, resize host  elementwise and memory passes
+             image front end            host  decode, bilinear letterbox to 192px padded with 0, (x/255 - mean)/std; per hand a rotated INTER_AREA crop to 224px
+             threshold, nms, inverse letterbox host  host-side by construction: a list of survivors, not a tensor
+  setup      <S> s (both graphs read, weights transposed once)
+  <FIXTURE>/bus.jpg 810x1080  1 detection -> 1 hand  <MS> ms (front <MS> / palm <MS> / nms <MS> / crop <MS> / lm <MS> / post 0.0)
+             crop: angle -159.9175 deg, palm kp box 84.5 83.0 92.8 102.0, rot_bbox 76.0 56.0 101.0 113.0, pad_bias 178.0 569.0, crop mean 0.1367

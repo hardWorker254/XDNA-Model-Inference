@@ -1,0 +1,180 @@
+NpuEmbeddings -- BERT-family embeddings on the AMD NPU (XDNA1/npu1,
+XDNA2/npu2; --dev selects the generation)
+
+  This is npuembeddings.
+
+    npuembeddings   embed, list, add, tokenize, serve
+    npuaudio        transcribe, serve
+    npuimage        classify, pose, hands, mppose, ocr, serve
+
+  npuembeddings list
+        every model this build can run, and which are installed
+
+  npuembeddings serve <model> [--port N] [--bind ADDR]
+        the HTTP endpoint for WHATEVER the container is. One verb,
+        four endpoints, and the model's arch picks which:
+          /v1/embeddings           a BERT-family text model
+          /v1/audio/transcriptions Whisper
+          /v1/classify             a ViT classifier
+          /v1/pose                 YOLOv8-pose
+        Downloads and verifies the model first if it is not
+        installed yet. The mode is chosen by the container's arch, never
+        by a flag, and each endpoint answers only for its own path -- a
+        wrong path is a 404 naming the right one, never another
+        endpoint's answer.
+        Only this binary's own family is served here (npuembeddings): another
+        binary's container is refused by name before the listener opens,
+        rather than answered by an endpoint this process is not named for.
+
+  npuembeddings embed <model> <in.txt> [out.f32]
+        embed a text file, one text per line
+
+  npuembeddings add <org/model> [<sha256>]
+        teach this installation about a model that is not built in --
+        typically a finetune of one that is. Reads the repository's
+        config.json, derives the geometry, checks a design serves it,
+        and writes models/catalog.json. No weights are downloaded until
+        the first serve/embed.
+        WITHOUT a sha256 the weights are NOT verified. That is allowed,
+        and it is warned about on every single run.
+
+  <model> in any of this binary's verbs is either a NAME -- looked up
+        in models/, fetched and verified against the catalogue's sha256
+        when the catalogue knows it -- or a PATH to a .npum, used as
+        given and never re-resolved by name:
+            npuembeddings embed models/all-MiniLM-L6-v2.npum in.txt
+        The runtime names a path-held model after its file, which is
+        also how it finds runtime/<stem>/artifacts_npu<N>.
+
+  Options for this binary's verbs:
+    --port N          listen port (default 8080)
+    --bind ADDR       interface (default 127.0.0.1, localhost only)
+    --threads N       host thread budget (default 24 for these)
+    --pipeline N      concurrent encode lanes (serve/embed pass 4;
+                      1 lane = no pipelining. A later --pipeline on the
+                      command line wins, so --pipeline 1 disables it)
+    --artifacts DIR   override the design set
+    --npu-ops CODES
+                      send the listed ops to the ARRAY instead of the
+                      host, comma-separated. An op not listed runs on
+                      the host, so there is no inverse flag. The
+                      default -- nothing listed -- runs every
+                      op in this process; for most codes that
+                      is the measured-faster side, and for
+                      gemm it is not.
+                        gemm   the four per-layer GEMMs
+                        gelu   GELU (exact erf; a Whisper
+                               container declares this one)
+                        layn   LayerNorm
+                        softm  softmax
+                        conv   Whisper's conv1/conv2
+                        attn   attention, as QK^T and softmax.V GEMMs
+                        mproj  the slaney mel bank, as a GEMM
+                        fft    the 400-point transform, as a GEMM
+                        logit  the tied-embedding projection, in
+                               eight chunks of the vocabulary
+                      The same nine codes in every architecture;
+                      which of them yours can honour is in
+                      NPU_OPS.md, and a code that cannot is refused
+                      by name with the reason, never ignored.
+                      Worth asking for? Measured, per 3 s of
+                      whisper-tiny on 16 threads: conv 0.94 -> <S> s
+                      wall and 5.5 -> <S> s CPU; gemm 1.06 -> <S> s
+                      on an embedder and 0.435 -> <S> s on a ViT.
+                      Every other code is either neutral or slower.
+                      README, 'What to move to the NPU'.
+                      The exporter's flag is the SAME STRING and it
+                      BUILDS what this one selects. gelu/layn/softm
+                      write a sibling design set each (gelu/,
+                      layernorm/, softmax/) and cost one extra
+                      hw_context EACH; gemm/conv/attn/mproj/fft/
+                      logit are streams inside the GEMM sets and
+                      cost none.
+                      A missing design is refused by name, never
+                      silently run on the host -- and a run that
+                      would exceed the context budget is refused
+                      before any context is built unless
+                      --allow-contention says the contention is
+                      intended (see below).
+                      The speech-to-text codes are refused on an
+                      embedder. Replaces --npu-ops, --npu-eltwise and
+                      --host-ln/--host-sm/--host-gelu, which are now
+                      refused by name so a stale command line cannot
+                      look like it worked.
+    --allow-contention
+                      proceed even though another process holds NPU
+                      hw_contexts. Without it, a run that would exceed
+                      the device's context budget is refused before any
+                      context is built, and a timed run refuses to
+                      report a throughput. ANY NUMBER FROM A CONTENDED
+                      RUN IS NOT AN NPU PERFORMANCE CLAIM.
+    --dev npu1|npu2   the NPU generation this process runs on. A
+                      design set built for the other generation is
+                      refused, not loaded. Defaults to NPU_DEVICE, or
+                      NPU2=1, or npu1
+    --language CODE   transcribe: the language to prime the decoder
+                      with (en, de, ru, ...). There is no detection
+                      and no default worth having: an assumed language
+                      is a fluent transcript of the wrong language, so
+                      it defaults to en and says so on stderr. A code
+                      the model's tokenizer has no token for is
+                      refused, never approximated.
+    --task NAME      transcribe: 'transcribe' (default) or
+                      'translate' -- English output either way
+    --convert        transcribe: ingest through ffmpeg instead of the
+                      WAV reader. The reader refuses what it cannot
+                      represent (a second channel, 8-bit, 44.1 kHz)
+                      by name; this is the way in for those
+    --max-new N      transcribe: cap on generated tokens per window
+                      (default: the model's own position bound, 448)
+    --chunk-seconds N  transcribe: window length, default 30 -- the
+                      model's own. Longer is refused: the encoder has
+                      weights for a fixed number of positions and a
+                      cut window is a transcript of the first 30 s
+                      presented as the whole recording
+    --stride-seconds N transcribe: overlap on EACH side of a window,
+                      default 5 (transformers' own), so windows start
+                      chunk - 2*stride apart and the merge
+                      de-duplicates the overlap
+    --json           transcribe: print {"text", "segments", ...}
+    --top-k          classify: print the runners-up to stderr, under
+                      the image. The whole row is ranked and the top
+                      ten shown -- a truncated list reads as "nothing
+                      else is close", which is a different claim
+    --root DIR        override where models/ and the design live
+    --token VALUE     HuggingFace access token for a GATED model
+                      (falls back to the HF_TOKEN env var if omitted)
+    --prefix NAME     task prefix to prepend to every input text, for
+                      `embed` and `--bench` only. REQUIRED for a model
+                      whose container carries a prompt table (nomic
+                      wants 'search_document' or 'search_query';
+                      EmbeddingGemma has 14) -- there is no default,
+                      because a wrongly-prefixed embedding is
+                      correctly shaped and correctly normed, so
+                      nothing downstream can tell it is wrong. Pass
+                      --prefix "" for no prefix at all. An unknown
+                      NAME refuses and lists the real options, and so
+                      does passing one to a model with no table (the
+                      four BERT models). Always printed on stderr.
+                      `serve` REJECTS this flag: its prompt is chosen
+                      per request -- POST "prompt_name", and GET
+                      /health lists what the model accepts.
+    --allow-truncation
+                      embed the first `seq` tokens of an input that
+                      is too long, instead of refusing it. OFF by
+                      default: a truncated text still returns a
+                      correctly shaped, correctly normed vector, so
+                      nothing downstream can tell that the answer is
+                      wrong -- and inputs sharing a preamble truncate
+                      to IDENTICAL vectors. Without this flag such an
+                      input is an error naming its real token count;
+                      with it, a one-line warning on stderr.
+                      This build runs at the sequence length its
+                      design was exported for -- see
+                      tools/export/export_gemm_rtp.py --seq to build for a
+                      longer one.
+
+  The flag form is unchanged and still works:
+    npuembeddings <root> --model NAME --artifacts DIR --serve [port]
+  and carries the probes and benchmarks; see docs/CURRENT_STATUS.md.
+

@@ -1,0 +1,16 @@
+{
+  "case": "sub/tokenize",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "tokenize",
+    "all-MiniLM-L6-v2",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt"
+  ],
+  "http": null,
+  "why": "the tokenizer's ids: a table that disagrees with the packer's produces a correctly shaped vector of the wrong text",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:17",
+  "rules": []
+}

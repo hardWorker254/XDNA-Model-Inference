@@ -1,0 +1,18 @@
+{
+  "case": "help/npuaudio",
+  "kind": "cli",
+  "binary": "npuaudio",
+  "argv": [
+    "--help"
+  ],
+  "http": null,
+  "why": "the same help, with the audio verbs and without the others",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:17",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "timing-s"
+  ]
+}

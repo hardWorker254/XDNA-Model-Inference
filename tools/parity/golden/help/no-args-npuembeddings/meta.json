@@ -1,0 +1,16 @@
+{
+  "case": "help/no-args-npuembeddings",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [],
+  "http": null,
+  "why": "no verb at all prints the help on stdout; a reader who typed the program's name gets the help and not an error",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:17",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "timing-s"
+  ]
+}

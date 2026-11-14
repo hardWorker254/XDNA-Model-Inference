@@ -1,0 +1,16 @@
+{
+  "case": "error/verb-wrong-binary-classify",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "classify",
+    "vit-base-patch16-224",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/bus.jpg"
+  ],
+  "http": null,
+  "why": "`classify` belongs to npuimage",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

@@ -1,0 +1,34 @@
+# The declared differences between the C++ oracle and the Rust runtime.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# A difference between the two runtimes is a FAILURE until somebody decides
+# it is not. The decision goes here, with its reason, and the file is in the
+# tree so that the reason is REVIEWED rather than remembered.
+#
+# A declared divergence is still printed on every run, with the diff. It
+# does not fail the run, because a difference that was decided on is not an
+# accident -- but a declared divergence that nobody reads is an accident
+# wearing a label, and the print is what stops that.
+#
+# THE FORMAT
+#
+# One case id, a colon, and the reason. The reason is the whole point: a
+# case id with no reason is a suppression.
+#
+#     sub/add: the C++ runtime aborts inside glibc when the network path
+#              runs; the Rust runtime refuses cleanly.
+#
+# WHAT DOES NOT BELONG HERE
+#
+# * A difference that has not been decided on. That is a failure, and it
+#   belongs in the report.
+# * A difference caused by the ENVIRONMENT -- a missing model, a missing
+#   design set. Those are skips, not divergences: they say that the case
+#   could not be run, which is a different statement from "the two
+#   runtimes differ here, on purpose".
+#
+sub/add: the C++ runtime ABORTS inside glibc ("invalid stdio handle") when
+         the network path runs on this machine, and the Rust runtime refuses
+         cleanly instead. A crash is not a contract: it says what the process
+         did, not what the runtime means.

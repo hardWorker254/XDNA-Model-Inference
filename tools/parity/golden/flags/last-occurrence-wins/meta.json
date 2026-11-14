@@ -1,0 +1,20 @@
+{
+  "case": "flags/last-occurrence-wins",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "tokenize",
+    "all-MiniLM-L6-v2",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt",
+    "--max-len",
+    "8",
+    "--max-len",
+    "64"
+  ],
+  "http": null,
+  "why": "the LAST occurrence of a flag wins, not the first: the output is padded to 64 tokens and nothing was truncated, where the first occurrence would have given 8 tokens and a note saying so. The C++ tree got this wrong once and `serve <whisper> --threads 8` answered with 24 threads",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

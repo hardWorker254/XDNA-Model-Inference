@@ -1,0 +1,1 @@
+error: --host-gelu is gone: one flag now says which ops go on the array, and an op is on the host when it is NOT listed. Use --npu-ops without gelu. (The old flags are refused rather than ignored so a stale command line cannot look like it worked.)

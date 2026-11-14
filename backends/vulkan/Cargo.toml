@@ -1,0 +1,21 @@
+[package]
+name = "npum-vulkan"
+description = "The GPU backend: Vulkan through ash, with WGSL shaders."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+npum-cpu.workspace = true
+npum-format.workspace = true
+npum-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

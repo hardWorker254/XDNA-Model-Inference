@@ -1,0 +1,15 @@
+[package]
+name = "npum-cpu"
+description = "The CPU backend: the accuracy reference every other backend is measured against."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+npum-format.workspace = true
+npum-model.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

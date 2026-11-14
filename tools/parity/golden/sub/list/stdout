@@ -1,0 +1,52 @@
+
+Models (root <ROOT>)
+
+  model                state     layers hidden  pooling      size  notes
+  all-MiniLM-L6-v2     cpu            6    384     mean     90 MB  smallest and fastest; head_dim 32 keeps attention off the array
+  bge-small-en-v1.5    available     12    384      cls 134 MB dl  MiniLM's width at twice the depth; +2.99 MTEB points
+  bge-micro-v2         available      3    384     mean  69 MB dl  3 layers at MiniLM's width; mean pooling; same designs as MiniLM
+  bge-base-en-v1.5     available     12    768      cls 438 MB dl  best geometric fit for this NPU: head_dim 64 and every N a multiple of 384
+  bge-large-en-v1.5    available     24   1024      cls 1340 MB dl  highest quality; N=1024 forces tile_n 32, and 24 layers cost dispatches
+  embeddinggemma-300m  available     24    768     mean 1155 MB dl  MQA+RoPE+GeGLU on the array (4 GEMMs/layer); gated, needs HF_TOKEN
+  nomic-embed-text-v1.5 cpu           12    768     mean    549 MB  RoPE + gated SwiGLU (arch=2); same array designs as bge-base; needs --prefix (search_document / search_query / clustering / classification)
+  gte-multilingual-base available     12    768      cls 582 MB dl  multilingual, XLM-R tokenizer; NTK RoPE + gated GeGLU (arch=3); same array designs as bge-base/nomic
+  whisper-tiny         no design      4    384      n/a    153 MB  smallest Whisper: 4+4 layers, 80 mel bins; greedy, no timestamps
+  whisper-base         available      6    512      n/a 290 MB dl  6+6 layers; clearly better than tiny on real speech
+  whisper-small        available     12    768      n/a 968 MB dl  12+12 layers; the first size where quality clearly beats base
+  whisper-medium       available     24   1024      n/a 3100 MB dl  24+24 layers; 4x the dispatches of base for a modest gain
+  whisper-large-v3     available     32   1280      n/a 3100 MB dl  32+32 layers, 128 mel bins; the audio frontend dominates its runtime
+  whisper-large-v3-turbo available     32   1280      n/a 1620 MB dl  large-v3's encoder with a 4-layer decoder: ~4x the speed, some cost
+  vit-base-patch16-224 no design     12    768      n/a    346 MB  image classifier: 4 GEMMs/layer on the SAME designs as bge-base, patch_embed rides attn_out; 197 positions, head on the host
+
+  Locally packed (not in the catalogue):
+  mediapipe-hands      hands          -      -      n/a      9 MB  npuimage hands <name> <image>; CPU only unless packed with --npu
+  mediapipe-pose       mppose         -      -      n/a     18 MB  npuimage mppose <name> <image>; CPU only unless packed with --npu
+  paddleocr-onnx       ocr            0      0      n/a     19 MB  npuimage ocr <name> <image>; CPU only unless packed with --npu
+  yolov8n-pose         pose           -      -      n/a     13 MB  npuimage pose <name> <image>; CPU only unless packed with --npu
+
+  ready      installed, with a matching NPU design -- `serve` runs it
+  available  not downloaded yet -- `serve` fetches and verifies it
+  cpu        installed, but this CONTAINER holds row-major host-side
+             GEMM operands, so it runs entirely on the CPU. Repack it
+             (the pre-tiled NPU layout is the default) to use the array
+  no design  installed, but no design set for this geometry is present
+  no encoder installed, and a design may match, but this build has no
+             forward pass for the architecture -- it will refuse rather
+             than return embeddings for the wrong model
+  stt        installed, and it is a SPEECH-TO-TEXT model: no pooling,
+             and it needs TWO design sets -- gemm_rtp for the encoder
+             stack and gemm_rtp_dec for the decoder. `transcribe` and
+             `serve` are how it runs; `embed` is not. A whisper row says
+             `no design` until BOTH are exported, which is one command:
+               python tools/export/export_gemm_rtp.py --target <name> \
+                   --arch 1 --out runtime
+  cls         installed, and it is an IMAGE CLASSIFIER: no pooling and
+             no text, and it needs ONE design set -- gemm_rtp, the same
+             four streams bge-base-en-v1.5 uses, because a ViT's GEMM
+             shapes ARE bge-base's and its patch embedding is [n,768]x
+             [768,768], which is attn_out's shape. `classify` is how it
+             runs; `embed` is not:
+               npuimage classify <name> <image.png>
+
+  npuembeddings serve <model>
+

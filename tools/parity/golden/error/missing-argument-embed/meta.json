@@ -1,0 +1,17 @@
+{
+  "case": "error/missing-argument-embed",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "embed"
+  ],
+  "http": null,
+  "why": "a verb with too few arguments says what it needs",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": [
+    "container-extension",
+    "container-extension-path"
+  ]
+}

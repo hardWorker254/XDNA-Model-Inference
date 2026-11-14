@@ -1,0 +1,4 @@
+a golden transcript is a contract
+the second line exercises the tokenizer's word boundaries
+UPPERCASE and punctuation: commas, periods, and hyphens!
+a third line, with a number 42 and a symbol $ sign

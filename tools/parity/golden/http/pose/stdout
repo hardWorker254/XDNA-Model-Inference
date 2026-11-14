@@ -1,0 +1,4 @@
+
+  serving http://127.0.0.1:<PORT>/v1/pose   (model yolov8n-pose)
+  POST multipart/form-data: image (required, PNG or JPEG), conf, iou, kpt, max_det
+  640x640 input, 300 people max, host backend

@@ -1,0 +1,17 @@
+NpuEmbeddings -- body pose (YOLOv8-pose) on the CPU
+  model      yolov8n-pose: 640px letterbox, 3 levels (strides 8/16/32), 8400 cells, head 56 = 4 box + 1 class + 17 keypoints x 3
+  backend    conv on the host (default), everything else on the host
+             pass --npu-ops conv to measure the array instead; see runtime/include/pose/net.hpp for why the host wins here (2.6x arithmetic padding waste on N <= 64, 100 of the network's 436 dispatches for the stem alone, and 660 us per dispatch of which 140 us is the device's GEMM).
+  decode     conf 0.25, iou 0.70, keypoint 0.50, max_det 300
+  setup      <S> s
+  ops        (npu = dispatched, host = this process)
+             72 x conv                  host  im2col + a blocked fp32 GEMM over rows, 16 threads
+             silu                       host  fused into the convolution's epilogue; it is elementwise on the GEMM's output
+             concat, add                host  channel joins and the C2f residual, memory-bound
+             maxpool (SPPF)             host  size-preserving 5x5/1, pad 2
+             upsample                   host  nearest x2, the neck's up path
+             image front end            host  decode, bilinear letterbox to 640px, pad 114, (x/255 - mean)/std
+             dfl                        folded the exported graph softmaxes its 16 bins and sums them, and the 1x1 projection above it is applied as w . E[bin] + b on that mean -- which is why it is not in the 72
+             threshold, nms, inverse letterbox host  host-side by construction: a list of survivors, not a tensor
+
+  interrupted -- releasing NPU contexts

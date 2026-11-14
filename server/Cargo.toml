@@ -1,0 +1,19 @@
+[package]
+name = "npuembeddings-server"
+description = "The HTTP endpoints: the eight of them, unchanged."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+npum-families.workspace = true
+npum-format.workspace = true
+npum-model.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

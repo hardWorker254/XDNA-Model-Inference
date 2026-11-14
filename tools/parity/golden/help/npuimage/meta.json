@@ -1,0 +1,18 @@
+{
+  "case": "help/npuimage",
+  "kind": "cli",
+  "binary": "npuimage",
+  "argv": [
+    "--help"
+  ],
+  "http": null,
+  "why": "the same help, with the image verbs and without the others",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:17",
+  "rules": [
+    "container-extension",
+    "container-extension-path",
+    "timing-s"
+  ]
+}

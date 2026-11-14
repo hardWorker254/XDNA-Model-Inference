@@ -1,0 +1,16 @@
+{
+  "case": "error/verb-wrong-binary-transcribe",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "transcribe",
+    "whisper-tiny",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/tone.wav"
+  ],
+  "http": null,
+  "why": "`transcribe` belongs to npuaudio; the refusal names the program to run and prints the roster",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

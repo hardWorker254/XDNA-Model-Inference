@@ -1,0 +1,4 @@
+error: `classify` runs in npuimage, and this is npuembeddings.
+    npuembeddings   embed, list, add, tokenize, serve
+    npuaudio        transcribe, serve
+    npuimage        classify, pose, hands, mppose, ocr, serve

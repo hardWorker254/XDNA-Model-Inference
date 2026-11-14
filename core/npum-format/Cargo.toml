@@ -1,0 +1,29 @@
+[package]
+name = "npum-format"
+description = "The .npum container: read, write, and the digests that pin a model's provenance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# TWO KINDS, because two callers want different things and one crate cannot
+# be both:
+#
+#   rlib   -- the Rust runtime and the Rust packer.
+#   cdylib -- the Python packer, which loads it with ctypes.
+#
+# The cdylib exists because the plan's open decision #1 was answered: the
+# format has ONE writer, and it is this crate. A Python writer would leave two
+# writers of one binary layout, which is the exact failure mode the C++ mirror
+# of tools/pack/pack_npue.py was: correctly-sized weights in the wrong order,
+# which no size check catches.
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

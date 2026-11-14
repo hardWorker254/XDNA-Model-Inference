@@ -1,0 +1,18 @@
+{
+  "case": "error/prefix-on-model-without-table",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "embed",
+    "all-MiniLM-L6-v2",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt",
+    "--prefix",
+    "search_document"
+  ],
+  "http": null,
+  "why": "a prefix for a model with no prompt table is refused too -- the same mistake in the other direction",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T14:41:28",
+  "rules": []
+}

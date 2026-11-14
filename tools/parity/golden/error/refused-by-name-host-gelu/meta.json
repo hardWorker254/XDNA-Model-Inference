@@ -1,0 +1,17 @@
+{
+  "case": "error/refused-by-name-host-gelu",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "embed",
+    "all-MiniLM-L6-v2",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt",
+    "--host-gelu"
+  ],
+  "http": null,
+  "why": "the removed flags are refused by name, with the replacement named; a stale command line must not look like it worked",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

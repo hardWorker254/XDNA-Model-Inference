@@ -1,0 +1,21 @@
+{
+  "case": "sub/hands",
+  "kind": "cli",
+  "binary": "npuimage",
+  "argv": [
+    "hands",
+    "mediapipe-hands",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/bus.jpg"
+  ],
+  "http": null,
+  "why": "the hands and their landmarks",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:18",
+  "rules": [
+    "timing-ms",
+    "timing-s",
+    "timing-split",
+    "timings-json"
+  ]
+}

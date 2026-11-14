@@ -1,0 +1,1 @@
+error: no NPU design set matches all-MiniLM-L6-v2 (hidden 384, datapath bfp16, device npu3) under <ROOT> -- name one with --artifacts, or export one for this generation with tools/export/export_gemm_rtp.py

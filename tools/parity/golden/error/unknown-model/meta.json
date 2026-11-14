@@ -1,0 +1,16 @@
+{
+  "case": "error/unknown-model",
+  "kind": "cli",
+  "binary": "npuembeddings",
+  "argv": [
+    "embed",
+    "no-such-model",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt"
+  ],
+  "http": null,
+  "why": "a model that is not installed is named as missing, and the refusal says where it would look",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

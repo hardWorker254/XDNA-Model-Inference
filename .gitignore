@@ -169,6 +169,29 @@ experiments/m8-npu-vs-cpu/artifacts/onnx/
 #   & "C:\Users\vegar\.conda\envs\iron\python.exe" tools\verify_npue.py
 *.npue
 
+# --- the Rust tree -------------------------------------------------------
+#
+# The build directory.
+#
+/target/
+
+# The packed containers: `.npum` is the current name and `.npue` the one
+# before it, and both are built by tools/pack/pack_npue.py.
+*.npum
+
+# The ONNX exports: they are downloaded by
+# tools/parity/fixtures/fetch_models.sh, pinned by sha256, and they are a
+# gigabyte.
+*.onnx
+
+# The parity fixture root: a symlink to models/ and a copy of the design
+# sets. It is BUILT by tools/parity/run.py, not committed -- the root is
+# what the harness points both runtimes at, and a committed one would be a
+# tree that says what is installed, which is the one thing a golden must
+# not be.
+/tools/parity/fixtures/root/
+
+
 # Prerequisites
 *.d
 

@@ -1,0 +1,16 @@
+{
+  "case": "error/verb-wrong-binary-embed",
+  "kind": "cli",
+  "binary": "npuaudio",
+  "argv": [
+    "embed",
+    "all-MiniLM-L6-v2",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/in.txt"
+  ],
+  "http": null,
+  "why": "`embed` belongs to npuembeddings",
+  "expect_code": 2,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": []
+}

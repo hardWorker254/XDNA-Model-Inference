@@ -1,0 +1,10 @@
+{
+  "image": "<FIXTURE>/ocr_text.png",
+  "width": 900,
+  "height": 360,
+  "timings_ms": {"total": <MS>, "front_end": <MS>, "detector": <MS>, "db": <MS>, "crop": <MS>, "recogniser": <MS>},
+  "boxes": [
+    {"score": 0.876913, "conf": 0.973182, "text": "Hello OCR World", "quad": [[33.000, 44.000], [449.000, 45.000], [449.000, 88.000], [33.000, 87.000]]},
+    {"score": 0.910794, "conf": 0.999915, "text": "NpuEmbeddings 12345", "quad": [[33.000, 160.000], [606.000, 159.000], [606.000, 207.000], [33.000, 208.000]]},
+    {"score": 0.925287, "conf": 0.984586, "text": "PaddleOCR on AMD NPU", "quad": [[35.000, 277.000], [653.000, 276.000], [653.000, 315.000], [36.000, 316.000]]}
+  ]}

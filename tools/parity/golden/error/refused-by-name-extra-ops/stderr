@@ -1,0 +1,1 @@
+error: --extra-ops is tools/export/export_eltwise.py's BUILD flag: at run time it selected nothing and was dropped without a word, so a command line that asked for an op quietly ran without it. To send ops to the array, use --npu-ops.

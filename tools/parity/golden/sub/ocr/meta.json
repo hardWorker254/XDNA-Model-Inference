@@ -1,0 +1,21 @@
+{
+  "case": "sub/ocr",
+  "kind": "cli",
+  "binary": "npuimage",
+  "argv": [
+    "ocr",
+    "paddleocr-onnx",
+    "/home/prof/XDNA-Model-Inference/tools/parity/fixtures/ocr_text.png"
+  ],
+  "http": null,
+  "why": "the boxes, the text and the confidences",
+  "expect_code": null,
+  "recorded_from": "/home/prof/Npu-Embeddings-XDNA1/runtime/build",
+  "recorded_at": "2026-11-14T15:02:21",
+  "rules": [
+    "timing-ms",
+    "timing-s",
+    "timing-split",
+    "timings-json"
+  ]
+}

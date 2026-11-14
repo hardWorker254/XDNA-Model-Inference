@@ -1,0 +1,4 @@
+error: `embed` runs in npuembeddings, and this is npuaudio.
+    npuembeddings   embed, list, add, tokenize, serve
+    npuaudio        transcribe, serve
+    npuimage        classify, pose, hands, mppose, ocr, serve

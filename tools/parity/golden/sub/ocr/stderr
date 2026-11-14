@@ -1,0 +1,13 @@
+NpuEmbeddings -- ocr (PaddleOCR text det + rec) on the CPU
+  model      paddleocr-onnx: detector 960px, recogniser 48x320, 438 classes over 436 characters
+  thresholds thresh 0.300, box 0.600, unclip 1.5, max_candidates 1000, min_size 3 -- from the container, not a flag
+  normalise  detector (x/255 - 0.485)/0.229, pad 0 in the RASTER (black); recogniser (x/255 - 0.500)/0.500, pad 0 in the NORMALISED space
+  ops        (npu = dispatched, host = this process)
+             57 x conv + 15 x dwconv    host  text detector, once per frame
+             24 x conv + 14 x dwconv    host  text recogniser, once per box
+             2 x convtranspose          host  the DB head's two upsampling convolutions: a sum of SHIFTED contributions, not a GEMM
+             db, ctc                    host  host-side by construction: a list of boxes and a string
+  setup      <S> s (both graphs read, weights transposed once)
+  <FIXTURE>/ocr_text.png 900x360  3 boxes -> 3 read  <MS> ms (front <MS> / det <MS> / db <MS> / crop <MS> / rec 685.6)
+             split  det: 57 convs on the host (<MS> ms: <MS> ms of GEMM, <MS> ms of transpose back), 15 dwconv + 2 convtranspose on the host (<MS> ms), im2col <MS> ms
+             split  rec: 72 convs on the host (<MS> ms: <MS> ms of GEMM, <MS> ms of transpose back), 42 dwconv + 0 convtranspose on the host (<MS> ms), im2col <MS> ms

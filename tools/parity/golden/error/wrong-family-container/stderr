@@ -1,0 +1,4 @@
+error: <ROOT>/models/whisper-tiny.npum is `whisper_encdec_gelu`, which npuaudio runs, and this is npuembeddings.
+    npuembeddings   embed, list, add, tokenize, serve
+    npuaudio        transcribe, serve
+    npuimage        classify, pose, hands, mppose, ocr, serve
