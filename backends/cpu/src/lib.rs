@@ -35,6 +35,8 @@
 //!   round-half-to-even and round-half-away differ on every exact .5.
 
 pub mod bert;
+pub mod hands;
+pub mod hands_decode;
 pub mod kernels;
 pub mod pose;
 pub mod pose_decode;

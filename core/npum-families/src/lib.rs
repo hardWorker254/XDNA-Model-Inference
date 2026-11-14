@@ -129,7 +129,7 @@ impl Family {
                 Some("the image front end, the patch embedding and the classification head")
             }
             Family::Pose => None,
-            Family::Hands => Some("the MediaPipe hand network and its decoding"),
+            Family::Hands => None,
             Family::MpPose => Some("the MediaPipe pose network and its decoding"),
             Family::Ocr => Some("the text detector, the recogniser and the box merging"),
         }

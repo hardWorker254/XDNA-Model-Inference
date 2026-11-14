@@ -35,6 +35,7 @@
 pub mod embed;
 pub mod families;
 pub mod flags;
+pub mod hands;
 pub mod help;
 pub mod list;
 pub mod pose;
