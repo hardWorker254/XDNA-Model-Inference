@@ -35,6 +35,46 @@ use crate::array::{ArrayDesign, ArrayError};
 use crate::transport::Transport;
 use npum_format::{bf16_to_f32, f32_to_bf16};
 
+/// The design's datapath: the element sizes the dispatch works in.
+///
+/// This is the ONE place that decides what the array's operands are, and
+/// both the projection and the convolution ask it -- a dispatch that
+/// converted its A operand one way and read its C operand another would
+/// produce a number that is wrong in a way no shape check would catch.
+#[derive(Debug, Clone, Copy)]
+pub struct Datapath {
+    /// The A operand's element size, in bytes.
+    pub a_bytes: usize,
+    /// The C operand's element size, in bytes.
+    pub c_bytes: usize,
+}
+
+impl Datapath {
+    /// The design's datapath, checked.
+    ///
+    /// Only bf16 is dispatched. An int8 design needs the container's
+    /// per-operand scales and the SmoothQuant reciprocals, and this runtime
+    /// has no source for either yet -- so it says so by name instead of
+    /// computing a number with the scales missing.
+    pub fn of<T: Transport>(design: &ArrayDesign<T>) -> Result<Self, ArrayError> {
+        let info = design.info();
+        let a_bytes = elem_bytes(&info.a_dtype)
+            .ok_or_else(|| ArrayError::Design(format!("the design's A dtype is {:?}", info.a_dtype)))?;
+        let c_bytes = elem_bytes(&info.c_dtype)
+            .ok_or_else(|| ArrayError::Design(format!("the design's C dtype is {:?}", info.c_dtype)))?;
+        if a_bytes != 2 || c_bytes != 2 {
+            return Err(ArrayError::Design(format!(
+                "this runtime dispatches the bf16 datapath only, and the design's \
+                 A and C are {} and {} bytes -- an int8 dispatch needs the \
+                 container's per-operand scales and the SmoothQuant reciprocals, \
+                 and this code has no source for either yet.",
+                a_bytes, c_bytes
+            )));
+        }
+        Ok(Self { a_bytes, c_bytes })
+    }
+}
+
 /// The element size of an operand dtype, as the manifest spells it.
 fn elem_bytes(dtype: &str) -> Option<usize> {
     match dtype {
@@ -62,9 +102,108 @@ pub fn gemm<T: Transport>(
 ) -> Result<(), ArrayError> {
     // THE SHAPE, BEFORE THE HARDWARE.
     //
-    // These three checks are the same on the host path and on the array
-    // path, and they come first: a shape bug is a shape bug whichever path
-    // the run takes.
+    // These checks are the same on the host path and on the array path, and
+    // they come first: a shape bug is a shape bug whichever path the run
+    // takes.
+    check_shape(a.len(), n_real, rows, k, n, out.len(), bias)?;
+
+    let dp = Datapath::of(design)?;
+
+    // THE FIT, AGAINST THE DESIGN'S OWN BUFFERS.
+    //
+    // The design was exported for a shape; a shape that does not fit is not
+    // a shape this runtime can serve, and saying so is better than a
+    // dispatch that overruns a buffer.
+    let info = design.info();
+    if rows * k * dp.a_bytes > info.buffers[0] as usize
+        || rows * n * dp.c_bytes > info.buffers[2] as usize
+    {
+        return Err(ArrayError::Design(format!(
+            "{rows}x{k} A or {rows}x{n} C does not fit the design's buffers -- \
+             the design was exported for a different shape (tile {}x{}x{})",
+            info.tile.m, info.tile.k, info.tile.n
+        )));
+    }
+
+    // THE A OPERAND, IN THE DESIGN'S OWN DTYPE.
+    //
+    // The real rows first, then the padded tail as zeros.
+    let a_packed = pack_a(a, n_real, rows, k, dp.a_bytes);
+
+    dispatch(design, instr, &a_packed, n_real, rows, dp, bias, n, out)
+}
+
+/// The A operand in the design's own dtype.
+///
+/// The real rows first, then the padded tail as zeros. The tail is a padded
+/// ROW: the design computes all `rows` rows whatever the A buffer holds in
+/// the rest, and zero is the only value that cannot be mistaken for a real
+/// position.
+pub(crate) fn pack_a(a: &[f32], n_real: usize, rows: usize, k: usize, a_bytes: usize) -> Vec<u8> {
+    let mut packed = vec![0u8; rows * k * a_bytes];
+    for i in 0..(n_real * k) {
+        packed[i * 2..i * 2 + 2].copy_from_slice(&f32_to_bf16(a[i]).to_le_bytes());
+    }
+    packed
+}
+
+/// The dispatch itself: the A operand is already in the design's dtype.
+///
+/// This is the shape both the projection and the convolution dispatch, and
+/// it is one function so that the two cannot disagree about what a dispatch
+/// is -- the convolution's padded rows and the projection's padded tail are
+/// the same mechanism, and a second copy of it would be a second thing to be
+/// wrong about.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch<T: Transport>(
+    design: &mut ArrayDesign<T>,
+    instr: usize,
+    a_packed: &[u8],
+    n_real: usize,
+    rows: usize,
+    dp: Datapath,
+    bias: Option<&[f32]>,
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), ArrayError> {
+    // THE DISPATCH WINDOW.
+    //
+    // Bind, sync, dispatch, sync back -- all of it before the host reads
+    // the output. A buffer that was written through the host map and not
+    // synced is still dirty in the host cache, and the device then reads
+    // whatever the host last flushed, which looks exactly like a design that
+    // computed nothing.
+    design.write_bound(0, a_packed)?;
+    design.dispatch(instr)?;
+
+    // THE OUTPUT, BACK IN f32, WITH THE BIAS.
+    let mut c_packed = vec![0u8; rows * n * dp.c_bytes];
+    design.read(2, &mut c_packed)?;
+    for r in 0..n_real {
+        for j in 0..n {
+            let bits =
+                u16::from_le_bytes([c_packed[(r * n + j) * 2], c_packed[(r * n + j) * 2 + 1]]);
+            let mut value = bf16_to_f32(bits);
+            if let Some(bias) = bias {
+                value += bias[j];
+            }
+            out[r * n + j] = value;
+        }
+    }
+    Ok(())
+}
+
+/// The shape a dispatch needs, checked before the hardware is touched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_shape(
+    a_len: usize,
+    n_real: usize,
+    rows: usize,
+    k: usize,
+    n: usize,
+    out_len: usize,
+    bias: Option<&[f32]>,
+) -> Result<(), ArrayError> {
     if n_real == 0 || n_real > rows {
         return Err(ArrayError::Design(format!(
             "{n_real} real rows into a {rows}-row dispatch"
@@ -75,17 +214,15 @@ pub fn gemm<T: Transport>(
             "a GEMM with a zero dimension".to_string(),
         ));
     }
-    if a.len() < n_real * k {
+    if a_len < n_real * k {
         return Err(ArrayError::Design(format!(
-            "the A operand holds {} floats, and {n_real} rows of {k} need {}",
-            a.len(),
+            "the A operand holds {a_len} floats, and {n_real} rows of {k} need {}",
             n_real * k
         )));
     }
-    if out.len() < n_real * n {
+    if out_len < n_real * n {
         return Err(ArrayError::Design(format!(
-            "the output holds {} floats, and {n_real} rows of {n} need {}",
-            out.len(),
+            "the output holds {out_len} floats, and {n_real} rows of {n} need {}",
             n_real * n
         )));
     }
@@ -95,71 +232,6 @@ pub fn gemm<T: Transport>(
                 "the bias holds {} values, and the output has {n} columns",
                 bias.len()
             )));
-        }
-    }
-
-    // THE DATAPATH.
-    let info = design.info().clone();
-    let a_bytes = elem_bytes(&info.a_dtype).ok_or_else(|| {
-        ArrayError::Design(format!("the design's A dtype is {:?}", info.a_dtype))
-    })?;
-    let c_bytes = elem_bytes(&info.c_dtype).ok_or_else(|| {
-        ArrayError::Design(format!("the design's C dtype is {:?}", info.c_dtype))
-    })?;
-    if a_bytes != 2 || c_bytes != 2 {
-        return Err(ArrayError::Design(format!(
-            "this runtime dispatches the bf16 datapath only, and the design's \
-             A and C are {} and {} bytes -- an int8 dispatch needs the \
-             container's per-operand scales and the SmoothQuant reciprocals, \
-             and this code has no source for either yet.",
-            a_bytes, c_bytes
-        )));
-    }
-
-    // THE FIT, AGAINST THE DESIGN'S OWN BUFFERS.
-    //
-    // The design was exported for a shape; a shape that does not fit is not
-    // a shape this runtime can serve, and saying so is better than a
-    // dispatch that overruns a buffer.
-    if rows * k * a_bytes > info.buffers[0] as usize
-        || rows * n * c_bytes > info.buffers[2] as usize
-    {
-        return Err(ArrayError::Design(format!(
-            "{rows}x{k} A or {rows}x{n} C does not fit the design's buffers -- \
-             the design was exported for a different shape (M {}, seq {})",
-            info.tile.m, info.name
-        )));
-    }
-
-    // THE A OPERAND, IN THE DESIGN'S OWN DTYPE.
-    //
-    // The real rows first, then the padded tail as zeros.
-    let mut a_packed = vec![0u8; rows * k * a_bytes];
-    for i in 0..(n_real * k) {
-        a_packed[i * 2..i * 2 + 2].copy_from_slice(&f32_to_bf16(a[i]).to_le_bytes());
-    }
-    design.write_bound(0, &a_packed)?;
-
-    // THE DISPATCH WINDOW.
-    //
-    // Bind, sync, dispatch, sync back -- all of it before the host reads
-    // the output. A buffer that was written through the host map and not
-    // synced is still dirty in the host cache, and the device then reads
-    // whatever the host last flushed, which looks exactly like a design that
-    // computed nothing.
-    design.dispatch(instr)?;
-
-    // THE OUTPUT, BACK IN f32, WITH THE BIAS.
-    let mut c_packed = vec![0u8; rows * n * c_bytes];
-    design.read(2, &mut c_packed)?;
-    for r in 0..n_real {
-        for j in 0..n {
-            let bits = u16::from_le_bytes([c_packed[(r * n + j) * 2], c_packed[(r * n + j) * 2 + 1]]);
-            let mut value = bf16_to_f32(bits);
-            if let Some(bias) = bias {
-                value += bias[j];
-            }
-            out[r * n + j] = value;
         }
     }
     Ok(())

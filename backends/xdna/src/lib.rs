@@ -39,6 +39,7 @@
 //! is room".
 
 pub mod array;
+pub mod conv;
 pub mod design;
 pub mod device;
 pub mod gemm;

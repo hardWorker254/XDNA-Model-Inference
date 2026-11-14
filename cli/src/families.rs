@@ -50,6 +50,22 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
     with_model(model, npum_families::Family::Embed, root, |path, arch| {
         // The banner comes before the refusal, as in the C++.
         crate::status::announce(path, root);
+        // `--npu-ops` is a valid request and a valid question, and this
+        // runtime has no answer to it yet: the text family's projections and
+        // its elementwise passes run on the host. Accepting the flag and
+        // running the host would leave the command line saying "array" about
+        // a run that dispatched nothing -- which is the one thing the flag
+        // exists to prevent.
+        //
+        // The array path itself is NOT missing: the transport, the design
+        // loader and the array's GEMM are ported and checked on the board.
+        // What is missing is the SEAM -- the place in this family where the
+        // call would go to the array instead of the host -- and no family
+        // routes to them yet.
+        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Embed, args) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(prefix) = prefix.as_deref() {
             if let Some(reason) = refuse_unknown_prefix(path, prefix) {
                 eprintln!("error: {reason}");
@@ -152,6 +168,39 @@ fn refuse_op_not_in_arch(args: &Args, family: npum_families::Family) -> Option<S
     // command line was parsed; a failure here would be a different bug.
     let codes = crate::flags::parse_npu_ops(listing).ok()?;
     npum_families::ops::refuse_op_not_in_arch(family, listing, &codes)
+}
+
+/// The refusal for a `--npu-ops` this runtime accepts but cannot honour.
+///
+/// THE FLAG IS A QUESTION ABOUT WHERE A RUN HAPPENS, and the answer has to
+/// be the truth. A family that accepts `--npu-ops gemm` and then runs the
+/// host has answered "the array" with a run that dispatched nothing, and the
+/// command line says something the run did not do -- which is the one thing
+/// the flag exists to prevent.
+///
+/// So the families that have no array path refuse the flag, and say what is
+/// missing AND what is not: the transport, the design loader and the array's
+/// GEMM are ported and checked on the board, and what is missing is the
+/// SEAM -- the place in this family where the call would go to the array
+/// instead of the host.
+///
+/// The conv families have their own refusals, in their own words, because
+/// their question is a different one: they have exactly one array-able op,
+/// and their message is about what that op would move.
+fn refuse_array_not_ported(family: npum_families::Family, args: &Args) -> Option<String> {
+    let listing = args.value("--npu-ops")?;
+    let codes = crate::flags::parse_npu_ops(listing).ok()?;
+    if codes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "--npu-ops {listing}: the {} family runs every operation on the host in this \
+         runtime, and the array path is not ported into it yet -- the transport, the \
+         design loader and the array's GEMM are done, and the family does not route to \
+         them yet. Accepting the flag and running the host would make the command line \
+         say something the run did not do.",
+        family.as_str(),
+    ))
 }
 
 /// `add`.
@@ -274,6 +323,10 @@ pub fn transcribe(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
+        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Stt, args) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         let _ = arch;
         crate::stt::run(path, audio, args, root)
     })
@@ -299,6 +352,10 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
     }
     with_model(model, npum_families::Family::Cls, root, |path, arch| {
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Cls) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Cls, args) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
