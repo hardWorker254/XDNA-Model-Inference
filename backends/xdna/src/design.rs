@@ -22,7 +22,13 @@
 use npum_format::layout::{Generation, OperandDtype};
 use serde::{Deserialize, Serialize};
 
-/// One compiled design: the xclbin and its instruction streams.
+/// One compiled design, described: what it is and what it was built for.
+///
+/// The DESCRIPTION, not the design itself: the thing on the board is
+/// `array::ArrayDesign`, and this is what the fit checks look at. The C++
+/// runtime had no such split -- its `npu::Design` was both -- and the
+/// difference between "the description does not fit" and "the board refused"
+/// is worth keeping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Design {
     /// The design set's name -- `gemm_rtp`, `gelu`, `layernorm`, `softmax`.

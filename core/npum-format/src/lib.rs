@@ -49,6 +49,7 @@ pub mod digest;
 pub mod directory;
 pub mod header;
 pub mod layout;
+pub mod tiling;
 pub mod writer;
 
 pub use directory::{Directory, TensorEntry};

@@ -38,9 +38,12 @@
 //! be compared", so that an unmeasured budget is not silently read as "there
 //! is room".
 
+pub mod array;
 pub mod design;
 pub mod device;
 pub mod geometry;
+pub mod manifest;
+pub mod transport;
 
 #[cfg(feature = "direct")]
 pub mod direct;
@@ -50,9 +53,12 @@ pub mod xrt;
 pub mod contention;
 pub mod dispatch;
 
+pub use array::{ArrayDesign, ArrayError};
 pub use design::{Design, DesignSet};
 pub use device::{Device, DeviceError, Generation};
 pub use geometry::Geometry;
+pub use manifest::DesignInfo;
+pub use transport::{BufferFlags, Transport, TransportError};
 
 use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 use npum_model::caps::Precision as CapsPrecision;
