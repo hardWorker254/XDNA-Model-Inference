@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use npum_model::array::{ArrayEltwise, EltOp};
+use npum_model::array::{ArrayEltwise, ArrayGemm, ArrayText, AttentionShape, EltOp};
 
 /// The repository root, from this crate's manifest directory.
 fn repo_root() -> PathBuf {
@@ -173,4 +173,173 @@ fn every_pass_named_reaches_the_array_and_the_others_do_not() {
     assert_eq!(sm.layernorm, 0, "the LayerNorm stays on the host");
     assert_eq!(sm.gelu, 0, "the GELU stays on the host");
     assert_eq!(sm.softmax, 6, "the softmax is one pass per layer");
+}
+
+/// What the family asked of the array's DENSE side.
+///
+/// The projections and the attention are one handle -- one design, one
+/// hardware context -- so the recorder is one object too.
+#[derive(Default)]
+struct Dense {
+    /// Whether the projections are on the array.
+    gemm_on: bool,
+    /// Whether the attention is on the array.
+    attn_on: bool,
+    /// How many projections were dispatched.
+    gemms: usize,
+    /// How many times the attention was called.
+    attns: usize,
+    /// The shape at each attention call.
+    shapes: Vec<AttentionShape>,
+    /// The mask's length at each attention call.
+    masks: Vec<usize>,
+    /// Whether the attention was handed the array's softmax.
+    softmaxes: Vec<bool>,
+}
+
+impl ArrayGemm for Dense {
+    fn name(&self) -> &'static str {
+        "recorder"
+    }
+
+    fn gemm_on_array(&self) -> bool {
+        self.gemm_on
+    }
+
+    fn dispatches(&self) -> usize {
+        self.gemms
+    }
+
+    fn staged_bytes(&self) -> usize {
+        0
+    }
+
+    fn gemm(
+        &mut self,
+        _weight: &str,
+        _a: &[f32],
+        _rows: usize,
+        _k: usize,
+        _n: usize,
+        _bias: Option<&[f32]>,
+        _out: &mut [f32],
+    ) -> npum_model::array::Result<()> {
+        self.gemms += 1;
+        Ok(())
+    }
+}
+
+impl npum_model::array::ArrayAttention for Dense {
+    fn name(&self) -> &'static str {
+        "recorder"
+    }
+
+    fn on_array(&self) -> bool {
+        self.attn_on
+    }
+
+    fn score_cols(&self) -> Option<usize> {
+        if self.attn_on { Some(384) } else { None }
+    }
+
+    fn attn_dispatches(&self) -> usize {
+        0
+    }
+
+    fn attn_seconds(&self) -> (f64, f64) {
+        (0.0, 0.0)
+    }
+
+    fn attention(
+        &mut self,
+        _qkv: &[f32],
+        shape: AttentionShape,
+        mask: &[f32],
+        softmax: Option<&mut (dyn ArrayEltwise + '_)>,
+        ctx: &mut [f32],
+    ) -> npum_model::array::Result<()> {
+        self.attns += 1;
+        self.shapes.push(shape);
+        self.masks.push(mask.len());
+        self.softmaxes.push(softmax.is_some());
+        // The recorder computes nothing, so the context is zeros -- and the
+        // family carries on with them, which is the point: the ROUTING is
+        // what this test is about.
+        for value in ctx.iter_mut() {
+            *value = 0.0;
+        }
+        Ok(())
+    }
+}
+
+impl ArrayText for Dense {}
+
+/// Run the model with a recorder where the array's dense side goes.
+fn run_dense(path: &Path, model: &npum_cpu::bert::BertModel, dense: &mut Dense) {
+    let container = npum_format::Container::open(path).expect("the container opens");
+    let blob = container
+        .tensor_bytes("tokenizer.vocab")
+        .expect("the container holds a vocabulary");
+    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+        .expect("the vocabulary is usable");
+    let (encoding, truncated) = tokenizer
+        .encode_padded("a golden transcript is a contract", SEQ)
+        .expect("the text encodes");
+    assert!(!truncated, "the text fits");
+    model
+        .embed(
+            &encoding.ids,
+            &encoding.mask,
+            1,
+            SEQ,
+            Some(dense),
+            None,
+        )
+        .expect("the model runs");
+}
+
+#[test]
+fn the_attention_is_one_call_per_layer_and_the_projections_stay_put() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: the container is not installed");
+        return;
+    };
+    let model = npum_cpu::bert::BertModel::open(&path).expect("the container opens");
+
+    // THE ATTENTION ON THE ARRAY, THE PROJECTIONS ON THE HOST.
+    //
+    // The flag names the ops one by one, and `attn` names the attention
+    // and not the projections: a run that asked for the attention and got
+    // the projections moved as well would have done work the reader did
+    // not ask for.
+    let mut dense = Dense {
+        attn_on: true,
+        ..Dense::default()
+    };
+    run_dense(&path, &model, &mut dense);
+    assert_eq!(dense.attns, 6, "the attention is one block per layer");
+    assert_eq!(dense.gemms, 0, "the projections stay on the host");
+    // The shape is the model's own: one sequence of 64 positions, twelve
+    // heads of 32, and a model 384 wide.
+    for shape in &dense.shapes {
+        assert_eq!(shape.batch, 1);
+        assert_eq!(shape.seq, SEQ);
+        assert_eq!(shape.heads, 12);
+        assert_eq!(shape.head_dim, 32);
+        assert_eq!(shape.hidden, 384);
+    }
+    // The mask is one row per query position.
+    assert!(dense.masks.iter().all(|n| *n == SEQ));
+    // The softmax is a SEPARATE decision, and the attention was not handed
+    // one: a run that asked only for `attn` has no softmax design.
+    assert!(dense.softmaxes.iter().all(|b| !b));
+
+    // THE PROJECTIONS ON THE ARRAY, THE ATTENTION ON THE HOST.
+    let mut dense = Dense {
+        gemm_on: true,
+        ..Dense::default()
+    };
+    run_dense(&path, &model, &mut dense);
+    assert_eq!(dense.attns, 0, "the attention stays on the host");
+    assert_eq!(dense.gemms, 4 * 6, "four projections per layer");
 }

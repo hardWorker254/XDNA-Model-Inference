@@ -107,6 +107,19 @@ pub type ArrayRef<'a, 'b> = Option<&'a mut (dyn ArrayConvs + 'b)>;
 /// reborrow is what a walk over a graph does.
 pub type ArrayGemmRef<'a, 'b> = Option<&'a mut (dyn ArrayGemm + 'b)>;
 
+/// A borrowed handle on the array's attention.
+///
+/// The two lifetimes are separate for the same reason the others are: a
+/// `&mut` is invariant in what it points at, and a reborrow is what a walk
+/// over a graph does.
+pub type ArrayAttentionRef<'a, 'b> = Option<&'a mut (dyn ArrayAttention + 'b)>;
+
+/// A borrowed handle on the array's dense work: the projections and the
+/// attention, which are one design on the board.
+///
+/// The two lifetimes are separate for the same reason the others are.
+pub type ArrayTextRef<'a, 'b> = Option<&'a mut (dyn ArrayText + 'b)>;
+
 /// Which of the three elementwise passes a question is about.
 ///
 /// The passes are separate designs and separate programs, so a run can put
@@ -150,6 +163,22 @@ pub trait ArrayEltwise {
     /// The softmax, over `n_rows` score rows.
     fn softmax(&mut self, x: &mut [f32], n_rows: usize) -> Result<()>;
 
+    /// The softmax the ATTENTION uses.
+    ///
+    /// A separate method and not the family's `softmax`, because the
+    /// dispatch count means ONE thing: the number of times the FAMILY
+    /// asked the array to do something. The attention's own softmax is the
+    /// attention's business -- the C++'s encoder counts the attention's
+    /// two GEMMs and not the softmax between them -- and counting it here
+    /// would make this runtime's number disagree with the C++'s on a run
+    /// that did exactly the same work.
+    ///
+    /// The default forwards to `softmax`, and an implementation that has
+    /// no count of its own may keep it.
+    fn attention_softmax(&mut self, x: &mut [f32], n_rows: usize) -> Result<()> {
+        self.softmax(x, n_rows)
+    }
+
     /// The width of a score row, when the softmax is on the array.
     ///
     /// `None` when the softmax stays on the host, and then the family's own
@@ -182,6 +211,14 @@ pub trait ArrayEltwise {
 pub trait ArrayGemm {
     /// The backend's name, as it appears in the status block.
     fn name(&self) -> &'static str;
+
+    /// Whether the projections are on the array.
+    ///
+    /// THE HANDLE'S PRESENCE IS NOT THE ANSWER: the text family's handle
+    /// covers the projections AND the attention, and a run that asked only
+    /// for the attention has a handle and no projection panels. So the
+    /// family asks, once, and sends the rest to the host.
+    fn gemm_on_array(&self) -> bool;
 
     /// How many projections this backend has dispatched.
     fn dispatches(&self) -> usize;
@@ -265,3 +302,108 @@ pub trait ArrayConvs {
         out: &mut [f32],
     ) -> Result<()>;
 }
+
+/// The attention's own shape.
+///
+/// The family knows it and the array's side needs it, and it is one struct
+/// because it is one fact: a head is `head_dim` wide, there are `heads` of
+/// them, and they make a row of `hidden`.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionShape {
+    /// How many sequences.
+    pub batch: usize,
+
+    /// How many positions per sequence.
+    pub seq: usize,
+
+    /// How many heads.
+    pub heads: usize,
+
+    /// One head's width.
+    pub head_dim: usize,
+
+    /// The model's width -- the hidden size, and `heads * head_dim`.
+    pub hidden: usize,
+}
+
+/// The array's side of a family's attention.
+///
+/// The attention is three things -- QK^T, a softmax and softmax.V -- and the
+/// array can take the two GEMMs while the softmax stays on the host, or the
+/// other way round. The two are SEPARATE decisions because the flag names
+/// them separately: `attn` moves the GEMMs and `softm` moves the softmax,
+/// and a run that names one has not named the other.
+///
+/// The trait is the whole block: the family hands over the activations and
+/// the mask, and the context comes back. The family does not walk the heads
+/// and the query chunks itself, because the array's side is the only one
+/// that knows how many rows one dispatch computes.
+pub trait ArrayAttention {
+    /// The backend's name, as it appears in the status block.
+    fn name(&self) -> &'static str;
+
+    /// Whether the attention's GEMMs are on the array.
+    fn on_array(&self) -> bool;
+
+    /// The width of a score row, when the attention is on the array.
+    ///
+    /// `None` when the attention stays on the host, and then the family's own
+    /// width is the right one.
+    ///
+    /// THE ARRAY'S WIDTH IS THE DESIGN'S, and it is the PADDED key count: the
+    /// array's score row has a column for every key the design was compiled
+    /// for, and the columns past the sequence are padding. A softmax that
+    /// normalises a different number of keys than the row holds is a softmax
+    /// over the wrong row.
+    fn score_cols(&self) -> Option<usize> {
+        None
+    }
+
+    /// How many attention dispatches this backend has run.
+    ///
+    /// The count is the RUN'S, and it is the number that says whether the
+    /// flag did what it said: two dispatches per head per query chunk.
+    fn attn_dispatches(&self) -> usize;
+
+    /// The attention's own QK^T time and its softmax.V time, in seconds.
+    ///
+    /// They are the attention's sub-items and not the block's: the block's
+    /// own time also covers the panels, which are built on the host once per
+    /// head. The two are reported separately so that a reader can see that
+    /// the sub-items add up to less than the block, which is what they do
+    /// on the array's path too.
+    fn attn_seconds(&self) -> (f64, f64);
+
+    /// Run the attention over the batch.
+    ///
+    /// `qkv` is the batch's Q|K|V block -- `batch * seq` rows of three
+    /// `hidden` values -- and `mask` is the additive mask, `batch * seq`
+    /// values, one per query position.
+    ///
+    /// `softmax` is the array's softmax when the run put it there, and
+    /// `None` when the softmax is on the host. Either way the softmax runs
+    /// at the PADDED width, because the score rows are the array's rows.
+    ///
+    /// `ctx` receives `batch * seq` rows of `hidden` values: the context.
+    fn attention(
+        &mut self,
+        qkv: &[f32],
+        shape: AttentionShape,
+        mask: &[f32],
+        softmax: Option<&mut (dyn ArrayEltwise + '_)>,
+        ctx: &mut [f32],
+    ) -> Result<()>;
+}
+
+/// The text family's handle on the array.
+///
+/// THE PROJECTIONS AND THE ATTENTION ARE ONE DESIGN on the board: the same
+/// xclbin, the same instruction streams, the same buffers, one hardware
+/// context. The attention's two GEMMs are streams INSIDE the projections'
+/// set -- `attn_qk` and `attn_av` -- and not a set of their own, so a
+/// family that holds one handle for each would be holding two handles on
+/// one thing, and the borrow checker is right to refuse it.
+///
+/// So the family holds ONE handle, and this trait is it: the two traits'
+/// operations, on one object.
+pub trait ArrayText: ArrayGemm + ArrayAttention {}

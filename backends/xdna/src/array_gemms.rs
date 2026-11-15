@@ -6,6 +6,13 @@
 //! projections -- the fused QKV, the attention output, and the two FFN
 //! halves -- and this is the object that runs them on the array.
 //!
+//! # THE ATTENTION IS HERE TOO, AND NOT BY ACCIDENT
+//!
+//! The attention's two GEMMs are streams INSIDE this design set -- `attn_qk`
+//! and `attn_av` -- and not a set of their own. So they are not a second
+//! backend and not a second context: they are two more instruction streams
+//! of the design this object already holds, and they dispatch on it.
+//!
 //! # THE TIERS ARE THE DESIGN'S
 //!
 //! The design was compiled for batches of four, eight and sixteen
@@ -26,6 +33,10 @@
 //! multiplies by, and it is the SAME numbers as the host's filter rounded to
 //! bf16 -- so a run that dispatches to the array is the same network, not a
 //! second network.
+//!
+//! The attention's panels are the exception: they are ACTIVATIONS, and they
+//! are built on the host, per head, because every head reads a different
+//! slice of the keys.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,6 +44,7 @@ use std::path::Path;
 use npum_format::Container;
 
 use crate::array::{ArrayDesign, ArrayError as DesignError};
+use crate::attention::Attention;
 use crate::gemm::gemm;
 use crate::transport::Transport;
 
@@ -82,6 +94,11 @@ pub struct ArrayGemms<T: Transport> {
     design: ArrayDesign<T>,
     /// The panels, by the weight's name.
     panels: HashMap<String, Panel>,
+    /// The attention, when the run asked for it.
+    ///
+    /// `None` is a run that asked for the projections only, and then the
+    /// attention is the host's.
+    attention: Option<Attention>,
     /// How many projections have been dispatched.
     dispatches: usize,
     /// How many bytes of panels are staged.
@@ -99,10 +116,16 @@ impl<T: Transport> ArrayGemms<T> {
     /// EVERY PROJECTION IS STAGED HERE, BEFORE THE FIRST RUN. The flag says
     /// the projections move to the array, and a container packed without the
     /// panels has to be refused while there is still nothing to unwind.
+    ///
+    /// `attention` asks for the attention's streams as well. They are
+    /// streams of the SAME design, so asking for them costs no context and
+    /// no second design set -- and not asking for them leaves the attention
+    /// on the host, which is what a run that did not name `attn` wants.
     pub fn open(
         container: &Path,
         mut design: ArrayDesign<T>,
         specs: &[GemmSpec],
+        attention: bool,
     ) -> Result<Self, DesignError> {
         let file = Container::open(container).map_err(|e| {
             DesignError::Design(format!("cannot open {}: {e}", container.display()))
@@ -189,16 +212,29 @@ impl<T: Transport> ArrayGemms<T> {
             );
         }
 
-        if panels.is_empty() {
+        if panels.is_empty() && !attention {
             return Err(DesignError::Design(format!(
                 "{}: the array was asked for and no projection could be staged.",
                 container.display()
             )));
         }
 
+        // THE ATTENTION'S STREAMS.
+        //
+        // They are streams of THIS design, so they cost no context and no
+        // second design set -- and they are found here, while there is still
+        // nothing to unwind: a set exported without them is refused by
+        // name, and not discovered at the first attention.
+        let attention = if attention {
+            Some(Attention::open(&mut design)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             design,
             panels,
+            attention,
             dispatches: 0,
             staged,
         })
@@ -213,6 +249,10 @@ impl<T: Transport> ArrayGemms<T> {
 impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
     fn name(&self) -> &'static str {
         "xrt"
+    }
+
+    fn gemm_on_array(&self) -> bool {
+        !self.panels.is_empty()
     }
 
     fn dispatches(&self) -> usize {
@@ -301,3 +341,55 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         Ok(())
     }
 }
+
+impl<T: Transport> npum_model::array::ArrayAttention for ArrayGemms<T> {
+    fn name(&self) -> &'static str {
+        "xrt"
+    }
+
+    fn on_array(&self) -> bool {
+        self.attention.is_some()
+    }
+
+    fn score_cols(&self) -> Option<usize> {
+        self.attention.as_ref().map(|a| a.score_cols())
+    }
+
+    fn attn_dispatches(&self) -> usize {
+        self.attention.as_ref().map(|a| a.dispatches).unwrap_or(0)
+    }
+
+    fn attn_seconds(&self) -> (f64, f64) {
+        match &self.attention {
+            Some(a) => (a.qk_seconds, a.av_seconds),
+            None => (0.0, 0.0),
+        }
+    }
+
+    fn attention(
+        &mut self,
+        qkv: &[f32],
+        shape: npum_model::array::AttentionShape,
+        mask: &[f32],
+        softmax: Option<&mut (dyn npum_model::array::ArrayEltwise + '_)>,
+        ctx: &mut [f32],
+    ) -> npum_model::array::Result<()> {
+        let attention = self.attention.as_mut().ok_or_else(|| {
+            npum_model::array::ArrayError(
+                "this run did not ask for the attention to go on the array".to_string(),
+            )
+        })?;
+        crate::attention::run(
+            &mut self.design,
+            attention,
+            qkv,
+            shape,
+            mask,
+            softmax,
+            ctx,
+        )
+        .map_err(|e| npum_model::array::ArrayError(e.to_string()))
+    }
+}
+
+impl<T: Transport> npum_model::array::ArrayText for ArrayGemms<T> {}

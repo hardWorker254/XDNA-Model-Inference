@@ -71,14 +71,15 @@ pub fn run(
     // answered here and nowhere else: the projections go to the array, the
     // elementwise passes stay on the host, and the run says how many it
     // dispatched.
-    let mut array: Option<Box<dyn npum_model::array::ArrayGemm>> = if wants_gemm(args) {
-        Some(open_array(path, &model, root).map_err(|reason| Refusal {
-            code: crate::EXIT_REFUSED,
-            message: reason,
-        })?)
-    } else {
-        None
-    };
+    let mut array: Option<Box<dyn npum_model::array::ArrayText>> =
+        if wants_gemm(args) || wants_attn(args) {
+            Some(open_array(path, &model, root, args).map_err(|reason| Refusal {
+                code: crate::EXIT_REFUSED,
+                message: reason,
+            })?)
+        } else {
+            None
+        };
     // THE ELEMENTWISE PASSES, AND ONLY THE ONES THE FLAG NAMED.
     //
     // Each pass is its own design and its own context, and a design that
@@ -156,6 +157,7 @@ pub fn run(
         texts.len() as f64 / elapsed
     );
     let dispatches = array.as_ref().map(|a| a.dispatches()).unwrap_or(0)
+        + array.as_ref().map(|a| a.attn_dispatches()).unwrap_or(0)
         + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
     crate::status::print_time_split(&timings, 4, elapsed, dispatches);
 
@@ -330,6 +332,15 @@ pub fn wants_softmax(args: &crate::flags::Args) -> bool {
     wants_op(args, "softm")
 }
 
+/// Whether the run asked for the attention to go on the array.
+///
+/// The attention is two GEMMs -- `attn_qk` and `attn_av` -- and they are
+/// streams of the projections' OWN design set, so asking for them costs no
+/// second context and no second design set.
+pub fn wants_attn(args: &crate::flags::Args) -> bool {
+    wants_op(args, "attn")
+}
+
 /// Where the elementwise passes run, read off the flag and the design sets.
 ///
 /// The status block is printed BEFORE the work, and it says where each
@@ -346,6 +357,11 @@ pub fn places(path: &Path, root: &Path, args: &Args) -> crate::status::Places {
     }
     if wants_softmax(args) {
         places.softm = op_place(path, root, "softmax");
+    }
+    if wants_attn(args) {
+        // The attention's streams are inside the projections' set, so the
+        // place it names is that set's.
+        places.attn = op_place(path, root, "gemm_rtp");
     }
     places.staged_bytes = staged_bytes(path, root, args);
     places
@@ -547,11 +563,19 @@ pub fn wants_gemm(args: &crate::flags::Args) -> bool {
 /// * the DESIGN SET -- the compiled core. The container's own copy is
 ///   preferred, because a container that carries it needs nothing beside
 ///   it; a directory is the fallback.
+///
+/// # ONE DESIGN, ONE CONTEXT
+///
+/// The attention's two GEMMs are streams of the projections' OWN set --
+/// `attn_qk` and `attn_av` -- and not a set of their own. So asking for the
+/// attention asks for the same design set, and the run holds ONE hardware
+/// context for the whole of the text family's dense work.
 pub fn open_array(
     path: &Path,
     model: &BertModel,
     root: &Path,
-) -> Result<Box<dyn npum_model::array::ArrayGemm>, String> {
+    args: &crate::flags::Args,
+) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
     use npum_xdna::array::ArrayDesign;
     use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
     use npum_xdna::transport::Transport;
@@ -559,25 +583,34 @@ pub fn open_array(
     let container =
         npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
+    let gemm = wants_gemm(args);
+    let attn = wants_attn(args);
+
     // THE PANELS.
-    let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
-        format!(
-            "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
-             any: it has no layer.0.qkv. Repack it with the packer's --dtype bf16, which \
-             stores every projection's weights as the pre-tiled bf16 panel the array \
-             multiplies by.",
-            path.display()
-        )
-    })?;
-    if panel.dtype != "BF16" {
-        return Err(format!(
-            "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
-             any: layer.0.qkv is {}, not BF16. Repack it with the packer's --dtype bf16, \
-             which stores every projection's weights as the pre-tiled bf16 panel the array \
-             multiplies by.",
-            path.display(),
-            panel.dtype
-        ));
+    //
+    // Only the projections need them: the attention's operands are
+    // ACTIVATIONS, built on the host, and a container packed for the host
+    // has everything the attention needs.
+    if gemm {
+        let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
+            format!(
+                "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
+                 any: it has no layer.0.qkv. Repack it with the packer's --dtype bf16, which \
+                 stores every projection's weights as the pre-tiled bf16 panel the array \
+                 multiplies by.",
+                path.display()
+            )
+        })?;
+        if panel.dtype != "BF16" {
+            return Err(format!(
+                "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
+                 any: layer.0.qkv is {}, not BF16. Repack it with the packer's --dtype bf16, \
+                 which stores every projection's weights as the pre-tiled bf16 panel the array \
+                 multiplies by.",
+                path.display(),
+                panel.dtype
+            ));
+        }
     }
 
     // THE DESIGN.
@@ -592,11 +625,12 @@ pub fn open_array(
     } else {
         let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
             format!(
-                "{}: --npu-ops gemm needs a design set: this container does not carry one, \
+                "{}: --npu-ops {} needs a design set: this container does not carry one, \
                  and no design set was found for it. Pass --artifacts <dir> naming one, or \
                  build it with the exporter. The flag has no default to fall back on, \
                  because this model's design is its own.",
-                path.display()
+                path.display(),
+                if gemm { "gemm" } else { "attn" }
             )
         })?;
         ArrayDesign::open(&dir.join("gemm_rtp"), transport).map_err(|e| e.to_string())?
@@ -607,22 +641,24 @@ pub fn open_array(
     let hidden = spec.hidden;
     let ffn = spec.ffn;
     let mut specs = Vec::with_capacity(spec.layers * 4);
-    for layer in 0..spec.layers {
-        for (op, k, n) in [
-            ("qkv", hidden, 3 * hidden),
-            ("attn_out", hidden, hidden),
-            ("ffn_up", hidden, ffn),
-            ("ffn_down", ffn, hidden),
-        ] {
-            specs.push(GemmSpec {
-                weight: format!("layer.{layer}.{op}"),
-                op: op.to_string(),
-                k,
-                n,
-            });
+    if gemm {
+        for layer in 0..spec.layers {
+            for (op, k, n) in [
+                ("qkv", hidden, 3 * hidden),
+                ("attn_out", hidden, hidden),
+                ("ffn_up", hidden, ffn),
+                ("ffn_down", ffn, hidden),
+            ] {
+                specs.push(GemmSpec {
+                    weight: format!("layer.{layer}.{op}"),
+                    op: op.to_string(),
+                    k,
+                    n,
+                });
+            }
         }
     }
-    let backend = ArrayGemms::open(path, design, &specs).map_err(|e| e.to_string())?;
+    let backend = ArrayGemms::open(path, design, &specs, attn).map_err(|e| e.to_string())?;
     Ok(Box::new(backend))
 }
 

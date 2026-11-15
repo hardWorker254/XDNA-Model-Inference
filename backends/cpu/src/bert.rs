@@ -26,7 +26,7 @@
 
 use crate::kernels;
 use crate::kernels::Isa;
-use npum_model::array::{ArrayEltwise, ArrayGemmRef};
+use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape};
 use std::path::Path;
 
 /// What can go wrong while running a BERT container.
@@ -83,6 +83,11 @@ pub enum Error {
              handed a longer one, so the scores would be computed at the wrong length. Re-export \
              it with sm_cols >= seq.")]
     SoftmaxTooNarrow { cols: usize, seq: usize },
+
+    #[error("the softmax design's rows are {softmax} wide, and the attention's score row is {attn} \
+             wide. The softmax design reduces along the whole row, so it has to be the width of \
+             the score row it is handed.")]
+    SoftmaxWidthMismatch { softmax: usize, attn: usize },
 
     #[error(transparent)]
     Kernel(#[from] npum_model::Error),
@@ -514,7 +519,7 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
-        array: ArrayGemmRef<'_, '_>,
+        array: ArrayTextRef<'_, '_>,
         eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
         self.embed_on(kernels::gemm_isa(), ids, mask, batch, seq, array, eltwise)
@@ -528,7 +533,7 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
-        array: ArrayGemmRef<'_, '_>,
+        array: ArrayTextRef<'_, '_>,
         eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
         let mut own = Timings::default();
@@ -558,7 +563,7 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
-        array: ArrayGemmRef<'_, '_>,
+        array: ArrayTextRef<'_, '_>,
         eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
         let mut timings = Timings::default();
@@ -574,7 +579,7 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
-        array: ArrayGemmRef<'_, '_>,
+        array: ArrayTextRef<'_, '_>,
         mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
         let rows = batch * seq;
@@ -642,7 +647,7 @@ impl BertModel {
         batch: usize,
         seq: usize,
         timings: &mut Timings,
-        mut array: ArrayGemmRef<'_, '_>,
+        mut array: ArrayTextRef<'_, '_>,
         mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
         let spec = &self.spec;
@@ -690,6 +695,40 @@ impl BertModel {
             .as_deref()
             .is_some_and(|e| e.on_array(npum_model::array::EltOp::Softmax));
 
+        // THE ATTENTION, ON THE ARRAY OR ON THE HOST.
+        //
+        // The attention is the one pass whose two halves are the ARRAY's
+        // decision: `attn` moves the two GEMMs and `softm` moves the
+        // softmax, and a run that names one has not named the other.
+        //
+        // And when the attention is on the array, the SCORE ROWS are the
+        // array's: they are at the PADDED key count, because the array's
+        // score row has a column for every key the design was compiled for.
+        // The softmax inside the attention is at that width too -- the
+        // array's, when the softmax is on the array, and the host's at the
+        // same width when it is not.
+        let attn_on = array.as_deref().is_some_and(|a| a.on_array());
+        // THE PROJECTIONS, ON THE ARRAY OR ON THE HOST.
+        //
+        // Asked and not assumed: the handle covers the projections AND the
+        // attention, so a run that asked only for the attention has a
+        // handle and no panels -- and the projections stay on the host.
+        let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
+        if attn_on {
+            let attn_cols = array
+                .as_deref()
+                .and_then(|a| a.score_cols())
+                .unwrap_or(seq);
+            if let Some(cols) = eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+                if cols != attn_cols {
+                    return Err(Error::SoftmaxWidthMismatch {
+                        softmax: cols,
+                        attn: attn_cols,
+                    });
+                }
+            }
+        }
+
         // The embedding LayerNorm.
         let t0 = std::time::Instant::now();
         if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| ln_on) {
@@ -717,7 +756,7 @@ impl BertModel {
             // the array multiplies the weights in bf16 and the host in f32
             // -- so a run on the array is the same network with a coarser
             // weight, and the difference is the width of bf16.
-            match array.as_deref_mut() {
+            match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array
@@ -737,52 +776,96 @@ impl BertModel {
                 }
             }
 
-            // The attention: QK^T, the softmax, and softmax.V.
-            let t_qk = std::time::Instant::now();
-            self.qk(&qkv, &mut scores, batch, seq, sc_cols);
-            let qk_s = t_qk.elapsed().as_secs_f64();
-            timings.qk += qk_s;
-            let t_sm = std::time::Instant::now();
-            // THE SOFTMAX, ON THE ARRAY OR ON THE HOST.
+            // THE ATTENTION: QK^T, the softmax, and softmax.V.
             //
-            // The mask is added to the row before the softmax, because the
-            // softmax's maximum has to see it -- and the mask covers the
-            // REAL keys only, so the padding columns keep the -1e30 the
-            // score matrix was laid out with.
-            if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| sm_on) {
-                for r in 0..score_rows {
-                    let row = &mut scores[r * sc_cols..][..sc_cols];
-                    let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
-                    for j in 0..seq {
-                        row[j] += mk[j];
-                    }
+            // TWO PATHS, AND THEY ARE ALTERNATIVES.
+            //
+            // The array's path takes the WHOLE block -- the two GEMMs and
+            // the softmax between them -- because the array's score row is
+            // at the PADDED key count and the host's is at the sequence, and
+            // a softmax that normalises a different number of keys than the
+            // row holds is a softmax over the wrong row. The host's path
+            // below is the reference the array's one is measured against,
+            // and not a fallback for it.
+            if attn_on {
+                let t_attn = std::time::Instant::now();
+                let before = array
+                    .as_deref()
+                    .map(|a| a.attn_seconds())
+                    .unwrap_or((0.0, 0.0));
+                let shape = AttentionShape {
+                    batch,
+                    seq,
+                    heads: spec.heads,
+                    head_dim: spec.head_dim,
+                    hidden,
+                };
+                if let Some(array) = array.as_deref_mut() {
+                    // The softmax handle is the family's, and it is passed
+                    // ONLY when the softmax is on the array: the attention
+                    // asks the eltwise backend for a softmax, and a backend
+                    // with no softmax design would refuse.
+                    let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
+                    array.attention(&qkv, shape, add_mask, softmax, &mut ctx)?;
                 }
-                eltwise.softmax(&mut scores, score_rows)?;
-                // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
-                timings.array_gemm += t_sm.elapsed().as_secs_f64();
+                let after = array
+                    .as_deref()
+                    .map(|a| a.attn_seconds())
+                    .unwrap_or((0.0, 0.0));
+                // The array's own sub-items: the QK^T half and the softmax.V
+                // half. The block's own time is more than their sum -- the
+                // panels are built on the host, once per head, and they are
+                // in neither half.
+                timings.qk += after.0 - before.0;
+                timings.av += after.1 - before.1;
+                timings.attention += t_attn.elapsed().as_secs_f64();
             } else {
-                for r in 0..score_rows {
-                    let row = &mut scores[r * seq..(r + 1) * seq];
-                    let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
-                    for j in 0..seq {
-                        row[j] += mk[j];
+                let t_qk = std::time::Instant::now();
+                self.qk(&qkv, &mut scores, batch, seq, sc_cols);
+                let qk_s = t_qk.elapsed().as_secs_f64();
+                timings.qk += qk_s;
+                let t_sm = std::time::Instant::now();
+                // THE SOFTMAX, ON THE ARRAY OR ON THE HOST.
+                //
+                // The mask is added to the row before the softmax, because
+                // the softmax's maximum has to see it -- and the mask covers
+                // the REAL keys only, so the padding columns keep the -1e30
+                // the score matrix was laid out with.
+                if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| sm_on) {
+                    for r in 0..score_rows {
+                        let row = &mut scores[r * sc_cols..][..sc_cols];
+                        let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
+                        for j in 0..seq {
+                            row[j] += mk[j];
+                        }
                     }
-                    kernels::softmax_row_on(isa, row)?;
+                    eltwise.softmax(&mut scores, score_rows)?;
+                    // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
+                    timings.array_gemm += t_sm.elapsed().as_secs_f64();
+                } else {
+                    for r in 0..score_rows {
+                        let row = &mut scores[r * seq..(r + 1) * seq];
+                        let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
+                        for j in 0..seq {
+                            row[j] += mk[j];
+                        }
+                        kernels::softmax_row_on(isa, row)?;
+                    }
+                    timings.host_softmax += t_sm.elapsed().as_secs_f64();
                 }
-                timings.host_softmax += t_sm.elapsed().as_secs_f64();
+                let t_av = std::time::Instant::now();
+                self.av(&scores, &qkv, &mut ctx, batch, seq, sc_cols);
+                let av_s = t_av.elapsed().as_secs_f64();
+                timings.av += av_s;
+                // THE ATTENTION BLOCK IS QK^T AND softmax.V, and not the
+                // softmax: the C++'s `t_attn` is those two, and the softmax
+                // is counted in its own row. Counting it here as well counts
+                // it twice.
+                timings.attention += qk_s + av_s;
             }
-            let t_av = std::time::Instant::now();
-            self.av(&scores, &qkv, &mut ctx, batch, seq, sc_cols);
-            let av_s = t_av.elapsed().as_secs_f64();
-            timings.av += av_s;
-            // THE ATTENTION BLOCK IS QK^T AND softmax.V, and not the
-            // softmax: the C++'s `t_attn` is those two, and the softmax is
-            // counted in its own row. Counting it here as well counts it
-            // twice.
-            timings.attention += qk_s + av_s;
 
             // The attention output projection, and the residual.
-            match array.as_deref_mut() {
+            match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array
@@ -815,7 +898,7 @@ impl BertModel {
                 layernorm_all(isa, x, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
                 timings.host_layernorm += t_ln.elapsed().as_secs_f64();
             }
-            match array.as_deref_mut() {
+            match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array
@@ -842,7 +925,7 @@ impl BertModel {
                 kernels::gelu_row_on(isa, &mut up);
                 timings.host_gelu += t_gelu.elapsed().as_secs_f64();
             }
-            match array.as_deref_mut() {
+            match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array

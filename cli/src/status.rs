@@ -142,6 +142,11 @@ pub struct Places {
     pub gelu: Option<OpPlace>,
     /// The softmax's place.
     pub softm: Option<OpPlace>,
+    /// The attention's place.
+    ///
+    /// It is the projections' set -- `attn_qk` and `attn_av` are streams
+    /// INSIDE it -- and so it is the same place the projections would name.
+    pub attn: Option<OpPlace>,
     /// How many bytes of weights the run stages on the device, once.
     ///
     /// Zero on a host run: nothing is staged, because the host's weights
@@ -426,9 +431,10 @@ pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &s
         places.layn.as_ref(),
         &format!("{} fewer NPU dispatches", 1 + 2 * layers),
     );
-    where_host(
+    where_op(
         "attn",
         "attention, as two GEMMs",
+        places.attn.as_ref(),
         "QK^T and softmax.V as host passes, no attn_qk/attn_av dispatches",
     );
 

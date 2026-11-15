@@ -254,6 +254,21 @@ impl<T: Transport> EltwiseDesign<T> {
         Ok(())
     }
 
+    /// The softmax, over `n_rows` rows, WITHOUT counting the dispatch.
+    ///
+    /// The count is the number of times the FAMILY asked the array to do
+    /// something, and the attention's own softmax is not the family's ask:
+    /// the C++'s encoder counts the attention's two GEMMs and not the
+    /// softmax between them, and a count that disagreed with the C++'s on
+    /// a run that did exactly the same work would be a count of something
+    /// else.
+    pub fn softmax_uncounted(&mut self, x: &mut [f32], n_rows: usize) -> Result<(), ArrayError> {
+        let before = self.dispatches;
+        self.softmax(x, n_rows)?;
+        self.dispatches = before;
+        Ok(())
+    }
+
     /// The GELU, over `n` values.
     ///
     /// The GELU's "row" is the whole flat span of activations, so the
@@ -401,6 +416,17 @@ impl<T: Transport> npum_model::array::ArrayEltwise for Eltwise<T> {
         })?;
         design
             .softmax(x, n_rows)
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))
+    }
+
+    fn attention_softmax(&mut self, x: &mut [f32], n_rows: usize) -> SeamResult<()> {
+        let design = self.softmax.as_mut().ok_or_else(|| {
+            npum_model::array::ArrayError(
+                "this run did not ask for the softmax to go on the array".to_string(),
+            )
+        })?;
+        design
+            .softmax_uncounted(x, n_rows)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))
     }
 

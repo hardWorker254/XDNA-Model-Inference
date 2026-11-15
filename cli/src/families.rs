@@ -51,22 +51,21 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
         // The banner comes before the refusal, as in the C++.
         crate::status::announce(path, root, &crate::embed::places(path, root, args));
         // `--npu-ops` is a valid request and a valid question, and this
-        // runtime answers it for four of the codes: the projections, the
-        // LayerNorm, the GELU and the softmax go to the array. The rest --
-        // the attention, above all -- are not ported yet, and accepting
-        // them and running the host would leave the command line saying
-        // "array" about a run that dispatched nothing -- which is the one
-        // thing the flag exists to prevent.
+        // runtime answers it for five of the codes: the projections, the
+        // LayerNorm, the GELU, the softmax and the attention go to the
+        // array. The rest are not ported yet, and accepting them and
+        // running the host would leave the command line saying "array"
+        // about a run that dispatched nothing -- which is the one thing
+        // the flag exists to prevent.
         //
         // The array path itself is NOT missing: the transport, the design
-        // loader, the array's GEMM and its elementwise passes are ported
-        // and checked on the board. What is missing is the SEAM for the
-        // attention -- the two GEMMs that make it -- and for the other
-        // families.
+        // loader, the array's GEMM, its elementwise passes and its
+        // attention are ported and checked on the board. What is missing is
+        // the SEAM for the other families.
         if let Some(reason) = refuse_array_not_ported(
             npum_families::Family::Embed,
             args,
-            &["gemm", "layn", "gelu", "softm"],
+            &["gemm", "layn", "gelu", "softm", "attn"],
         ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;

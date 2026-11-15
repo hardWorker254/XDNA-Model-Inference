@@ -32,7 +32,10 @@ pub mod dispatcher;
 pub mod graph;
 pub mod tensor;
 
-pub use array::{ArrayConvs, ArrayEltwise, ArrayError, ArrayGemm, ConvSpec, EltOp};
+pub use array::{
+    ArrayAttention, ArrayAttentionRef, ArrayConvs, ArrayEltwise, ArrayError, ArrayGemm,
+    ArrayGemmRef, ArrayText, ArrayTextRef, AttentionShape, ConvSpec, EltOp,
+};
 pub use caps::{Caps, OpKind};
 pub use dispatcher::{Dispatcher, Placement};
 pub use graph::{Graph, ModelSpec, Op};
