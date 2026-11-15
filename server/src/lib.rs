@@ -373,7 +373,7 @@ impl Embedder {
             tokens += encoding.mask.iter().filter(|m| **m > 0).count();
             let chunk = self
                 .model
-                .embed(&encoding.ids, &encoding.mask, 1, self.seq)
+                .embed(&encoding.ids, &encoding.mask, 1, self.seq, None)
                 .map_err(|e| e.to_string())?;
             vectors.push(chunk);
         }

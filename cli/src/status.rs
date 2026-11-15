@@ -356,7 +356,7 @@ fn where_host(code: &str, long_name: &str, note: &str) {
 ///
 /// The rows are the C++'s, in the C++'s order and the C++'s widths, and the
 /// array's own rows are zero -- the host path dispatches nothing.
-pub fn print_time_split(timings: &Timings, lanes: usize, wall_s: f64) {
+pub fn print_time_split(timings: &Timings, lanes: usize, wall_s: f64, dispatches: usize) {
     let ms = 1e3;
     let busy = timings.busy();
     println!(
@@ -368,12 +368,22 @@ pub fn print_time_split(timings: &Timings, lanes: usize, wall_s: f64) {
         // before the percentage are the C++'s, and the percentage's own width
         // is %5.1f -- so a value of 96.0 prints with one space and a value
         // of 0.0 with two.
+        //
+        // THE VALUE IS IN MILLISECONDS, and the timings carry seconds: the
+        // C++'s block prints milliseconds, and a block that prints "0.0 ms"
+        // for a third of a second is a block nobody can read.
         println!(
             "    {name:<22} {value:>8.1} ms  {pct:>5.1}%",
+            value = value * ms,
             pct = if busy > 0.0 { 100.0 * value / busy } else { 0.0 }
         );
     };
-    row("gemm + epilogue", 0.0);
+    // THE ARRAY'S ROWS, AND THEY ARE ZERO ON A HOST RUN.
+    //
+    // The row is the array's own time -- the conversion, the upload, the
+    // dispatch and the download -- because the host's projection is
+    // counted by the host's rows and not here.
+    row("gemm + epilogue", timings.array_gemm);
     row("  A upload (sync)", 0.0);
     row("  dispatch (wait)", 0.0);
     row("  C download", 0.0);
@@ -392,7 +402,10 @@ pub fn print_time_split(timings: &Timings, lanes: usize, wall_s: f64) {
         "    {:<22} {:>8.1} ms   (sum of the rows above)",
         "busy", busy * ms
     );
-    println!("    {:<22} {:>8}     (count, not a time)", "dispatches", 0);
+    println!(
+        "    {:<22} {:>8}     (count, not a time)",
+        "dispatches", dispatches
+    );
     if busy > 0.0 {
         println!(
             "    {:<22} {:>8.2} x   (sum of passes / wall -- the pipelining achieved)",

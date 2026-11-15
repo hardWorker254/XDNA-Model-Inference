@@ -62,7 +62,7 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
         // What is missing is the SEAM -- the place in this family where the
         // call would go to the array instead of the host -- and no family
         // routes to them yet.
-        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Embed, args) {
+        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Embed, args, &["gemm"]) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
@@ -87,6 +87,7 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
             crate::embed::wants_out_file(args).as_deref(),
             allow_truncation,
             root,
+            args,
         ) {
             Ok(_) => 0,
             Err(refusal) => {
@@ -187,18 +188,38 @@ fn refuse_op_not_in_arch(args: &Args, family: npum_families::Family) -> Option<S
 /// The conv families have their own refusals, in their own words, because
 /// their question is a different one: they have exactly one array-able op,
 /// and their message is about what that op would move.
-fn refuse_array_not_ported(family: npum_families::Family, args: &Args) -> Option<String> {
+fn refuse_array_not_ported(
+    family: npum_families::Family,
+    args: &Args,
+    honoured: &[&str],
+) -> Option<String> {
     let listing = args.value("--npu-ops")?;
     let codes = crate::flags::parse_npu_ops(listing).ok()?;
-    if codes.is_empty() {
+    let refused: Vec<&str> = codes.iter().copied().filter(|c| !honoured.contains(c)).collect();
+    if refused.is_empty() {
         return None;
     }
+    let what = if refused.len() == 1 {
+        "that operation"
+    } else {
+        "those operations"
+    };
+    let has = if honoured.is_empty() {
+        "This family has no array-able operation in this runtime yet.".to_string()
+    } else {
+        format!(
+            "The {} family runs {} on the array here.",
+            family.as_str(),
+            honoured.join(", ")
+        )
+    };
     Some(format!(
-        "--npu-ops {listing}: the {} family runs every operation on the host in this \
-         runtime, and the array path is not ported into it yet -- the transport, the \
-         design loader and the array's GEMM are done, and the family does not route to \
-         them yet. Accepting the flag and running the host would make the command line \
-         say something the run did not do.",
+        "--npu-ops {}: the {} family runs {what} on the host in this runtime, and the \
+         array path is not ported into it yet -- the transport, the design loader and the \
+         array's GEMM and convolution are done and checked on the board, and what is \
+         missing is the SEAM for this family. {has} Accepting the flag and running the \
+         host would make the command line say something the run did not do.",
+        refused.join(", "),
         family.as_str(),
     ))
 }
@@ -323,7 +344,7 @@ pub fn transcribe(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Stt, args) {
+        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Stt, args, &[]) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
@@ -355,7 +376,7 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Cls, args) {
+        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Cls, args, &[]) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }

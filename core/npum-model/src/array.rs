@@ -100,6 +100,53 @@ pub struct ConvSpec {
 /// same handle.
 pub type ArrayRef<'a, 'b> = Option<&'a mut (dyn ArrayConvs + 'b)>;
 
+/// A borrowed handle on the array's projections.
+///
+/// The two lifetimes are separate for the same reason the convolution
+/// handle's are: a `&mut` is invariant in what it points at, and a
+/// reborrow is what a walk over a graph does.
+pub type ArrayGemmRef<'a, 'b> = Option<&'a mut (dyn ArrayGemm + 'b)>;
+
+/// The array's side of a family's projection.
+///
+/// A projection is a matrix multiplication and nothing else, and this is
+/// the same seam as the convolution's one: the family calls the trait, the
+/// array's side implements it, and the difference between the two paths is
+/// the weights' width -- the array multiplies them in bf16 and the host in
+/// f32 -- and not the shape.
+pub trait ArrayGemm {
+    /// The backend's name, as it appears in the status block.
+    fn name(&self) -> &'static str;
+
+    /// How many projections this backend has dispatched.
+    fn dispatches(&self) -> usize;
+
+    /// How many bytes of weight panels are staged on the board.
+    fn staged_bytes(&self) -> usize;
+
+    /// Run one projection on the array.
+    ///
+    /// `weight` is the projection's weight name in the container --
+    /// "layer.0.qkv" -- and the array's side finds the panel that belongs
+    /// to it. `a` holds the host's activations, `rows` of `k` values, and
+    /// `out` receives `rows` of `n` values.
+    ///
+    /// The bias is an argument and not part of the panel, because the
+    /// panel's own width is the DESIGN's and the bias's is the PROJECTION's
+    /// -- and they are the same number only because the design was exported
+    /// for this model.
+    fn gemm(
+        &mut self,
+        weight: &str,
+        a: &[f32],
+        rows: usize,
+        k: usize,
+        n: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<()>;
+}
+
 /// The array's side of a family's dense convolution.
 ///
 /// A family's dense convolution is an im2col on the host and a matrix

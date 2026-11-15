@@ -40,6 +40,7 @@
 
 pub mod array;
 pub mod array_convs;
+pub mod array_gemms;
 pub mod conv;
 pub mod design;
 pub mod device;

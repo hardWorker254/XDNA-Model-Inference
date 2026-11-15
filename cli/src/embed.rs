@@ -50,6 +50,7 @@ pub fn run(
     out_path: Option<&str>,
     allow_truncation: bool,
     root: &Path,
+    args: &crate::flags::Args,
 ) -> Result<Vec<f32>, Refusal> {
     let container = npum_format::Container::open(path).map_err(|e| Refusal {
         code: crate::EXIT_REFUSED,
@@ -63,6 +64,21 @@ pub fn run(
         code: crate::EXIT_REFUSED,
         message: format!("{}: {e}", path.display()),
     })?;
+
+    // THE ARRAY, OR THE HOST.
+    //
+    // The flag is a question about where the run happens, and it is
+    // answered here and nowhere else: the projections go to the array, the
+    // elementwise passes stay on the host, and the run says how many it
+    // dispatched.
+    let mut array: Option<Box<dyn npum_model::array::ArrayGemm>> = if wants_gemm(args) {
+        Some(open_array(path, &model, root).map_err(|reason| Refusal {
+            code: crate::EXIT_REFUSED,
+            message: reason,
+        })?)
+    } else {
+        None
+    };
 
     // The status block was printed by the caller, before any refusal this
     // run might give: the banner says WHICH container, and a refusal on
@@ -103,7 +119,14 @@ pub fn run(
             });
         }
         let chunk = model
-            .embed_timed(&mut timings, &encoding.ids, &encoding.mask, 1, seq)
+            .embed_timed(
+                &mut timings,
+                &encoding.ids,
+                &encoding.mask,
+                1,
+                seq,
+                array.as_deref_mut(),
+            )
             .map_err(|e| Refusal {
                 code: crate::EXIT_REFUSED,
                 message: e.to_string(),
@@ -117,7 +140,11 @@ pub fn run(
         elapsed,
         texts.len() as f64 / elapsed
     );
-    crate::status::print_time_split(&timings, 4, elapsed);
+    let dispatches = array
+        .as_ref()
+        .map(|a| a.dispatches())
+        .unwrap_or(0);
+    crate::status::print_time_split(&timings, 4, elapsed, dispatches);
 
     if let Some(out) = out_path {
         let mut bytes = Vec::with_capacity(vectors.len() * 4);
@@ -273,6 +300,107 @@ pub fn find_artifacts(root: &Path, model_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether the run asked for the projections to go on the array.
+///
+/// The flag is a SET of codes, and this family honours exactly one of
+/// them: `gemm`. Anything else is refused by the family's own check.
+pub fn wants_gemm(args: &crate::flags::Args) -> bool {
+    args.value("--npu-ops")
+        .map(|v| v.split(',').any(|c| c.trim() == "gemm"))
+        .unwrap_or(false)
+}
+
+/// The array's backend for the text family, when the run asked for it.
+///
+/// # THE TWO THINGS THE ARRAY NEEDS ARE SEPARATE
+///
+/// * the PANELS -- the container's weights as the array's operands: bf16,
+///   already tiled into the MMAC's byte order. A container packed for the
+///   host keeps its weights in fp32 and has no panel at all, and the
+///   refusal says how to repack it.
+///
+/// * the DESIGN SET -- the compiled core. The container's own copy is
+///   preferred, because a container that carries it needs nothing beside
+///   it; a directory is the fallback.
+pub fn open_array(
+    path: &Path,
+    model: &BertModel,
+    root: &Path,
+) -> Result<Box<dyn npum_model::array::ArrayGemm>, String> {
+    use npum_xdna::array::ArrayDesign;
+    use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
+    use npum_xdna::transport::Transport;
+
+    let container =
+        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+
+    // THE PANELS.
+    let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
+        format!(
+            "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
+             any: it has no layer.0.qkv. Repack it with the packer's --dtype bf16, which \
+             stores every projection's weights as the pre-tiled bf16 panel the array \
+             multiplies by.",
+            path.display()
+        )
+    })?;
+    if panel.dtype != "BF16" {
+        return Err(format!(
+            "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
+             any: layer.0.qkv is {}, not BF16. Repack it with the packer's --dtype bf16, \
+             which stores every projection's weights as the pre-tiled bf16 panel the array \
+             multiplies by.",
+            path.display(),
+            panel.dtype
+        ));
+    }
+
+    // THE DESIGN.
+    let own = container
+        .directory()
+        .tensor("design/gemm_rtp/design.json")
+        .is_some();
+    let transport = npum_xdna::xrt::XrtTransport::open(0)
+        .map_err(|e| format!("{}: cannot open the NPU board: {e}", path.display()))?;
+    let design = if own {
+        ArrayDesign::open_from_container(path, "gemm_rtp", transport).map_err(|e| e.to_string())?
+    } else {
+        let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
+            format!(
+                "{}: --npu-ops gemm needs a design set: this container does not carry one, \
+                 and no design set was found for it. Pass --artifacts <dir> naming one, or \
+                 build it with the exporter. The flag has no default to fall back on, \
+                 because this model's design is its own.",
+                path.display()
+            )
+        })?;
+        ArrayDesign::open(&dir.join("gemm_rtp"), transport).map_err(|e| e.to_string())?
+    };
+
+    // THE PROJECTIONS: the four of every layer.
+    let spec = &model.spec;
+    let hidden = spec.hidden;
+    let ffn = spec.ffn;
+    let mut specs = Vec::with_capacity(spec.layers * 4);
+    for layer in 0..spec.layers {
+        for (op, k, n) in [
+            ("qkv", hidden, 3 * hidden),
+            ("attn_out", hidden, hidden),
+            ("ffn_up", hidden, ffn),
+            ("ffn_down", ffn, hidden),
+        ] {
+            specs.push(GemmSpec {
+                weight: format!("layer.{layer}.{op}"),
+                op: op.to_string(),
+                k,
+                n,
+            });
+        }
+    }
+    let backend = ArrayGemms::open(path, design, &specs).map_err(|e| e.to_string())?;
+    Ok(Box::new(backend))
 }
 
 /// A container's name, without the directory and without the extension.

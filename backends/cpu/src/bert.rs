@@ -26,6 +26,7 @@
 
 use crate::kernels;
 use crate::kernels::Isa;
+use npum_model::array::ArrayGemmRef;
 use std::path::Path;
 
 /// What can go wrong while running a BERT container.
@@ -71,6 +72,12 @@ pub enum Error {
         found: usize,
     },
 
+    #[error("the tensor {name} cannot be read as a GEMM operand: {reason}")]
+    BadOperand { name: String, reason: String },
+
+    #[error("the array refused the projection: {0}")]
+    Array(#[from] npum_model::array::ArrayError),
+
     #[error(transparent)]
     Kernel(#[from] npum_model::Error),
 }
@@ -109,6 +116,12 @@ pub struct Timings {
     pub qk: f64,
     /// The softmax.V half of the attention, in seconds.
     pub av: f64,
+    /// The array's projections, in seconds.
+    ///
+    /// It is the array's own time, measured around the call, and it is
+    /// zero on a host run -- which is what the status block's split is read
+    /// against.
+    pub array_gemm: f64,
 }
 
 impl Timings {
@@ -118,7 +131,7 @@ impl Timings {
     /// and bias rows -- all zero on the host path -- plus the host rows and
     /// the attention.
     pub fn busy(&self) -> f64 {
-        self.host_layernorm + self.host_softmax + self.host_gelu + self.attention
+        self.host_layernorm + self.host_softmax + self.host_gelu + self.attention + self.array_gemm
     }
 }
 
@@ -172,6 +185,113 @@ impl BertSpec {
             cls_pooling: pooling == "cls",
             l2_normalize: config.get_bool("l2_normalize").unwrap_or(true),
         })
+    }
+}
+
+/// A GEMM operand as the host reads it: `[K, N]` in f32, row-major.
+///
+/// # THE CONTAINER STORES IT TWO WAYS
+///
+/// * an fp32 row-major filter -- the container's default, and the one the
+///   CPU backend has always read;
+/// * a bf16 panel, already padded to the design's widths and already tiled
+///   into the MMAC's byte order -- the container's ARRAY operand, and the
+///   one a container packed for the board carries.
+///
+/// The second is read by DE-TILING it with its own recorded layout and
+/// widening it back to f32. So a host run of a bf16 container is the same
+/// network as the array's run of it -- the same numbers, rounded -- and not
+/// a second network.
+///
+/// # WHY THE HOST READS A PANEL AT ALL
+///
+/// Because the array and the host must be able to run the SAME container.
+/// A container that only the array can read is a container whose host path
+/// is a different model, and the two would disagree by exactly the width of
+/// bf16 -- which is a difference nobody would notice until the numbers
+/// mattered.
+fn read_operand(
+    container: &npum_format::Container,
+    name: &str,
+) -> std::result::Result<Vec<f32>, String> {
+    let entry = container
+        .directory()
+        .tensor(name)
+        .ok_or_else(|| format!("the container has no tensor named {name}"))?;
+    let bytes = container
+        .tensor_bytes(name)
+        .map_err(|e| format!("{name}: {e}"))?;
+    match entry.dtype.as_str() {
+        "F32" => Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()),
+        "BF16" => {
+            // THE SHAPE: the PADDED one, which is the panel's own.
+            let shape: Vec<i64> = entry.padded_shape.clone();
+            if shape.len() != 2 {
+                return Err(format!(
+                    "{name}: a GEMM operand has a {}-dimensional padded shape; a dense operand \
+                     is [K, N]",
+                    shape.len()
+                ));
+            }
+            if !entry.logical_shape.is_empty()
+                && (entry.logical_shape[0] != shape[0] || entry.logical_shape[1] != shape[1])
+            {
+                return Err(format!(
+                    "{name}: logical [{},{}] but padded [{},{}]. The host builds [K,N] from the \
+                     padded shape and the caller indexes it with the logical one, so the two \
+                     must agree.",
+                    entry.logical_shape[0],
+                    entry.logical_shape[1],
+                    shape[0],
+                    shape[1]
+                ));
+            }
+            let (k, n) = (shape[0] as usize, shape[1] as usize);
+            if k == 0 || n == 0 {
+                return Err(format!("{name}: a GEMM operand with a zero dimension"));
+            }
+            // THE LAYOUT, WHICH IS THE PANEL'S OWN.
+            let layout = entry
+                .layout
+                .clone()
+                .ok_or_else(|| format!("{name}: the payload carries no layout. The layout is what says where each element sits, so without it these bytes are a right count in an unknown order."))?;
+            let layout: npum_format::layout::BLayout = serde_json::from_value(layout)
+                .map_err(|e| format!("{name}: the recorded layout is unreadable: {e}"))?;
+            if layout.kind != "block_panel"
+                || layout.tile_k <= 0
+                || layout.tile_n <= 0
+                || layout.mac_s <= 0
+                || layout.mac_t <= 0
+            {
+                return Err(format!(
+                    "{name}: the payload carries no usable block_panel layout (kind '{}').",
+                    layout.kind
+                ));
+            }
+            let tiled = npum_format::tiling::untile_b(
+                bytes,
+                k,
+                n,
+                layout.tile_k as usize,
+                layout.tile_n as usize,
+                2,
+                Some(layout.mac_s as usize),
+                Some(layout.mac_t as usize),
+                npum_format::tiling::TileOrder::Kn,
+            )
+            .map_err(|e| format!("{name}: the panel does not de-tile: {}", e.message))?;
+            let mut values = vec![0f32; k * n];
+            npum_format::bf16::bf16_to_f32_bytes(&tiled, &mut values);
+            Ok(values)
+        }
+        other => Err(format!(
+            "{name}: a {other} operand cannot be run on the host. This build widens BF16 and \
+             copies F32; anything else would mean inventing a conversion, and a guessed \
+             conversion is a wrong number in a plausible range."
+        )),
     }
 }
 
@@ -270,6 +390,14 @@ impl BertModel {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         };
+        // THE GEMM OPERANDS ARE READ DIFFERENTLY, because the container
+        // stores them two ways.
+        let read_operand = |name: &str| -> Result<Vec<f32>> {
+            read_operand(&container, name).map_err(|reason| Error::BadOperand {
+                name: name.to_string(),
+                reason,
+            })
+        };
         let expect = |name: &str, values: Vec<f32>, want: usize| -> Result<Vec<f32>> {
             if values.len() != want {
                 return Err(Error::WrongSize {
@@ -303,7 +431,7 @@ impl BertModel {
         for l in 0..spec.layers {
             let p = format!("layer.{l}");
             layers.push(LayerWeights {
-                qkv: expect(&format!("{p}.qkv"), read(&format!("{p}.qkv"))?, hidden * three_hidden)?,
+                qkv: expect(&format!("{p}.qkv"), read_operand(&format!("{p}.qkv"))?, hidden * three_hidden)?,
                 qkv_bias: expect(
                     &format!("{p}.qkv.bias"),
                     read(&format!("{p}.qkv.bias"))?,
@@ -311,7 +439,7 @@ impl BertModel {
                 )?,
                 attn_out: expect(
                     &format!("{p}.attn_out"),
-                    read(&format!("{p}.attn_out"))?,
+                    read_operand(&format!("{p}.attn_out"))?,
                     hidden * hidden,
                 )?,
                 attn_out_bias: expect(
@@ -321,7 +449,7 @@ impl BertModel {
                 )?,
                 ln1_gamma: expect(&format!("{p}.ln1.weight"), read(&format!("{p}.ln1.weight"))?, hidden)?,
                 ln1_beta: expect(&format!("{p}.ln1.bias"), read(&format!("{p}.ln1.bias"))?, hidden)?,
-                ffn_up: expect(&format!("{p}.ffn_up"), read(&format!("{p}.ffn_up"))?, hidden * ffn)?,
+                ffn_up: expect(&format!("{p}.ffn_up"), read_operand(&format!("{p}.ffn_up"))?, hidden * ffn)?,
                 ffn_up_bias: expect(
                     &format!("{p}.ffn_up.bias"),
                     read(&format!("{p}.ffn_up.bias"))?,
@@ -329,7 +457,7 @@ impl BertModel {
                 )?,
                 ffn_down: expect(
                     &format!("{p}.ffn_down"),
-                    read(&format!("{p}.ffn_down"))?,
+                    read_operand(&format!("{p}.ffn_down"))?,
                     ffn * hidden,
                 )?,
                 ffn_down_bias: expect(
@@ -360,8 +488,15 @@ impl BertModel {
     /// `ids` and `mask` are `batch * seq` long: the token ids and the
     /// attention mask, 1 for a real token and 0 for padding. The result is
     /// `batch * hidden` long: the pooled, normalised vectors.
-    pub fn embed(&self, ids: &[u32], mask: &[u32], batch: usize, seq: usize) -> Result<Vec<f32>> {
-        self.embed_on(kernels::gemm_isa(), ids, mask, batch, seq)
+    pub fn embed(
+        &self,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        array: ArrayGemmRef<'_, '_>,
+    ) -> Result<Vec<f32>> {
+        self.embed_on(kernels::gemm_isa(), ids, mask, batch, seq, array)
     }
 
     /// Embed a batch, and report where the time went.
@@ -372,9 +507,11 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
+        array: ArrayGemmRef<'_, '_>,
     ) -> Result<Vec<f32>> {
         let mut own = Timings::default();
-        let vectors = self.embed_timed_on(kernels::gemm_isa(), &mut own, ids, mask, batch, seq)?;
+        let vectors =
+            self.embed_timed_on(kernels::gemm_isa(), &mut own, ids, mask, batch, seq, array)?;
         *timings = own;
         Ok(vectors)
     }
@@ -391,9 +528,10 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
+        array: ArrayGemmRef<'_, '_>,
     ) -> Result<Vec<f32>> {
         let mut timings = Timings::default();
-        self.embed_timed_on(isa, &mut timings, ids, mask, batch, seq)
+        self.embed_timed_on(isa, &mut timings, ids, mask, batch, seq, array)
     }
 
     /// Embed a batch on a named ISA, and report where the time went.
@@ -405,6 +543,7 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
+        array: ArrayGemmRef<'_, '_>,
     ) -> Result<Vec<f32>> {
         let rows = batch * seq;
         if ids.len() != rows || mask.len() != rows {
@@ -452,7 +591,7 @@ impl BertModel {
         }
 
         // 3. The forward pass.
-        let h = self.forward(isa, &mut x, &add_mask, batch, seq, timings)?;
+        let h = self.forward(isa, &mut x, &add_mask, batch, seq, timings, array)?;
 
         // 4. The pooling.
         Ok(self.pool(&h, &attn_mask, batch, seq))
@@ -469,6 +608,7 @@ impl BertModel {
         batch: usize,
         seq: usize,
         timings: &mut Timings,
+        mut array: ArrayGemmRef<'_, '_>,
     ) -> Result<Vec<f32>> {
         let spec = &self.spec;
         let hidden = spec.hidden;
@@ -487,9 +627,33 @@ impl BertModel {
         let mut down = vec![0.0f32; rows * hidden];
         let mut scores = vec![0.0f32; batch * spec.heads * seq * seq];
 
-        for layer in &self.weights.layers {
+        for (index, layer) in self.weights.layers.iter().enumerate() {
             // The fused QKV projection.
-            gemm_nt_on(isa, x, rows, &layer.qkv, hidden, three_hidden, &layer.qkv_bias, &mut qkv);
+            //
+            // THE SEAM: the array, or the host, decided ONCE per projection
+            // and in one place. The two paths are not the same numbers --
+            // the array multiplies the weights in bf16 and the host in f32
+            // -- so a run on the array is the same network with a coarser
+            // weight, and the difference is the width of bf16.
+            match array.as_deref_mut() {
+                Some(array) => {
+                    let t = std::time::Instant::now();
+                    array
+                        .gemm(
+                            &format!("layer.{index}.qkv"),
+                            x,
+                            rows,
+                            hidden,
+                            three_hidden,
+                            Some(&layer.qkv_bias),
+                            &mut qkv,
+                        )?;
+                    timings.array_gemm += t.elapsed().as_secs_f64();
+                }
+                None => {
+                    gemm_nt_on(isa, x, rows, &layer.qkv, hidden, three_hidden, &layer.qkv_bias, &mut qkv);
+                }
+            }
 
             // The attention: QK^T, the softmax, and softmax.V.
             let t_attn = std::time::Instant::now();
@@ -514,7 +678,25 @@ impl BertModel {
             timings.attention += t_attn.elapsed().as_secs_f64();
 
             // The attention output projection, and the residual.
-            gemm_nt_on(isa, &ctx, rows, &layer.attn_out, hidden, hidden, &layer.attn_out_bias, &mut proj);
+            match array.as_deref_mut() {
+                Some(array) => {
+                    let t = std::time::Instant::now();
+                    array
+                        .gemm(
+                            &format!("layer.{index}.attn_out"),
+                            &ctx,
+                            rows,
+                            hidden,
+                            hidden,
+                            Some(&layer.attn_out_bias),
+                            &mut proj,
+                        )?;
+                    timings.array_gemm += t.elapsed().as_secs_f64();
+                }
+                None => {
+                    gemm_nt_on(isa, &ctx, rows, &layer.attn_out, hidden, hidden, &layer.attn_out_bias, &mut proj);
+                }
+            }
             for i in 0..x.len() {
                 x[i] = proj[i] + x[i];
             }
@@ -523,11 +705,47 @@ impl BertModel {
             let t_ln = std::time::Instant::now();
             layernorm_all(isa, x, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
             timings.host_layernorm += t_ln.elapsed().as_secs_f64();
-            gemm_nt_on(isa, x, rows, &layer.ffn_up, hidden, spec.ffn, &layer.ffn_up_bias, &mut up);
+            match array.as_deref_mut() {
+                Some(array) => {
+                    let t = std::time::Instant::now();
+                    array
+                        .gemm(
+                            &format!("layer.{index}.ffn_up"),
+                            x,
+                            rows,
+                            hidden,
+                            spec.ffn,
+                            Some(&layer.ffn_up_bias),
+                            &mut up,
+                        )?;
+                    timings.array_gemm += t.elapsed().as_secs_f64();
+                }
+                None => {
+                    gemm_nt_on(isa, x, rows, &layer.ffn_up, hidden, spec.ffn, &layer.ffn_up_bias, &mut up);
+                }
+            }
             let t_gelu = std::time::Instant::now();
             kernels::gelu_row_on(isa, &mut up);
             timings.host_gelu += t_gelu.elapsed().as_secs_f64();
-            gemm_nt_on(isa, &up, rows, &layer.ffn_down, spec.ffn, hidden, &layer.ffn_down_bias, &mut down);
+            match array.as_deref_mut() {
+                Some(array) => {
+                    let t = std::time::Instant::now();
+                    array
+                        .gemm(
+                            &format!("layer.{index}.ffn_down"),
+                            &up,
+                            rows,
+                            spec.ffn,
+                            hidden,
+                            Some(&layer.ffn_down_bias),
+                            &mut down,
+                        )?;
+                    timings.array_gemm += t.elapsed().as_secs_f64();
+                }
+                None => {
+                    gemm_nt_on(isa, &up, rows, &layer.ffn_down, spec.ffn, hidden, &layer.ffn_down_bias, &mut down);
+                }
+            }
             for i in 0..x.len() {
                 x[i] = down[i] + x[i];
             }

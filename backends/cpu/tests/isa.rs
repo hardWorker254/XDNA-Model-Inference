@@ -128,7 +128,7 @@ fn the_model_agrees_across_every_isa() {
     let mut reference: Option<(Isa, Vec<u8>)> = None;
     for isa in available_isas() {
         let vectors = model
-            .embed_on(isa, &encoding.ids, &encoding.mask, 1, SEQ)
+            .embed_on(isa, &encoding.ids, &encoding.mask, 1, SEQ, None)
             .expect("the model runs");
         let bytes: Vec<u8> = vectors.iter().flat_map(|v| v.to_le_bytes()).collect();
         match &reference {
