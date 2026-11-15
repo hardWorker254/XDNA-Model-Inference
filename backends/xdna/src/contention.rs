@@ -34,6 +34,15 @@
 //! FAILURE and not as "no contention". A format change must fail closed
 //! too.
 //!
+//! # THE DRIVER FIRST, `xrt-smi` SECOND
+//!
+//! The table above is XRT's, and a build without XRT cannot ask for it --
+//! which made the budget check a check that a direct-transport run could
+//! only pass with `--allow-contention`. The driver answers the same
+//! question by itself (`QUERY_HW_CONTEXTS`: every context, its pid, its
+//! partition, its submissions and its errors), so that is asked first and
+//! the table is the fallback.
+//!
 //! # THE LIMIT IS A LABELLED CONSTANT
 //!
 //! Measured on this NPU1 (Ryzen 7 PRO 8845HS, amdxdna 2.26 on Linux): a
@@ -96,6 +105,8 @@ pub fn context_budget() -> ContextBudget {
     if device.is_empty() || device == "npu1" {
         return ContextBudget {
             limit: 6,
+            // The WORDS are the oracle's: this line is printed before a run
+            // and compared byte for byte against the C++ runtime's.
             source: "measured on NPU1 (six concurrent hw_contexts; XRT exposes no \
                      usable-count query)"
                 .to_string(),
@@ -129,10 +140,47 @@ pub fn running_device() -> String {
 }
 
 /// Survey the contexts other processes hold.
+///
+/// The driver first: it answers without XRT, and it answers for the whole
+/// device. `xrt-smi` is the fallback, for the machines where the driver's
+/// query is refused (`QUERY_HW_CONTEXTS` is newer than the node).
 pub fn survey_contexts() -> ContentionReport {
+    if let Some(report) = from_driver() {
+        return report;
+    }
+    from_xrt_smi()
+}
+
+/// The survey the driver answers.
+fn from_driver() -> Option<ContentionReport> {
+    let contexts = crate::direct::query_hw_contexts().ok()?;
+    let own = std::process::id();
+    let mut report = ContentionReport {
+        tool_ran: true,
+        failure: String::new(),
+        foreign: Vec::new(),
+    };
+    for context in contexts.iter().filter(|context| context.pid != own) {
+        let busy = context.submissions > context.completions;
+        report.foreign.push(ForeignContext {
+            pid: context.pid,
+            // The driver's per-context entry carries no process name; the
+            // name is in the array query, and a name is not needed to say
+            // whether the device has room.
+            process: format!("ctx {} col {}", context.start_col, context.num_col),
+            status: if busy { "Active" } else { "Idle" }.to_string(),
+            memory: String::new(),
+        });
+    }
+    Some(report)
+}
+
+/// The survey `xrt-smi` answers.
+fn from_xrt_smi() -> ContentionReport {
     let mut report = ContentionReport::default();
     let Some(text) = run_capture() else {
-        report.failure = "xrt-smi examine -r all did not run or printed no table"
+        report.failure = "neither the driver's GET_INFO context query nor `xrt-smi examine -r all` \
+             answered"
             .to_string();
         return report;
     };
@@ -207,7 +255,7 @@ pub fn require_context_budget(
             return true;
         }
         eprintln!();
-        eprintln!("  Refusing to build {requested} hw_context(s) without knowing the device has room. Make `xrt-smi examine -r all` work, close other NPU");
+        eprintln!(            "Refusing to build {requested} hw_context(s) without knowing the device has room. Make `xrt-smi examine -r all` work, close other NPU");
         eprintln!("  processes, or pass --allow-contention to proceed anyway.");
         eprintln!();
         return false;

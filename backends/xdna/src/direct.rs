@@ -171,6 +171,9 @@ const CU_OPCODE_RUN: u64 = 3;
 const QUERY_AIE_VERSION: u32 = 2;
 /// The AIE metadata parameter of `GET_INFO`.
 const QUERY_AIE_METADATA: u32 = 1;
+/// The hardware contexts parameter of `GET_INFO`.
+const QUERY_HW_CONTEXTS: u32 = 5;
+
 /// How long one dispatch may take before the wait gives up.
 ///
 /// A dispatch on this board is milliseconds, so a minute is long enough not
@@ -323,6 +326,22 @@ struct SyncobjTimelineWait {
 struct AieVersion {
     major: u32,
     minor: u32,
+}
+
+/// `struct amdxdna_drm_query_hwctx`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct QueryHwctx {
+    context_id: u32,
+    start_col: u32,
+    num_col: u32,
+    pad: u32,
+    pid: i64,
+    command_submissions: u64,
+    command_completions: u64,
+    migrations: u64,
+    preemptions: u64,
+    errors: u64,
 }
 
 /// `struct amdxdna_qos_info`.
@@ -1438,6 +1457,83 @@ fn monotonic_now_ns() -> i64 {
 #[cfg(not(target_os = "linux"))]
 fn monotonic_now_ns() -> i64 {
     i64::MAX - DISPATCH_TIMEOUT_NS
+}
+
+/// One hardware context, as the driver reports it.
+#[derive(Debug, Clone, Copy)]
+pub struct HwContext {
+    /// The process that holds it.
+    pub pid: u32,
+    /// The first column of its partition.
+    pub start_col: u32,
+    /// How many columns its partition occupies.
+    pub num_col: u32,
+    /// Commands submitted to it.
+    pub submissions: u64,
+    /// Commands it completed.
+    pub completions: u64,
+    /// Errors it counted.
+    pub errors: u64,
+}
+
+/// The hardware contexts the device holds right now, for every process.
+///
+/// The driver answers this for the whole device, which is what a run needs
+/// before it builds contexts of its own -- one context per design set, and a
+/// seventh is refused. It is also the answer a build WITHOUT XRT can get:
+/// `xrt-smi` is not there to be asked.
+///
+/// The driver hides a context its caller may not see (another Linux user
+/// without `CAP_SYS_ADMIN`), so a short answer is not proof of an idle
+/// device -- and neither is an empty one.
+pub fn query_hw_contexts() -> Result<Vec<HwContext>, String> {
+    /// More contexts than the device allows, so that the array is never the
+    /// reason an entry is missing.
+    const MOST: usize = 32;
+
+    let mut last = std::io::Error::other("no device node");
+    for path in device_nodes(0) {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                last = error;
+                continue;
+            }
+        };
+        let board = Board { file };
+        let mut entries = [QueryHwctx::default(); MOST];
+        let mut args = GetInfo {
+            param: QUERY_HW_CONTEXTS,
+            buffer_size: size_of::<[QueryHwctx; MOST]>() as u32,
+            buffer: entries.as_mut_ptr() as u64,
+        };
+        ioctl(
+            &board,
+            IOCTL_GET_INFO,
+            &mut args as *mut GetInfo as *mut c_void,
+        )
+        .map_err(|error| format!("{path}: {error}"))?;
+        // The driver answers with the number of BYTES it wrote, not with a
+        // count of entries.
+        let filled = args.buffer_size as usize / size_of::<QueryHwctx>();
+        return Ok(entries
+            .iter()
+            .take(filled)
+            .map(|entry| HwContext {
+                pid: entry.pid as u32,
+                start_col: entry.start_col,
+                num_col: entry.num_col,
+                submissions: entry.command_submissions,
+                completions: entry.command_completions,
+                errors: entry.errors,
+            })
+            .collect());
+    }
+    Err(format!("cannot open the NPU device: {last}"))
 }
 
 /// The raw ioctl, without a libc dependency.
