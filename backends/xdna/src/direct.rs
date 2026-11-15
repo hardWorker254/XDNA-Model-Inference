@@ -171,6 +171,20 @@ const CU_OPCODE_RUN: u64 = 3;
 const QUERY_AIE_VERSION: u32 = 2;
 /// The AIE metadata parameter of `GET_INFO`.
 const QUERY_AIE_METADATA: u32 = 1;
+/// How long one dispatch may take before the wait gives up.
+///
+/// A dispatch on this board is milliseconds, so a minute is long enough not
+/// to cut a slow design short -- and short enough that a wedged device is a
+/// failure the caller is told about instead of a process that waits with no
+/// output and no way out. The job is not cancelled by the timeout: it is
+/// still the device's, which is why the message says what to do about it.
+///
+/// It is a DURATION and not a deadline: the ioctl's `timeout_nsec` is an
+/// absolute CLOCK_MONOTONIC time (`drm.h` says so), so a value that looks
+/// like sixty seconds is a deadline sixty seconds after boot -- already
+/// past -- and the wait answers ETIME at once. That reads exactly like a
+/// device that never completes a job.
+const DISPATCH_TIMEOUT_NS: i64 = 60 * 1_000_000_000;
 
 /// `struct amdxdna_drm_create_hwctx`.
 #[repr(C)]
@@ -977,18 +991,24 @@ impl Transport for DirectTransport {
         let mut wait = SyncobjTimelineWait {
             handles: handles.as_mut_ptr() as u64,
             points: points.as_mut_ptr() as u64,
-            timeout_nsec: i64::MAX,
+            timeout_nsec: monotonic_now_ns().saturating_add(DISPATCH_TIMEOUT_NS),
             count_handles: 1,
             flags: 0,
             first_signaled: 0,
             pad: 0,
             deadline_nsec: 0,
         };
-        ioctl(
+        if let Err(error) = ioctl(
             &run.board,
             IOCTL_SYNCOBJ_TIMELINE_WAIT,
             &mut wait as *mut SyncobjTimelineWait as *mut c_void,
-        )?;
+        ) {
+            return Err(TransportError::new(format!(
+                "the kernel did not finish in {} s: {error}. The job is still the device's; \
+                 do not reuse this context -- open it again before running more",
+                DISPATCH_TIMEOUT_NS / 1_000_000_000
+            )));
+        }
 
         // AND THE STATE: the driver writes it into the packet's own header
         // word, and a run that did not complete is an error and not a
@@ -1321,6 +1341,7 @@ fn errno_text(errno: i32) -> String {
         22 => "EINVAL",
         25 => "ENOTTY",
         28 => "ENOSPC",
+        62 => "ETIME",
         95 => "EOPNOTSUPP",
         _ => "an unknown error",
     };
@@ -1366,6 +1387,57 @@ pub fn read_generation() -> Option<Generation> {
 #[cfg(not(target_os = "linux"))]
 pub fn read_generation() -> Option<Generation> {
     None
+}
+
+/// `struct timespec`.
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// The monotonic clock's reading, in nanoseconds.
+///
+/// The syncobj wait takes an ABSOLUTE deadline on this clock, so a timeout
+/// is a deadline computed from here and not a duration handed over.
+#[cfg(target_os = "linux")]
+fn monotonic_now_ns() -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_CLOCK_GETTIME: i64 = 228;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_CLOCK_GETTIME: i64 = 113;
+    /// CLOCK_MONOTONIC: the clock the syncobj wait's deadline is on.
+    const CLOCK_MONOTONIC: i64 = 1;
+
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let ret: i64;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_CLOCK_GETTIME => ret,
+            in("rdi") CLOCK_MONOTONIC,
+            in("rsi") &mut now as *mut Timespec,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    if ret < 0 {
+        // A clock that cannot be read is not a reason to hang: the caller
+        // gets the longest deadline there is instead.
+        return i64::MAX - DISPATCH_TIMEOUT_NS;
+    }
+    now.tv_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(now.tv_nsec)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn monotonic_now_ns() -> i64 {
+    i64::MAX - DISPATCH_TIMEOUT_NS
 }
 
 /// The raw ioctl, without a libc dependency.
