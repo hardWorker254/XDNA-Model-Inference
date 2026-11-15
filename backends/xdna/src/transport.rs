@@ -126,6 +126,7 @@ pub trait Transport: Sized {
     /// has ever used.
     fn open(index: u32) -> Result<Self, TransportError>;
 
+
     /// The hardware context for one xclbin.
     ///
     /// The xclbin is handed over as BYTES: a design set that lives inside a
@@ -200,5 +201,29 @@ pub trait Transport: Sized {
 /// Vulkan backends, and the array path then says so instead of failing to
 /// link.
 pub const fn transport_available() -> bool {
-    cfg!(all(feature = "xrt", xrt_shim))
+    cfg!(all(feature = "xrt", xrt_shim)) || cfg!(feature = "direct")
+}
+
+/// The transport this build speaks.
+///
+/// The same rule for every dependent: the direct transport, when the build
+/// has it, is the one that speaks; XRT is what a build without it uses. A
+/// build can have both -- the direct transport does not need XRT to be
+/// absent, only to be unused -- and the direct one wins, because it is the
+/// one the build was asked for.
+///
+/// It lives HERE and not in each dependent so that the binary, the tests
+/// and any future tool all speak through the same transport: a test that
+/// named XRT itself would quietly keep testing XRT in a direct build.
+#[cfg(feature = "direct")]
+pub type SelectedTransport = crate::direct::DirectTransport;
+
+/// The transport this build speaks, when it has no direct transport.
+#[cfg(all(feature = "xrt", not(feature = "direct")))]
+pub type SelectedTransport = crate::xrt::XrtTransport;
+
+/// Open the board, through whichever transport this build speaks.
+#[cfg(any(feature = "xrt", feature = "direct"))]
+pub fn open_selected(index: u32) -> Result<SelectedTransport, TransportError> {
+    SelectedTransport::open(index)
 }

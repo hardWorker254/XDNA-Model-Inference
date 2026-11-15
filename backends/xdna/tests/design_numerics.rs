@@ -29,7 +29,7 @@ use std::path::PathBuf;
 
 use npum_xdna::array::ArrayDesign;
 use npum_xdna::transport::Transport;
-use npum_xdna::xrt::XrtTransport;
+use npum_xdna::transport::SelectedTransport as Board;
 
 /// bf16 carries 8 significand bits, so one output rounding is at most half an
 /// ulp = 2^-9 relative. Anything beyond that is not a rounding artefact.
@@ -133,7 +133,7 @@ fn the_design_computes_the_gemm_it_claims_to() {
         eprintln!("skipping: no design set (set NPU_ARTIFACTS to the artifacts root)");
         return;
     };
-    let transport = match XrtTransport::open(0) {
+    let transport = match Board::open(0) {
         Ok(transport) => transport,
         Err(e) => {
             eprintln!("skipping: no NPU board: {e}");
@@ -248,7 +248,7 @@ fn the_op_layer_gemm_matches_the_reference() {
         eprintln!("skipping: no design set (set NPU_ARTIFACTS to the artifacts root)");
         return;
     };
-    let transport = match XrtTransport::open(0) {
+    let transport = match Board::open(0) {
         Ok(transport) => transport,
         Err(e) => {
             eprintln!("skipping: no NPU board: {e}");

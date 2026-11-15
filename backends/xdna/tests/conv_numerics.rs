@@ -38,7 +38,7 @@ use npum_format::tiling::{untile_b, TileOrder};
 use npum_xdna::array::ArrayDesign;
 use npum_xdna::conv::{conv, ConvShape};
 use npum_xdna::transport::Transport;
-use npum_xdna::xrt::XrtTransport;
+use npum_xdna::transport::SelectedTransport as Board;
 use npum_format::Container;
 
 /// bf16 carries 8 significand bits, so one output rounding is at most half an
@@ -135,7 +135,7 @@ fn the_container_s_own_convolution_panel_goes_through_the_array() {
         eprintln!("skipping: no OCR container");
         return;
     };
-    let transport = match XrtTransport::open(0) {
+    let transport = match Board::open(0) {
         Ok(transport) => transport,
         Err(e) => {
             eprintln!("skipping: no NPU board: {e}");

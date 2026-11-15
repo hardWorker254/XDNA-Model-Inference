@@ -51,7 +51,9 @@ pub mod geometry;
 pub mod manifest;
 pub mod transport;
 
-#[cfg(feature = "direct")]
+// The direct transport is compiled WHATEVER the build has: it needs no XRT
+// and no shim, and the driver queries it holds -- which hardware contexts
+// exist, right now -- are useful to a build that speaks through XRT too.
 pub mod direct;
 #[cfg(feature = "xrt")]
 pub mod xrt;
