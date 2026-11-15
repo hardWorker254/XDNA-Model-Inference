@@ -34,8 +34,13 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
+# The repository root, for `npue_tools` -- the package the plan puts the
+# weight sources in (phase 3). It is last on this list on purpose: the flat
+# `sys.path` modules below are what the packers import by bare name, and a
+# package that shadowed one of them would break every arch at once.
 sys.path.insert(0, str(REPO / "tools" / "lib"))
 sys.path.insert(0, str(REPO / "reference"))
+sys.path.append(str(REPO))
 
 # gemm_b_layout was factored into npue.py so the descriptor has ONE definition
 # (its docstring records two copies drifting apart). The import was never added
@@ -47,49 +52,53 @@ from npue import (ARCH_GEMMA3_MQA_ROPE_GEGLU, ARCH_GTE_NEW_ROPE_GEGLU,  # noqa: 
                   ARCH_NOMIC_ROPE_SWIGLU, MAC_BY_DEVICE, MAC_DEFAULT_DEVICE,
                   Writer, gemm_b_layout, layout_hash, mac_for_device, tile_b,
                   to_bf16_bits)
-from onnx_weights import (EMBEDDINGGEMMA_RENAME,             # noqa: E402
-                          EMBEDDINGGEMMA_STRIP, MODEL_ONNX,
-                          model_digest)
+from onnx_weights import EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP  # noqa: E402
+from npue_tools.weights import open_model                    # noqa: E402
 
 
-def load(path, strip="", rename=()):
-    """Read an ONNX checkpoint into a plain dict of numpy arrays.
+# WHICH SOURCE A PACK READS, when a model directory has both. "auto" is the
+# plan's rule -- safetensors when it is there, ONNX otherwise -- and the other
+# two exist so the gate can pack the same checkpoint from each source and
+# compare the containers. Set from --weights-source in main(); a module global
+# rather than a parameter because the four arch branches below already take a
+# dozen keyword arguments each and none of them is about this.
+WEIGHTS_SOURCE = "auto"
 
-    `strip` and `rename` are handed to the reader: a root the export ADDED
-    and the checkpoint does not have comes off, and the export's mid-name
-    rewrites go back to the checkpoint's spelling, so what lands in the dict
-    is what this dict always held. Only embeddinggemma needs either
-    ("model." plus EMBEDDINGGEMMA_RENAME -- pass both together); see
-    OnnxWeights for the other direction (a root the export dropped).
 
-    The reader is tools/lib/onnx_weights.py, which serves every tensor under
-    the name AND the orientation the checkpoint used, so the dict built here
-    is the dict this file has always built. That is the whole point of the
-    reader's contract: the source of the .npue changed to ONNX and no packer
-    changed shape.
+def set_weights_source(name):
+    global WEIGHTS_SOURCE
+    WEIGHTS_SOURCE = name
+
+
+def load_model(model_dir, strip="", rename=()):
+    """Read a model directory's weights into a plain dict of numpy arrays.
+
+    The dict is keyed by the CHECKPOINT's names, in the checkpoint's
+    orientation -- that is the contract both readers share, and it is why no
+    arch branch in this file changed when the source did. safetensors needs no
+    repair at all (a flat checkpoint has its own names); ONNX gets `strip` and
+    `rename`, which undo a root the export added and its mid-name rewrites.
+    Only embeddinggemma needs either ("model." plus EMBEDDINGGEMMA_RENAME --
+    pass both together), and it has no safetensors, so the two never meet:
+    `open_model` REFUSES that combination rather than ignoring the repair.
+
+    Returns (dict, source), and the source matters: `.digest` is the
+    `source_sha256` written into the container, and `.format` says which file
+    it came from -- the two facts a golden comparison and a bug report need.
+    The source is closed here, so only its attributes are usable afterwards.
 
     Two things about this function are load-bearing and easy to undo:
 
-      * the import is INSIDE the function. pack_npue.py puts reference/ and
-        tools/lib on sys.path at import time, but a module-level import of a
-        name that is not there yet makes the whole file unimportable, and
-        then every architecture -- not just the one that needed it -- fails
-        with a bare ImportError instead of a message naming what is missing.
-      * no .copy() here, unlike the version of this function that read a flat
-        file (whose result was a view that outlived close()). OnnxWeights.
-        array() promises an OWNED array on purpose (see its docstring: a view
-        outlives close() and then faults), so copying would double the peak on
-        a 1.2 GB gemma checkpoint for nothing. If that promise is ever
-        relaxed, this call site is where it starts to bite.
-
-    Returns (dict, metadata) with the metadata empty: that pair is the shape
-    this function's predecessor returned, every call site in this file
-    discards the second element, and keeping it costs nothing.
+      * no .copy() here. Both readers promise an OWNED array (a view would
+        outlive close() and then fault), so copying would double the peak on a
+        1.2 GB gemma checkpoint for nothing.
+      * the whole checkpoint is materialised as a dict. That is what the arch
+        branches below consume, and changing it is a much larger job than
+        changing the source of the numbers.
     """
-    from onnx_weights import OnnxWeights
-    w = OnnxWeights(path, strip=strip, rename=rename)
+    w = open_model(model_dir, strip=strip, rename=rename, prefer=WEIGHTS_SOURCE)
     try:
-        return {k: w.array(k) for k in w.keys()}, {}
+        return {k: w.array(k) for k in w.keys()}, w
     finally:
         w.close()
 
@@ -621,9 +630,9 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
     # than the packers and the reference encoder being rewritten to match one
     # exporter's convention. They are passed as a pair because stripping
     # without renaming would hand this function the export's spelling back.
-    src, _ = load(model_dir / MODEL_ONNX, strip=EMBEDDINGGEMMA_STRIP,
-                  rename=EMBEDDINGGEMMA_RENAME)
-    src_sha = model_digest(model_dir / MODEL_ONNX)
+    src, weights = load_model(model_dir, strip=EMBEDDINGGEMMA_STRIP,
+                              rename=EMBEDDINGGEMMA_RENAME)
+    src_sha = weights.digest
     # The sentence-transformers head is no longer a checkpoint of its own: its
     # two matrices were fused into the export and ride beside the rest of the
     # weights as /model/st/dense_1 and /model/st/dense_2, numbered in the order
@@ -710,6 +719,13 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
         "model_type": cfg["model_type"],
         "source_repo": source_repo,
         "source_sha256": src_sha,
+        # WHICH FILE THE NUMBERS CAME FROM. The digest above identifies a set
+        # of checkpoint files and cannot say what format they were in, and a
+        # container whose reader wonders "was this packed from the ONNX export
+        # or from model.safetensors" is asking a question the file should
+        # answer. "onnx" is what every container packed before this says by
+        # omission; both are written explicitly from now on.
+        "weights_source": weights.format,
         "num_layers": L, "hidden": hidden,
         "num_heads": heads, "num_key_value_heads": kv_heads, "head_dim": head_dim,
         "intermediate": inter,
@@ -977,7 +993,7 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
     print(f"  json       : {info['json_length']} B at {info['json_offset']}")
     print(f"  data       : {info['data_length']/1e6:.2f} MB at {info['data_offset']}")
     print(f"  file       : {total/1e6:.2f} MB")
-    print(f"  source     : {src_sha[:16]}...")
+    print(f"  source     : {src_sha[:16]}...  ({weights.format})")
     if not host_only:
         print(f"  layout_hash: "
               f"{layout_hash(gemm_b_layout(tile_k, tile_n, mac[0], mac[1], dtype=b_layout_dtype(int8)))[:16]}..."
@@ -1038,8 +1054,8 @@ def pack_nomic(model_dir, out, tile_k, tile_n, max_seq, fold_scale,
             "drop --dtype f32.")
     model_dir = Path(model_dir)
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
-    src, _ = load(model_dir / MODEL_ONNX)
-    src_sha = model_digest(model_dir / MODEL_ONNX)
+    src, weights = load_model(model_dir)
+    src_sha = weights.digest
 
     L = cfg["num_hidden_layers"]
     H = cfg["num_attention_heads"]
@@ -1139,6 +1155,13 @@ def pack_nomic(model_dir, out, tile_k, tile_n, max_seq, fold_scale,
         "source_repo": json.loads(
             (model_dir / "CHECKPOINT.json").read_text(encoding="utf-8"))["repo_id"],
         "source_sha256": src_sha,
+        # WHICH FILE THE NUMBERS CAME FROM. The digest above identifies a set
+        # of checkpoint files and cannot say what format they were in, and a
+        # container whose reader wonders "was this packed from the ONNX export
+        # or from model.safetensors" is asking a question the file should
+        # answer. "onnx" is what every container packed before this says by
+        # omission; both are written explicitly from now on.
+        "weights_source": weights.format,
         "num_layers": L, "num_heads": H, "hidden": hidden, "head_dim": head_dim,
         "intermediate": inter,
         "layer_norm_eps": eps,
@@ -1326,7 +1349,7 @@ def pack_nomic(model_dir, out, tile_k, tile_n, max_seq, fold_scale,
     print(f"  json       : {info['json_length']} B at {info['json_offset']}")
     print(f"  data       : {info['data_length']/1e6:.2f} MB at {info['data_offset']}")
     print(f"  file       : {total/1e6:.2f} MB")
-    print(f"  source     : {src_sha[:16]}...")
+    print(f"  source     : {src_sha[:16]}...  ({weights.format})")
     # The dtype is part of the layout, so printing the bf16 hash over int8
     # tensors reports the intention rather than the value -- the same shape as
     # tasks/0042's `tile (64, 32)` and 0078's banner, both of which cost time.
@@ -1396,8 +1419,8 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
     # the packer's own qerr figure and the int8 MTEB gate are for: the oracle
     # being present makes the factors well-defined, not good.
 
-    raw, _ = load(model_dir / MODEL_ONNX)
-    src_sha = model_digest(model_dir / MODEL_ONNX)
+    raw, weights = load_model(model_dir)
+    src_sha = weights.digest
     # The checkpoint stores F16; every consumer here wants f32 (the bf16
     # pre-tiler and the F32 emitters both). Upcast once, losslessly.
     src = {}
@@ -1504,6 +1527,13 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
         "source_repo": json.loads(
             (model_dir / "CHECKPOINT.json").read_text(encoding="utf-8"))["repo_id"],
         "source_sha256": src_sha,
+        # WHICH FILE THE NUMBERS CAME FROM. The digest above identifies a set
+        # of checkpoint files and cannot say what format they were in, and a
+        # container whose reader wonders "was this packed from the ONNX export
+        # or from model.safetensors" is asking a question the file should
+        # answer. "onnx" is what every container packed before this says by
+        # omission; both are written explicitly from now on.
+        "weights_source": weights.format,
         "num_layers": L, "num_heads": H, "hidden": hidden, "head_dim": head_dim,
         "intermediate": inter,
         "layer_norm_eps": eps,
@@ -1673,7 +1703,7 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
     print(f"  json       : {info['json_length']} B at {info['json_offset']}")
     print(f"  data       : {info['data_length']/1e6:.2f} MB at {info['data_offset']}")
     print(f"  file       : {total/1e6:.2f} MB")
-    print(f"  source     : {src_sha[:16]}...")
+    print(f"  source     : {src_sha[:16]}...  ({weights.format})")
     # b_layout_dtype(int8), NOT a bare gemm_b_layout(...): the layout hash
     # covers the B operand's ELEMENT TYPE as well as its tiling, so an int8
     # container has to report the int8 layout's hash. Printing the bf16 one over
@@ -1774,6 +1804,16 @@ def main():
     # NOT a silent MiniLM default: that put one checkpoint's weights under
     # another model's filename.
     ap.add_argument("--model-dir", default=None)
+    # THE WEIGHT SOURCE. "auto" is the rule the plan states: a model directory
+    # with model.safetensors packs from it, one without still packs from the
+    # ONNX export. The other two are for the gate -- pack the same checkpoint
+    # from each source and compare the containers -- and a forced source that
+    # is not on disk is refused, not silently replaced.
+    ap.add_argument("--weights-source", default="auto",
+                    choices=("auto", "safetensors", "onnx"),
+                    help="where the weights come from: 'auto' (safetensors when "
+                         "model.safetensors is there, ONNX otherwise), or one "
+                         "source named (default %(default)s)")
     ap.add_argument("--out", default=str(REPO / "models" / "all-MiniLM-L6-v2.npue"))
     ap.add_argument("--tile-k", type=int, default=DEFAULT_TILE_K)
     ap.add_argument("--tile-n", type=int, default=DEFAULT_TILE_N)
@@ -2039,6 +2079,7 @@ def main():
                          "This flag only stages the panels and records their "
                          "streams; it does not change who wins.")
     args = ap.parse_args()
+    set_weights_source(args.weights_source)
 
     # Kept BEFORE the generic --int4-group defaulting below, which would
     # otherwise resolve an unstyped flag to the GEMM packers' 32 and hand a pose
@@ -2771,8 +2812,8 @@ def main():
                         int8_corpus=args.int8_corpus,
                         host_only=args.gemma_host_only)
 
-    src, _ = load(model_dir / MODEL_ONNX)
-    src_sha = model_digest(model_dir / MODEL_ONNX)
+    src, weights = load_model(model_dir)
+    src_sha = weights.digest
 
     L = cfg["num_hidden_layers"]
     H = cfg["num_attention_heads"]
@@ -2795,6 +2836,13 @@ def main():
         "source_repo": json.loads(
             (model_dir / "CHECKPOINT.json").read_text(encoding="utf-8"))["repo_id"],
         "source_sha256": src_sha,
+        # WHICH FILE THE NUMBERS CAME FROM. The digest above identifies a set
+        # of checkpoint files and cannot say what format they were in, and a
+        # container whose reader wonders "was this packed from the ONNX export
+        # or from model.safetensors" is asking a question the file should
+        # answer. "onnx" is what every container packed before this says by
+        # omission; both are written explicitly from now on.
+        "weights_source": weights.format,
         "num_layers": L, "num_heads": H, "hidden": hidden, "head_dim": head_dim,
         "intermediate": cfg["intermediate_size"],
         "layer_norm_eps": cfg["layer_norm_eps"],
@@ -2967,7 +3015,7 @@ def main():
     print(f"  json       : {info['json_length']} B at {info['json_offset']}")
     print(f"  data       : {info['data_length']/1e6:.2f} MB at {info['data_offset']}")
     print(f"  file       : {total/1e6:.2f} MB")
-    print(f"  source     : {src_sha[:16]}...")
+    print(f"  source     : {src_sha[:16]}...  ({weights.format})")
     # REPORT THE VALUE, NOT THE INTENTION. This printed the bf16 hash while the
     # tensors carried the I8 one -- the same fail-open shape as tasks/0042's
     # "tile (64, 32)" banner over a tile-48 pack. Build the descriptor the same
