@@ -89,8 +89,9 @@ INT4_WEIGHT_ONLY_LIMIT = 2e-01
 from encoder import MiniLMReference                                # noqa: E402
 from precision_study import make_gemm                              # noqa: E402
 from gemm_i8 import check_i8_operand                                # noqa: E402
-from npue import (ALIGN, ASMOOTH_SUFFIX, GSCALE_SUFFIX, HEADER_SIZE, MAGIC, VERSION,  # noqa: E402
-                  Reader, WSCALE_SUFFIX, find_goldens, to_bf16_bits, untile_b)
+from npue import (ALIGN, ASMOOTH_SUFFIX, GSCALE_SUFFIX,  # noqa: E402
+                  HEADER_SIZE, MAGIC, VERSION, Reader, WSCALE_SUFFIX,
+                  checkpoint_pins, find_goldens, to_bf16_bits, untile_b)
 from gemm_i4 import check_i4_operand                               # noqa: E402
 from npz_io import load                                            # noqa: E402
 from onnx_io import MODEL_ONNX, load as load_ckpt                   # noqa: E402
@@ -382,7 +383,7 @@ def build_from_npue(r, cfg, gemm=None):
 def check_goldens(r, cfg, goldens):
     print("\nD. the encoder, running off packed weights, vs the M3 goldens")
     g, meta = load(goldens)
-    if meta["source_sha256"] != cfg["source_sha256"]:
+    if meta["source_sha256"] not in checkpoint_pins(cfg):
         return [f"checkpoint mismatch: goldens {meta['source_sha256'][:16]} vs "
                 f".npue {cfg['source_sha256'][:16]}"]
 
@@ -582,9 +583,9 @@ def main():
         # By checkpoint, not by name: bge-large-n16.npue is the same weights at
         # a different tile size and shares bge-large's goldens.
         with Reader(args.npue) as _r:
-            _sha = _r.config["source_sha256"]
+            _pins = checkpoint_pins(_r.config)
         args.goldens = str(find_goldens(REPO / "reference" / "goldens",
-                                        _sha, args.seq, load)[0])
+                                        _pins, args.seq, load)[0])
 
     r = Reader(args.npue)
     cfg = r.config
@@ -602,7 +603,7 @@ def main():
     # Comparing right-shaped tensors against another model's answers is the
     # failure the runtime's fixture guard exists for; it applies here too.
     _g, _gmeta = load(args.goldens)
-    if _gmeta.get("source_sha256") != cfg.get("source_sha256"):
+    if _gmeta.get("source_sha256") not in checkpoint_pins(cfg):
         print(f"FAIL -- the .npue and the goldens are different checkpoints:\n"
               f"  .npue    {cfg.get('source_sha256')}\n"
               f"  goldens  {_gmeta.get('source_sha256')}")

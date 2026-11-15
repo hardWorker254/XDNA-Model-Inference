@@ -53,6 +53,8 @@ from npue import (ARCH_WHISPER_ENC_DEC_GELU, MAC_BY_DEVICE,  # noqa: E402
                   mac_for_device, tile_b, to_bf16_bits)
 from onnx_weights import (Combined, OnnxWeights, model_digest,    # noqa: E402
                           WHISPER_DECODER_ONNX, WHISPER_ENCODER_ONNX)
+from npue_tools.weights import (has_safetensors, open_model,     # noqa: E402
+                                prefer)
 from whisper_bpe import VocabMerges, build_table                      # noqa: E402
 
 # Only s and t of the MAC geometry affect the B operand's byte order, and both
@@ -421,6 +423,58 @@ def _embed(w, model_name, datapath, npue_args, where):
     return r
 
 
+def whisper_weights(model_dir):
+    """The whole model's weights: one flat file, or the export's two.
+
+    A whisper checkpoint is ONE state dict with both halves in it
+    (`model.encoder.conv1.weight` and `model.decoder.embed_tokens.weight`
+    side by side), so model.safetensors is read directly and needs no
+    namespace repair. The export split the model into two files and dropped
+    the encoder's `model.encoder.` root, which is why the ONNX path still
+    needs Combined() and a prefix -- and why 30 of its initializers are graph
+    constants (`/model/decoder/Constant_10_output_0`) that a flat checkpoint
+    does not carry at all. Measured on openai/whisper-tiny: 167 tensors in
+    model.safetensors, and all 167 are among the export's 197 names.
+
+    One function so both branches answer the same question, and so the
+    refusal for a forced source is written once.
+    """
+    if prefer() == "safetensors" or (prefer() == "auto"
+                                     and has_safetensors(model_dir)):
+        return open_model(model_dir)
+    return combined_onnx(model_dir)
+
+
+def combined_onnx(model_dir):
+    """The two exports behind one namespace, as this packer has always read them.
+
+    This packer asks for `model.encoder.conv1.weight` about a hundred lines
+    after `model.decoder.embed_tokens.weight` and cannot sensibly be split, so
+    Combined() presents them as one namespace and refuses a name that resolves
+    in both. The encoder export dropped the `model.encoder.` root its tensors
+    are named for -- prefix= puts it back -- while the decoder export kept
+    `model.decoder.` and needs nothing; OnnxWeights documents both directions.
+
+    The digest covers the WHOLE model and not just the two graph files: an
+    export large enough to trip protobuf's 2 GB limit keeps its weights in an
+    .onnx_data side file, and hashing only the graphs would pin the tensor
+    names while leaving every weight unguarded.
+    """
+    combined = Combined([
+        OnnxWeights(model_dir / WHISPER_ENCODER_ONNX,
+                    prefix="model.encoder."),
+        OnnxWeights(model_dir / WHISPER_DECODER_ONNX),
+    ])
+    # Combined is a namespace, not a source: it has no format and no digest of
+    # its own. Both are attached here so the packer sees one protocol
+    # whichever branch answered.
+    combined.format = "onnx"
+    combined.export_digest = None
+    combined.digest = model_digest(model_dir / WHISPER_ENCODER_ONNX,
+                                   model_dir / WHISPER_DECODER_ONNX)
+    return combined
+
+
 def pack_whisper(model_dir, out, max_seq=None, max_target=None,
                  fold_scale=True, dry_run=False, device=None,
                  int8=False, int4_group=None, int8_alpha=0.5, int8_clips=8,
@@ -534,25 +588,8 @@ def pack_whisper(model_dir, out, max_seq=None, max_target=None,
             f"vocab_size {vocab}; the logit matrix would be narrower than the "
             f"ids the decoder can emit")
 
-    # Two ONNX files behind one reader: this function asks for
-    # `model.encoder.conv1.weight` about a hundred lines after
-    # `model.decoder.embed_tokens.weight` and cannot sensibly be split, so
-    # Combined() presents them as one namespace and refuses a name that
-    # resolves in both. The encoder export dropped the `model.encoder.` root
-    # its tensors are named for -- prefix= puts it back -- while the decoder
-    # export kept `model.decoder.` and needs nothing; OnnxWeights documents
-    # both directions.
-    st = Combined([
-        OnnxWeights(model_dir / WHISPER_ENCODER_ONNX,
-                    prefix="model.encoder."),
-        OnnxWeights(model_dir / WHISPER_DECODER_ONNX),
-    ])
-    # The whole model, not just the two graph files: an export large enough
-    # to trip protobuf's 2 GB limit keeps its weights in an .onnx_data side
-    # file, and hashing only the graphs would pin the tensor names while
-    # leaving every weight unguarded.
-    src_sha = model_digest(model_dir / WHISPER_ENCODER_ONNX,
-                           model_dir / WHISPER_DECODER_ONNX)
+    st = whisper_weights(model_dir)
+    src_sha = st.digest
 
     # The int8 calibration, before any operand is written: it needs torch and
     # transformers, which are build-time only, and it is the reason this branch
@@ -590,6 +627,11 @@ def pack_whisper(model_dir, out, max_seq=None, max_target=None,
         "gemm_layout": "host" if host_only else "pretiled_bf16",
         "source_repo": f"openai/{model_dir.name}",
         "source_sha256": src_sha,
+        # WHICH FILE THE NUMBERS CAME FROM, and the export they are proven
+        # equal to when it is still on disk (see npue_tools.weights).
+        "weights_source": st.format,
+        **({"export_sha256": getattr(st, "export_digest", None)}
+           if getattr(st, "export_digest", None) else {}),
         "d_model": d,
         "hidden": d,                       # what the design selector reads
         "num_heads": heads,

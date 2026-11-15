@@ -92,7 +92,7 @@ from gemm_i4 import add_gemm_b_int4                              # noqa: E402
 from npue import (ARCH_VIT_PATCH16_PRELN, MAC_BY_DEVICE,        # noqa: E402
                   MAC_DEFAULT_DEVICE, Writer, gemm_b_layout, layout_hash,
                   mac_for_device, tile_b, to_bf16_bits)
-from onnx_weights import MODEL_ONNX, OnnxWeights, model_digest  # noqa: E402
+from npue_tools.weights import ONNX_NAME, open_model           # noqa: E402
 
 # Only s and t of the MAC geometry affect the B operand's byte order, and the
 # board decides them: npu1's MMAC sub-tile is (s=8, t=4) and npu2's is (8, 8).
@@ -117,8 +117,8 @@ def _read_json(path, what):
     p = Path(path)
     if not p.exists():
         raise SystemExit(f"{what}: {p} not found. A ViT checkpoint needs "
-                         f"config.json, preprocessor_config.json and "
-                         f"{MODEL_ONNX}.")
+                         f"config.json, preprocessor_config.json and either "
+                         f"{ONNX_NAME} or model.safetensors.")
     return json.loads(p.read_text(encoding="utf-8"))
 
 
@@ -493,8 +493,16 @@ def pack_vit(model_dir, out, fold_scale=True, dry_run=False, device=None,
             "concatenation of three biases, which is exact only because all "
             "three exist.")
 
-    st = OnnxWeights(model_dir / MODEL_ONNX)
-    src_sha = model_digest(model_dir / MODEL_ONNX)
+    # THE WEIGHTS, from whichever source the checkpoint is on disk as.
+    #
+    # A flat checkpoint needs no repair HERE: its names are the checkpoint's
+    # (`vit.embeddings.cls_token`, `vit.encoder.layer.0...`), which is exactly
+    # what this packer asks for. Measured on google/vit-base-patch16-224: 200
+    # tensors in model.safetensors, all 200 also in the export, whose remaining
+    # 14 initializers are graph constants under `/vit/...` names. That subset
+    # relation is why the swap is one line and no mapping table.
+    st = open_model(model_dir)
+    src_sha = st.digest
 
     # The checkpoint's OWN image front end, read for EVERY pack and not only for
     # an int8 one. Its numbers are part of the model's definition -- a container
@@ -576,6 +584,11 @@ def pack_vit(model_dir, out, fold_scale=True, dry_run=False, device=None,
         "gemm_layout": "host" if host_only else "pretiled_bf16",
         "source_repo": f"google/{model_dir.name}",
         "source_sha256": src_sha,
+        # WHICH FILE THE NUMBERS CAME FROM, and the export they are proven
+        # equal to when it is still on disk (see npue_tools.weights).
+        "weights_source": st.format,
+        **({"export_sha256": getattr(st, "export_digest", None)}
+           if getattr(st, "export_digest", None) else {}),
         "num_layers": layers,
         "hidden": d,
         "num_heads": heads,

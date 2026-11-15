@@ -61,19 +61,43 @@ def is_graph_temporary(name: str) -> bool:
     and a shape operand (`/Unsqueeze_axes`). A REAL weight is a checkpoint
     name -- dots, module path, `.weight`/`.bias` -- and never one of these.
     """
+    # A SLASH IS NEVER IN A CHECKPOINT NAME: module paths are dotted
+    # (`model.encoder.layers.0...`), and a slash only appears in an exporter's
+    # subgraph scoping -- so all four shapes below are reachable by asking
+    # "does this name have one".
     return (
-        name.startswith("/")
+        "/" in name
         or name.startswith("onnx::")
         or "Constant" in name
         or name.endswith("_axes")
     )
 
 
+#: Where an export of a model can be, relative to the model directory. Whisper
+#: is the reason this is a list: its export is TWO files (an encoder and a
+#: decoder) and there is no onnx/model.onnx.
+ONNX_LAYOUTS = (ONNX_NAME, "onnx/encoder_model.onnx")
+
+
 def sources(model_dir: Path) -> tuple[bool, bool]:
     return (
         (model_dir / SAFETENSORS_NAME).is_file(),
-        (model_dir / ONNX_NAME).is_file(),
+        any((model_dir / p).is_file() for p in ONNX_LAYOUTS),
     )
+
+
+def onnx_source(model_dir: Path):
+    """The ONNX reader the PACKER would use for this model, not a second one.
+
+    Importing the packer's own function is the point: a gate that opened the
+    export its own way would be checking a reader the pipeline does not use.
+    """
+    if (model_dir / ONNX_NAME).is_file():
+        return open_model(model_dir, prefer="onnx")
+    sys.path.insert(0, str(REPO / "tools" / "pack"))
+    from packers.whisper import combined_onnx  # noqa: PLC0415
+
+    return combined_onnx(model_dir)
 
 
 def compare_numbers(model_dir: Path) -> list[str]:
@@ -82,7 +106,7 @@ def compare_numbers(model_dir: Path) -> list[str]:
     st = onnx = None
     try:
         st = open_model(model_dir, prefer="safetensors")
-        onnx = open_model(model_dir, prefer="onnx")
+        onnx = onnx_source(model_dir)
         a, b = sorted(st.keys()), sorted(onnx.keys())
         # WHAT A KEY-SET DIFFERENCE MEANS, IN BOTH DIRECTIONS.
         #
@@ -153,9 +177,16 @@ def pack(model_dir: Path, out: Path, source: str, extra: list[str]) -> str:
 
 
 def masked(directory: dict) -> dict:
-    """The container's directory with the source record taken out."""
+    """The container's directory with the source record taken out.
+
+    Three keys, all about where the numbers came from and all checked
+    separately below: the checkpoint that was read (`source_sha256` --
+    necessarily different, it is a different file), which format that was
+    (`weights_source`), and the export the safetensors pack is proven equal to
+    (`export_sha256`, which the ONNX pack does not carry).
+    """
     d = json.loads(json.dumps(directory))
-    for key in ("source_sha256", "weights_source"):
+    for key in ("source_sha256", "weights_source", "export_sha256"):
         d.get("config", {}).pop(key, None)
     return d
 
@@ -234,6 +265,14 @@ def compare_containers(model_dir: Path, work: Path, extra: list[str]) -> list[st
     # be provenance that cannot be trusted).
     sha_onnx = da["config"].get("source_sha256")
     sha_st = db["config"].get("source_sha256")
+    # The export the flat checkpoint claims to equal must be the export that
+    # was packed here -- not merely some export.
+    claimed = db["config"].get("export_sha256")
+    if claimed is not None and claimed != sha_onnx:
+        problems.append(
+            f"the safetensors container claims export_sha256 {claimed[:16]} "
+            f"but the ONNX pack was made from {str(sha_onnx)[:16]}"
+        )
     if not sha_onnx or not sha_st:
         problems.append("a packed container carries no source_sha256")
     elif sha_onnx == sha_st:

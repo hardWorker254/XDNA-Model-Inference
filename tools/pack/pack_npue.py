@@ -53,21 +53,21 @@ from npue import (ARCH_GEMMA3_MQA_ROPE_GEGLU, ARCH_GTE_NEW_ROPE_GEGLU,  # noqa: 
                   Writer, gemm_b_layout, layout_hash, mac_for_device, tile_b,
                   to_bf16_bits)
 from onnx_weights import EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP  # noqa: E402
-from npue_tools.weights import open_model                    # noqa: E402
-
-
-# WHICH SOURCE A PACK READS, when a model directory has both. "auto" is the
-# plan's rule -- safetensors when it is there, ONNX otherwise -- and the other
-# two exist so the gate can pack the same checkpoint from each source and
-# compare the containers. Set from --weights-source in main(); a module global
-# rather than a parameter because the four arch branches below already take a
-# dozen keyword arguments each and none of them is about this.
-WEIGHTS_SOURCE = "auto"
+from npue_tools.weights import (export_digest, open_model,     # noqa: E402
+                                set_prefer)
 
 
 def set_weights_source(name):
-    global WEIGHTS_SOURCE
-    WEIGHTS_SOURCE = name
+    """--weights-source, handed to the weights layer.
+
+    "auto" is the plan's rule -- safetensors when model.safetensors is there,
+    ONNX otherwise -- and the other two exist so the gate can pack the same
+    checkpoint from each source and compare the containers. The choice lives
+    in npue_tools.weights rather than here because packers/whisper.py and
+    packers/vit.py open their own weights and would not see a global in this
+    module.
+    """
+    set_prefer(name)
 
 
 def load_model(model_dir, strip="", rename=()):
@@ -96,11 +96,18 @@ def load_model(model_dir, strip="", rename=()):
         branches below consume, and changing it is a much larger job than
         changing the source of the numbers.
     """
-    w = open_model(model_dir, strip=strip, rename=rename, prefer=WEIGHTS_SOURCE)
+    w = open_model(model_dir, strip=strip, rename=rename)
     try:
-        return {k: w.array(k) for k in w.keys()}, w
+        data = {k: w.array(k) for k in w.keys()}
     finally:
         w.close()
+    # WHICH EXPORT THESE NUMBERS EQUAL, when the tree still has one. The
+    # goldens, the CHECKPOINT.json pins and every provenance record in this
+    # repository name the export, so a pack from the flat checkpoint carries
+    # that digest as well -- and the gate that proves the two sources equal is
+    # what makes carrying it truthful rather than hopeful.
+    w.export_digest = export_digest(model_dir) if w.format != "onnx" else None
+    return data, w
 
 # From M2's traced results: mac_dims are (r,s,t) = (4,8,8) for plain bf16 on
 # npu2 and (8,8,8) with bfp16 emulation. Only s and t affect the B operand
@@ -633,6 +640,7 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
     src, weights = load_model(model_dir, strip=EMBEDDINGGEMMA_STRIP,
                               rename=EMBEDDINGGEMMA_RENAME)
     src_sha = weights.digest
+    export_sha = weights.export_digest
     # The sentence-transformers head is no longer a checkpoint of its own: its
     # two matrices were fused into the export and ride beside the rest of the
     # weights as /model/st/dense_1 and /model/st/dense_2, numbered in the order
@@ -726,6 +734,8 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
         # answer. "onnx" is what every container packed before this says by
         # omission; both are written explicitly from now on.
         "weights_source": weights.format,
+        # The export these numbers are proven equal to (see load_model).
+        **({"export_sha256": export_sha} if export_sha else {}),
         "num_layers": L, "hidden": hidden,
         "num_heads": heads, "num_key_value_heads": kv_heads, "head_dim": head_dim,
         "intermediate": inter,
@@ -1056,6 +1066,7 @@ def pack_nomic(model_dir, out, tile_k, tile_n, max_seq, fold_scale,
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     src, weights = load_model(model_dir)
     src_sha = weights.digest
+    export_sha = weights.export_digest
 
     L = cfg["num_hidden_layers"]
     H = cfg["num_attention_heads"]
@@ -1162,6 +1173,8 @@ def pack_nomic(model_dir, out, tile_k, tile_n, max_seq, fold_scale,
         # answer. "onnx" is what every container packed before this says by
         # omission; both are written explicitly from now on.
         "weights_source": weights.format,
+        # The export these numbers are proven equal to (see load_model).
+        **({"export_sha256": export_sha} if export_sha else {}),
         "num_layers": L, "num_heads": H, "hidden": hidden, "head_dim": head_dim,
         "intermediate": inter,
         "layer_norm_eps": eps,
@@ -1421,6 +1434,7 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
 
     raw, weights = load_model(model_dir)
     src_sha = weights.digest
+    export_sha = weights.export_digest
     # The checkpoint stores F16; every consumer here wants f32 (the bf16
     # pre-tiler and the F32 emitters both). Upcast once, losslessly.
     src = {}
@@ -1534,6 +1548,8 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
         # answer. "onnx" is what every container packed before this says by
         # omission; both are written explicitly from now on.
         "weights_source": weights.format,
+        # The export these numbers are proven equal to (see load_model).
+        **({"export_sha256": export_sha} if export_sha else {}),
         "num_layers": L, "num_heads": H, "hidden": hidden, "head_dim": head_dim,
         "intermediate": inter,
         "layer_norm_eps": eps,
@@ -2814,6 +2830,7 @@ def main():
 
     src, weights = load_model(model_dir)
     src_sha = weights.digest
+    export_sha = weights.export_digest
 
     L = cfg["num_hidden_layers"]
     H = cfg["num_attention_heads"]
@@ -2843,6 +2860,8 @@ def main():
         # answer. "onnx" is what every container packed before this says by
         # omission; both are written explicitly from now on.
         "weights_source": weights.format,
+        # The export these numbers are proven equal to (see load_model).
+        **({"export_sha256": export_sha} if export_sha else {}),
         "num_layers": L, "num_heads": H, "hidden": hidden, "head_dim": head_dim,
         "intermediate": cfg["intermediate_size"],
         "layer_norm_eps": cfg["layer_norm_eps"],

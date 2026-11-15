@@ -44,8 +44,11 @@ __all__ = [
     "WeightError",
     "WeightSource",
     "checkpoint_digest",
+    "export_digest",
     "has_safetensors",
     "open_model",
+    "prefer",
+    "set_prefer",
     "sha256_file",
     "weights_digest",
 ]
@@ -56,18 +59,73 @@ __all__ = [
 SAFETENSORS_NAME = "model.safetensors"
 ONNX_NAME = "onnx/model.onnx"
 
+# THE PACK'S CHOICE, kept here rather than in each packer.
+#
+# The packers are four modules and two of them (whisper, vit) open their own
+# weights, so a preference living in pack_npue would be invisible to exactly
+# the branches that needed it most. One module-level answer, set once from
+# --weights-source, read by every reader that does not say otherwise.
+_PREFER = "auto"
+_PREFERS = ("auto", "safetensors", "onnx")
+
+
+def set_prefer(name: str) -> None:
+    """Set the source a pack reads: 'auto', 'safetensors' or 'onnx'."""
+    global _PREFER
+    if name not in _PREFERS:
+        raise WeightError(f"weights source {name!r}; expected one of {_PREFERS}")
+    _PREFER = name
+
+
+def prefer() -> str:
+    """The source a pack reads unless it says otherwise."""
+    return _PREFER
+
+
+def export_digest(model_dir):
+    """The digest of the ONNX export of this model, when it is still on disk.
+
+    Goldens, `CHECKPOINT.json` pins and provenance records in this tree name
+    the EXPORT, because that is what they were made from. A pack from
+    model.safetensors records that digest too (`export_sha256`) so those
+    records keep pointing at the right weights; the equality between the two
+    sources is what tools/verify/verify_weights_source.py proves.
+
+    None when there is no export: a checkpoint on its own has no export digest
+    to name, and inventing one would be the lie this field exists to avoid.
+    """
+    model_dir = Path(model_dir)
+    if (model_dir / ONNX_NAME).is_file():
+        w = OnnxWeightsSource(model_dir / ONNX_NAME)
+        try:
+            return w.digest
+        finally:
+            w.close()
+    encoder = model_dir / "onnx" / "encoder_model.onnx"
+    decoder = model_dir / "onnx" / "decoder_model.onnx"
+    if encoder.is_file() and decoder.is_file():
+        # The two-file export (whisper): one digest over the whole model, which
+        # is the rule `model_digest` documents -- hashing only the graphs would
+        # leave every weight in the .onnx_data side files unguarded.
+        from .onnx import model_digest
+
+        return model_digest(encoder, decoder)
+    return None
+
 
 def has_safetensors(model_dir) -> bool:
     return (Path(model_dir) / SAFETENSORS_NAME).is_file()
 
 
-def open_model(model_dir, *, strip="", rename=(), prefer="auto") -> WeightSource:
+def open_model(model_dir, *, strip="", rename=(), prefer=None) -> WeightSource:
     """Open the weight source for a model directory.
 
     `prefer` is "auto" (safetensors when present, ONNX otherwise),
-    "safetensors" or "onnx". An explicit choice that is not on disk REFUSES
-    instead of falling back: a gate that silently measured the other source
-    would report equality between a thing and itself.
+    "safetensors" or "onnx"; None means the module-wide choice from
+    `set_prefer` (which is "auto" unless --weights-source said otherwise).
+    An explicit choice that is not on disk REFUSES instead of falling back: a
+    gate that silently measured the other source would report equality between
+    a thing and itself.
 
     `strip` and `rename` are the ONNX reader's tools for undoing what an
     exporter did to a name (a root added, a mid-name rewrite). A flat
@@ -78,11 +136,10 @@ def open_model(model_dir, *, strip="", rename=(), prefer="auto") -> WeightSource
     model_dir = Path(model_dir)
     st_path = model_dir / SAFETENSORS_NAME
     onnx_path = model_dir / ONNX_NAME
+    prefer = _PREFER if prefer is None else prefer
 
-    if prefer not in ("auto", "safetensors", "onnx"):
-        raise WeightError(
-            f"prefer={prefer!r}; expected 'auto', 'safetensors' or 'onnx'"
-        )
+    if prefer not in _PREFERS:
+        raise WeightError(f"prefer={prefer!r}; expected one of {_PREFERS}")
     if prefer == "safetensors" and not st_path.is_file():
         raise WeightError(
             f"{model_dir}: --weights-source safetensors, but {SAFETENSORS_NAME} "

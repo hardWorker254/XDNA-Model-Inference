@@ -29,7 +29,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "reference"))
 sys.path.insert(0, str(REPO / "tools" / "lib"))
 
-from npue import Reader, find_goldens                       # noqa: E402
+from npue import Reader, checkpoint_pins, find_goldens        # noqa: E402
 from npz_io import load                       # noqa: E402
 
 
@@ -53,7 +53,7 @@ def main() -> int:
               f"`npuembeddings --prepare-model models/{args.model}`")
         return 1
     with Reader(npue_path) as r0:
-        want_sha = r0.config["source_sha256"]
+        want_sha = checkpoint_pins(r0.config)
         n_layers = r0.config["num_layers"]
         arch = r0.config.get("arch", "bert_abs_gelu_postln")
 
@@ -91,7 +91,7 @@ def main() -> int:
         cfg = r.config
         hidden, head_dim = cfg["hidden"], cfg["head_dim"]
         folded = cfg["fusions"]["qk_scale_folded_into_q"]
-        if cfg["source_sha256"] != meta["source_sha256"]:
+        if meta["source_sha256"] not in checkpoint_pins(cfg):
             print("FAIL -- .npue and goldens are different checkpoints")
             return 1
 

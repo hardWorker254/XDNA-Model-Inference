@@ -166,8 +166,20 @@ pub fn read_container(container: &npum_format::Container, path: &Path) -> Status
         .or_else(|| config.get_str("repo"))
         .unwrap_or("")
         .to_string();
+    // WHICH CHECKPOINT THIS IS, in the terms every other artifact uses.
+    //
+    // `source_sha256` names the file the numbers were READ from, and since the
+    // weights can come from a flat checkpoint that need not be the ONNX export
+    // the goldens and the oracle were made from -- the same weights, a
+    // different file. `export_sha256` is that export's digest, recorded by the
+    // packer when the export was on disk beside the checkpoint, and it is what
+    // this line names when it is there: the oracle prints the same number for
+    // the same weights, so the two runtimes describe one checkpoint instead of
+    // two. A container with no export digest (packed beside nothing but its
+    // own checkpoint) prints its source as before.
     let checkpoint = config
-        .get_str("source_sha256")
+        .get_str("export_sha256")
+        .or_else(|| config.get_str("source_sha256"))
         .unwrap_or("")
         .chars()
         .take(16)

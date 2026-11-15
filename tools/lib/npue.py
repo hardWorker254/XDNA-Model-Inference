@@ -1261,6 +1261,28 @@ def golden_slug(model_name, n_layers):
     return LEGACY_GOLDEN_SLUGS.get(name, f"{name.lower()}_l{n_layers}")
 
 
+def checkpoint_pins(cfg):
+    """The digests a container's weights answer to, most specific first.
+
+    `source_sha256` is the checkpoint the numbers were READ from. Since phase 3
+    that can be model.safetensors rather than the ONNX export of the same
+    weights, and the goldens were made from the export -- so a pack from the
+    flat checkpoint would fail to find goldens that describe exactly its
+    weights. `export_sha256` is the export's digest, recorded by the packer
+    when the export was on disk beside the checkpoint.
+
+    That the two digests name the SAME weights is not assumed here: it is what
+    tools/verify/verify_weights_source.py checks, container against container,
+    before any of this can matter.
+    """
+    pins = []
+    for key in ("source_sha256", "export_sha256"):
+        v = cfg.get(key)
+        if v and v not in pins:
+            pins.append(v)
+    return pins
+
+
 def find_goldens(goldens_dir, source_sha256, seq, load):
     """The goldens for a checkpoint, found by CONTENT rather than by name.
 
@@ -1278,18 +1300,20 @@ def find_goldens(goldens_dir, source_sha256, seq, load):
     """
     from pathlib import Path as _P
     gdir = _P(goldens_dir)
+    wants = ({source_sha256} if isinstance(source_sha256, str)
+             else set(source_sha256))
     hits = []
     for cand in sorted(gdir.glob(f"*_s{seq}_boundary.npz")):
         try:
             _, meta = load(cand)
         except Exception:
             continue
-        if meta.get("source_sha256") == source_sha256:
+        if meta.get("source_sha256") in wants:
             hits.append(cand)
     if len(hits) != 1:
         names = ", ".join(h.name for h in hits) if hits else "none"
         raise FileNotFoundError(
             f"{len(hits)} goldens in {gdir} match checkpoint "
-            f"{source_sha256[:16]}... at seq {seq} ({names}). Generate them "
-            f"with reference/make_goldens.py --model-dir <dir> --taps")
+            f"{next(iter(wants))[:16]}... at seq {seq} ({names}). Generate "
+            f"them with reference/make_goldens.py --model-dir <dir> --taps")
     return hits[0], hits[0].with_name(hits[0].name.replace("_boundary.", "_taps."))
