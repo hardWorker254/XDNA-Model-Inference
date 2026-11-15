@@ -45,6 +45,7 @@ pub mod root;
 pub mod serve;
 pub mod status;
 pub mod stt;
+pub mod transport;
 pub mod vit;
 
 use flags::{parse, Args, ParseError};

@@ -310,7 +310,6 @@ pub fn open_array(
 ) -> Result<Box<dyn npum_model::array::ArrayConvs>, String> {
     use npum_xdna::array::ArrayDesign;
     use npum_xdna::array_convs::ArrayConvs;
-    use npum_xdna::transport::Transport;
 
     // THE PANELS.
     let container =
@@ -351,8 +350,8 @@ pub fn open_array(
     };
 
     // THE BOARD.
-    let transport = npum_xdna::xrt::XrtTransport::open(0)
-        .map_err(|e| format!("{}: cannot open the NPU board: {e}", path.display()))?;
+    let transport = crate::transport::open()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let design = match dir {
         Some(dir) => ArrayDesign::open(&dir, transport).map_err(|e| e.to_string())?,
         None => ArrayDesign::open_from_container(path, "gemm_rtp", transport)

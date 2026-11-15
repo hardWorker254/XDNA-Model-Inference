@@ -50,7 +50,10 @@ npum-tokenizers = { path = "core/npum-tokenizers" }
 npum-families = { path = "core/npum-families" }
 npum-cpu = { path = "backends/cpu" }
 npum-vulkan = { path = "backends/vulkan" }
-npum-xdna = { path = "backends/xdna" }
+# The backend's own default features are NOT inherited here: the transport
+# is the dependent's choice, and the dependent chooses by its own features.
+# The crate built as a workspace member still gets its own defaults.
+npum-xdna = { path = "backends/xdna", default-features = false }
 
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "tokio"] }

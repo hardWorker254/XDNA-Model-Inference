@@ -515,9 +515,8 @@ fn open_design(
     root: &Path,
     set: &str,
     code: &str,
-) -> Result<npum_xdna::array::ArrayDesign<npum_xdna::xrt::XrtTransport>, String> {
+) -> Result<npum_xdna::array::ArrayDesign<crate::transport::Transport>, String> {
     use npum_xdna::array::ArrayDesign;
-    use npum_xdna::transport::Transport;
 
     let container =
         npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -525,8 +524,8 @@ fn open_design(
         .directory()
         .tensor(&format!("design/{set}/design.json"))
         .is_some();
-    let transport = npum_xdna::xrt::XrtTransport::open(0)
-        .map_err(|e| format!("{}: cannot open the NPU board: {e}", path.display()))?;
+    let transport = crate::transport::open()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     if own {
         ArrayDesign::open_from_container(path, set, transport).map_err(|e| e.to_string())
     } else {
@@ -578,7 +577,6 @@ pub fn open_array(
 ) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
     use npum_xdna::array::ArrayDesign;
     use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
-    use npum_xdna::transport::Transport;
 
     let container =
         npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -618,8 +616,8 @@ pub fn open_array(
         .directory()
         .tensor("design/gemm_rtp/design.json")
         .is_some();
-    let transport = npum_xdna::xrt::XrtTransport::open(0)
-        .map_err(|e| format!("{}: cannot open the NPU board: {e}", path.display()))?;
+    let transport = crate::transport::open()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let design = if own {
         ArrayDesign::open_from_container(path, "gemm_rtp", transport).map_err(|e| e.to_string())?
     } else {
