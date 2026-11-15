@@ -34,8 +34,15 @@
 //!
 //! The rows are the C++'s, in the C++'s order, with the C++'s widths. The
 //! array's own rows -- the upload, the dispatch, the download -- are zero,
-//! because the host path dispatches nothing; the host rows carry the
-//! measurements this runtime actually made.
+//! because this runtime measures the array's time as one number and does
+//! not split it into the three; the host rows carry the measurements this
+//! runtime actually made.
+//!
+//! AND THE ARRAY'S TIME IS IN THE "gemm + epilogue" ROW, which is where
+//! the C++'s puts it: the C++'s `t.conv` holds the projections' conversion
+//! and the elementwise passes' conversion alike, and both are the array's
+//! time. A host row that reported the array's time would be a row that
+//! lies about where the work happened.
 
 use npum_cpu::bert::Timings;
 use std::path::{Path, PathBuf};
@@ -72,8 +79,11 @@ pub struct Status {
 
 /// What the status block needs to know about the design set.
 pub struct DesignStatus {
-    /// The artifacts directory.
-    pub artifacts: PathBuf,
+    /// The artifacts directory the design set came from.
+    ///
+    /// `None` when the container carried its own copy: there is no
+    /// directory then, and an empty path would read as one.
+    pub artifacts: Option<PathBuf>,
     /// How many instruction streams the set holds.
     pub streams: usize,
     /// How many batch tiers the streams cover.
@@ -100,6 +110,43 @@ pub struct DesignStatus {
     pub git_head: String,
     /// Whether the toolchain was recorded at all.
     pub toolchain_recorded: bool,
+}
+
+/// Where one operation runs, and the design it runs on.
+///
+/// The block says where each operation runs, and it says it by naming the
+/// design -- so the block needs the design's name, its generation and its
+/// device. All three are in the design's own manifest, and reading a
+/// manifest does not need a board: the block is printed before the work,
+/// and the work is what needs the board.
+#[derive(Debug, Clone)]
+pub struct OpPlace {
+    /// The design set's name -- `layernorm`, `gelu`, `softmax`.
+    pub name: String,
+    /// The generation it was compiled for.
+    pub arch: i64,
+    /// The device it was compiled for -- `npu1`.
+    pub device: String,
+}
+
+/// Where the elementwise passes run.
+///
+/// `None` for a pass means the host runs it. The flag is the only thing
+/// that can move a pass to the array, so a pass that is not in here is a
+/// pass on the host.
+#[derive(Debug, Clone, Default)]
+pub struct Places {
+    /// The LayerNorm's place.
+    pub layn: Option<OpPlace>,
+    /// The GELU's place.
+    pub gelu: Option<OpPlace>,
+    /// The softmax's place.
+    pub softm: Option<OpPlace>,
+    /// How many bytes of weights the run stages on the device, once.
+    ///
+    /// Zero on a host run: nothing is staged, because the host's weights
+    /// are read from the container and never uploaded.
+    pub staged_bytes: usize,
 }
 
 /// Read the container's half of the status block.
@@ -143,9 +190,33 @@ pub fn read_container(container: &npum_format::Container, path: &Path) -> Status
 /// a block that pretends otherwise would be describing a run that is not
 /// happening.
 pub fn read_design(artifacts: &Path) -> Option<DesignStatus> {
-    let design_path = artifacts.join("gemm_rtp").join("design.json");
-    let bytes = std::fs::read(&design_path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let design = std::fs::read(artifacts.join("gemm_rtp").join("design.json")).ok()?;
+    let toolchain = std::fs::read(artifacts.join("gemm_rtp").join("toolchain.json")).ok();
+    read_design_from(&design, toolchain.as_deref(), Some(artifacts))
+}
+
+/// The same, out of the container's own copy of the design set.
+///
+/// A container that carries its own set needs nothing beside it, and the
+/// block has to say so -- the same source the run will use, so the block
+/// and the run cannot disagree about where the design came from.
+pub fn read_container_design(container: &npum_format::Container) -> Option<DesignStatus> {
+    let design = container.tensor_bytes("design/gemm_rtp/design.json").ok()?;
+    let toolchain = container.tensor_bytes("design/gemm_rtp/toolchain.json").ok();
+    read_design_from(design, toolchain.as_deref(), None)
+}
+
+/// The manifest and the toolchain, read into the block's rows.
+///
+/// The two are read together because they are the two files a design set
+/// carries, and a container's copy of one and a directory's copy of the
+/// other would be two designs.
+fn read_design_from(
+    design: &[u8],
+    toolchain: Option<&[u8]>,
+    artifacts: Option<&Path>,
+) -> Option<DesignStatus> {
+    let value: serde_json::Value = serde_json::from_slice(design).ok()?;
 
     let streams = value.get("streams").and_then(|v| v.as_array());
     let stream_count = streams.map(|s| s.len()).unwrap_or(4);
@@ -161,10 +232,7 @@ pub fn read_design(artifacts: &Path) -> Option<DesignStatus> {
     }
     tiers.sort_unstable();
 
-    let toolchain_path = artifacts.join("gemm_rtp").join("toolchain.json");
-    let toolchain = std::fs::read(&toolchain_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let toolchain = toolchain.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
     let (mlir_aie, peano, git_head, toolchain_recorded) = match &toolchain {
         Some(t) => (
             t.get("mlir_aie_version")
@@ -211,7 +279,7 @@ pub fn read_design(artifacts: &Path) -> Option<DesignStatus> {
     };
 
     Some(DesignStatus {
-        artifacts: artifacts.to_path_buf(),
+        artifacts: artifacts.map(|a| a.to_path_buf()),
         streams: stream_count,
         tiers_count: tiers.len().max(1),
         tiers,
@@ -239,25 +307,42 @@ pub fn read_design(artifacts: &Path) -> Option<DesignStatus> {
 /// seen the banner knows WHICH container the refusal is about -- a
 /// refusal on its own says "something is wrong" and a banner says "this
 /// container, this design, this device".
-pub fn announce(path: &Path, root: &Path) -> Option<Status> {
+pub fn announce(path: &Path, root: &Path, places: &Places) -> Option<Status> {
     let container = npum_format::Container::open(path).ok()?;
     let status = read_container(&container, path);
     let artifacts = crate::embed::find_artifacts(root, &status.model_name);
-    let design = artifacts.as_ref().and_then(|a| read_design(a));
-    print_block(
-        &status,
-        design.as_ref(),
-        artifacts.as_deref().unwrap_or(root),
-    );
+    // THE CONTAINER'S OWN SET, OR THE DIRECTORY'S.
+    //
+    // The same order the run uses to load the design: the container's own
+    // copy first, because a container that carries its set needs nothing
+    // beside it. The block has to name the same source the run will use --
+    // a block that names a directory the run ignores is a block that
+    // describes a different run.
+    let own = read_container_design(&container);
+    let from_dir = artifacts.as_ref().and_then(|a| read_design(a));
+    let design = own.as_ref().or(from_dir.as_ref());
+    let what = match (own.is_some(), artifacts.as_deref()) {
+        (true, _) => CONTAINER_ARTIFACTS.to_string(),
+        (false, Some(dir)) => format!(
+            "{} (picked from the container's geometry; no --artifacts given)",
+            dir.display()
+        ),
+        (false, None) => format!(
+            "{} (picked from the container's geometry; no --artifacts given)",
+            root.display()
+        ),
+    };
+    print_block(&status, design, &what, places);
     Some(status)
 }
 
+/// The block's first line, when the container carries its own design set.
+pub const CONTAINER_ARTIFACTS: &str =
+    "the container's own design set (design/gemm_rtp; no directory needed, no --artifacts given)";
+
 /// The status block, printed before the work.
-pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &Path) {
-    println!(
-        "  artifacts  {} (picked from the container's geometry; no --artifacts given)",
-        artifacts.display()
-    );
+pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &str, places: &Places) {
+    println!("  artifacts  {artifacts}");
     println!("NpuEmbeddings Rust runtime -- full encode");
     println!("  bo-mode    host_only (data-buffer allocation)");
     println!(
@@ -315,12 +400,30 @@ pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &P
     );
 
     // Where each operation runs.
+    //
+    // READ OFF THE DESIGN, and not off the flag that led here: a host-
+    // forced op prints the host line, and an array op names the resolved
+    // design and the generation it was built for. The op's CODE is
+    // printed, not its long name: the code is what --npu-ops takes, and a
+    // status line that names something you cannot type is one more thing
+    // to translate at the terminal.
     let layers = status.layers;
-    where_host("gelu", "GELU", &format!("{layers} fewer NPU dispatches"));
-    where_host("softm", "softmax", &format!("{layers} fewer NPU dispatches"));
-    where_host(
+    where_op(
+        "gelu",
+        "GELU",
+        places.gelu.as_ref(),
+        &format!("{layers} fewer NPU dispatches"),
+    );
+    where_op(
+        "softm",
+        "softmax",
+        places.softm.as_ref(),
+        &format!("{layers} fewer NPU dispatches"),
+    );
+    where_op(
         "layn",
         "LayerNorm",
+        places.layn.as_ref(),
         &format!("{} fewer NPU dispatches", 1 + 2 * layers),
     );
     where_host(
@@ -330,7 +433,10 @@ pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &P
     );
 
     println!("  bo-align   last data buffer aligned to 4096 B");
-    println!("  weights    0.00 MB staged on the device once, not per call");
+    println!(
+        "  weights    {:.2} MB staged on the device once, not per call",
+        places.staged_bytes as f64 / 1e6
+    );
     println!(
         "  pipeline   4 concurrent encodes of {}, one NPU mutex, 6 host threads per lane",
         batch
@@ -350,6 +456,24 @@ pub fn print_tokenizer(vocab: usize) {
 /// One operation's row: the code, the long name, and where it runs.
 fn where_host(code: &str, long_name: &str, note: &str) {
     println!("  {code:<6} {long_name:<10} on the HOST (fp32) -- {note}");
+}
+
+/// One operation's row: the code, the long name, and where it runs.
+///
+/// The array's line names the design and the generation it was built for,
+/// and it is the C++'s line word for word: the design's name (or its kind,
+/// when the design has no name), the architecture number, and the device.
+fn where_op(code: &str, long_name: &str, place: Option<&OpPlace>, note: &str) {
+    match place {
+        Some(place) => println!(
+            "  {code:<6} {long_name:<10} on the ARRAY ({}, arch {}{}{})",
+            place.name,
+            place.arch,
+            if place.device.is_empty() { "" } else { " " },
+            place.device
+        ),
+        None => where_host(code, long_name, note),
+    }
 }
 
 /// The time split, printed after the work.

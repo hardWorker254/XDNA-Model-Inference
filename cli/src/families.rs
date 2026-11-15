@@ -49,20 +49,25 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
     }
     with_model(model, npum_families::Family::Embed, root, |path, arch| {
         // The banner comes before the refusal, as in the C++.
-        crate::status::announce(path, root);
+        crate::status::announce(path, root, &crate::embed::places(path, root, args));
         // `--npu-ops` is a valid request and a valid question, and this
-        // runtime has no answer to it yet: the text family's projections and
-        // its elementwise passes run on the host. Accepting the flag and
-        // running the host would leave the command line saying "array" about
-        // a run that dispatched nothing -- which is the one thing the flag
-        // exists to prevent.
+        // runtime answers it for four of the codes: the projections, the
+        // LayerNorm, the GELU and the softmax go to the array. The rest --
+        // the attention, above all -- are not ported yet, and accepting
+        // them and running the host would leave the command line saying
+        // "array" about a run that dispatched nothing -- which is the one
+        // thing the flag exists to prevent.
         //
         // The array path itself is NOT missing: the transport, the design
-        // loader and the array's GEMM are ported and checked on the board.
-        // What is missing is the SEAM -- the place in this family where the
-        // call would go to the array instead of the host -- and no family
-        // routes to them yet.
-        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Embed, args, &["gemm"]) {
+        // loader, the array's GEMM and its elementwise passes are ported
+        // and checked on the board. What is missing is the SEAM for the
+        // attention -- the two GEMMs that make it -- and for the other
+        // families.
+        if let Some(reason) = refuse_array_not_ported(
+            npum_families::Family::Embed,
+            args,
+            &["gemm", "layn", "gelu", "softm"],
+        ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
@@ -214,11 +219,11 @@ fn refuse_array_not_ported(
         )
     };
     Some(format!(
-        "--npu-ops {}: the {} family runs {what} on the host in this runtime, and the \
-         array path is not ported into it yet -- the transport, the design loader and the \
-         array's GEMM and convolution are done and checked on the board, and what is \
-         missing is the SEAM for this family. {has} Accepting the flag and running the \
-         host would make the command line say something the run did not do.",
+        "--npu-ops {}: the {} family runs {what} on the host in this runtime, and the array \
+         path for it is not ported into this family yet -- the transport, the design loader and \
+         the array's own operations are done and checked on the board, and what is missing is \
+         the SEAM that would route this operation to the array here. {has} Accepting the flag and \
+         running the host would make the command line say something the run did not do.",
         refused.join(", "),
         family.as_str(),
     ))

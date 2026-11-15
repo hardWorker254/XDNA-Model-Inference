@@ -107,6 +107,71 @@ pub type ArrayRef<'a, 'b> = Option<&'a mut (dyn ArrayConvs + 'b)>;
 /// reborrow is what a walk over a graph does.
 pub type ArrayGemmRef<'a, 'b> = Option<&'a mut (dyn ArrayGemm + 'b)>;
 
+/// Which of the three elementwise passes a question is about.
+///
+/// The passes are separate designs and separate programs, so a run can put
+/// one of them on the array and leave the others on the host -- and the
+/// family has to ask WHICH, once per pass, before it calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EltOp {
+    /// The LayerNorm.
+    LayerNorm,
+    /// The GELU.
+    Gelu,
+    /// The softmax.
+    Softmax,
+}
+
+/// The array's side of a family's elementwise pass.
+///
+/// A LayerNorm, a softmax and a GELU are three designs and one mechanism:
+/// the array computes a block of rows and the host fills and reads it. The
+/// trait is the seam, and it is the same seam as the projection's one.
+pub trait ArrayEltwise {
+    /// Whether one pass is on the array.
+    ///
+    /// The flag names the passes one by one, and a run can name one of
+    /// them and not the others -- so the family asks, once per pass, and
+    /// sends the rest to the host.
+    fn on_array(&self, op: EltOp) -> bool;
+
+    /// The LayerNorm, over `n_rows` rows of the design's own width.
+    ///
+    /// `params` is the gain and the offset -- gamma first, then beta, f32 --
+    /// and it is `2 * cols` values long.
+    fn layernorm(&mut self, params: &[f32], x: &mut [f32], n_rows: usize) -> Result<()>;
+
+    /// The GELU, over the whole span.
+    ///
+    /// The GELU's "row" is the whole flat span of activations, so the count
+    /// is in elements and not in rows.
+    fn gelu(&mut self, x: &mut [f32]) -> Result<()>;
+
+    /// The softmax, over `n_rows` score rows.
+    fn softmax(&mut self, x: &mut [f32], n_rows: usize) -> Result<()>;
+
+    /// The width of a score row, when the softmax is on the array.
+    ///
+    /// `None` when the softmax stays on the host, and then the family's own
+    /// width is the right one.
+    ///
+    /// THE ARRAY'S WIDTH IS THE DESIGN'S, and the family's is the sequence
+    /// length. They are the same number only when the design was exported
+    /// for this model's sequence, and a softmax that normalises a
+    /// different number of keys than the family laid out is a softmax over
+    /// the wrong row -- so the family asks, and lays the scores out at the
+    /// width it is given.
+    fn softmax_cols(&self) -> Option<usize> {
+        None
+    }
+
+    /// How many dispatches this backend has run.
+    ///
+    /// The count is the RUN'S, and it is the number that says whether the
+    /// flag did what it said.
+    fn dispatches(&self) -> usize;
+}
+
 /// The array's side of a family's projection.
 ///
 /// A projection is a matrix multiplication and nothing else, and this is

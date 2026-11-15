@@ -79,6 +79,20 @@ pub fn run(
     } else {
         None
     };
+    // THE ELEMENTWISE PASSES, AND ONLY THE ONES THE FLAG NAMED.
+    //
+    // Each pass is its own design and its own context, and a design that
+    // was not opened is a pass that stays on the host.
+    let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> =
+        match open_eltwise(path, root, args) {
+            Ok(backend) => backend,
+            Err(reason) => {
+                return Err(Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: reason,
+                })
+            }
+        };
 
     // The status block was printed by the caller, before any refusal this
     // run might give: the banner says WHICH container, and a refusal on
@@ -126,6 +140,7 @@ pub fn run(
                 1,
                 seq,
                 array.as_deref_mut(),
+                eltwise.as_deref_mut(),
             )
             .map_err(|e| Refusal {
                 code: crate::EXIT_REFUSED,
@@ -140,10 +155,8 @@ pub fn run(
         elapsed,
         texts.len() as f64 / elapsed
     );
-    let dispatches = array
-        .as_ref()
-        .map(|a| a.dispatches())
-        .unwrap_or(0);
+    let dispatches = array.as_ref().map(|a| a.dispatches()).unwrap_or(0)
+        + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
     crate::status::print_time_split(&timings, 4, elapsed, dispatches);
 
     if let Some(out) = out_path {
@@ -300,6 +313,216 @@ pub fn find_artifacts(root: &Path, model_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether the run asked for the LayerNorm to go on the array.
+pub fn wants_layernorm(args: &crate::flags::Args) -> bool {
+    wants_op(args, "layn")
+}
+
+/// Whether the run asked for the GELU to go on the array.
+pub fn wants_gelu(args: &crate::flags::Args) -> bool {
+    wants_op(args, "gelu")
+}
+
+/// Whether the run asked for the softmax to go on the array.
+pub fn wants_softmax(args: &crate::flags::Args) -> bool {
+    wants_op(args, "softm")
+}
+
+/// Where the elementwise passes run, read off the flag and the design sets.
+///
+/// The status block is printed BEFORE the work, and it says where each
+/// operation runs -- so the answer is read off the design sets' manifests
+/// and not off the board: a manifest holds the design's name, its
+/// generation and its device, and reading one does not need a board.
+pub fn places(path: &Path, root: &Path, args: &Args) -> crate::status::Places {
+    let mut places = crate::status::Places::default();
+    if wants_layernorm(args) {
+        places.layn = op_place(path, root, "layernorm");
+    }
+    if wants_gelu(args) {
+        places.gelu = op_place(path, root, "gelu");
+    }
+    if wants_softmax(args) {
+        places.softm = op_place(path, root, "softmax");
+    }
+    places.staged_bytes = staged_bytes(path, root, args);
+    places
+}
+
+/// How many bytes of weights the array run stages on the device, once.
+///
+/// TWO THINGS ARE STAGED, and both are counted before the run and not
+/// after it:
+///
+/// * the PANELS -- the projections' weights, already rounded to bf16 and
+///   already tiled into the MMAC's byte order. They are the container's
+///   own tensors, so their sizes are the container's;
+/// * the LAYERNORM'S PARAMETERS -- one slot per site, and a site is the
+///   embedding plus two per layer.
+///
+/// The number is the run's, and the block reports it before the run
+/// because the block is a description of the run rather than a report on
+/// it -- and a block that reports the intention rather than the value is
+/// this project's recurring fail-open.
+pub fn staged_bytes(path: &Path, root: &Path, args: &Args) -> usize {
+    let mut bytes = 0usize;
+    if wants_gemm(args) {
+        bytes += panel_bytes(path);
+    }
+    if wants_layernorm(args) {
+        if let (Some(cols), Some(layers)) = (design_cols(path, root, "layernorm"), layers(path)) {
+            // gamma and beta, f32, two of them per row.
+            bytes += (1 + 2 * layers) * 2 * cols * 4;
+        }
+    }
+    bytes
+}
+
+/// The projections' panels, as the container holds them.
+fn panel_bytes(path: &Path) -> usize {
+    let Ok(container) = npum_format::Container::open(path) else {
+        return 0;
+    };
+    container
+        .directory()
+        .tensors()
+        .iter()
+        .filter(|t| t.role == "gemm_b")
+        .map(|t| t.nbytes as usize)
+        .sum()
+}
+
+/// One design set's row width, from its own manifest.
+fn design_cols(path: &Path, root: &Path, set: &str) -> Option<usize> {
+    let value = design_manifest(path, root, set)?;
+    value.get("cols")?.as_u64().map(|v| v as usize)
+}
+
+/// How many transformer layers the container's model has.
+fn layers(path: &Path) -> Option<usize> {
+    let container = npum_format::Container::open(path).ok()?;
+    container.config().get_i64("num_layers").map(|v| v as usize)
+}
+
+/// One design set's place, from its own manifest.
+fn op_place(path: &Path, root: &Path, set: &str) -> Option<crate::status::OpPlace> {
+    let value = design_manifest(path, root, set)?;
+    Some(crate::status::OpPlace {
+        name: value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(set)
+            .to_string(),
+        arch: value.get("arch").and_then(|v| v.as_i64()).unwrap_or(0),
+        device: value
+            .get("device")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// One design set's manifest, from the container or from the tree.
+///
+/// The container is the PREFERRED source and the directory is the
+/// fallback, and the two are read the same way the design itself is.
+fn design_manifest(path: &Path, root: &Path, set: &str) -> Option<serde_json::Value> {
+    if let Ok(container) = npum_format::Container::open(path) {
+        if let Some(bytes) = container
+            .tensor_bytes(&format!("design/{set}/design.json"))
+            .ok()
+        {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                return Some(value);
+            }
+        }
+    }
+    let dir = find_artifacts(root, &container_name(path))?;
+    let bytes = std::fs::read(dir.join(set).join("design.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether the run asked for one operation to go on the array.
+///
+/// The flag is a SET of codes, and a code is asked for by NAME.
+fn wants_op(args: &crate::flags::Args, code: &str) -> bool {
+    args.value("--npu-ops")
+        .map(|v| v.split(',').any(|c| c.trim() == code))
+        .unwrap_or(false)
+}
+
+/// The array's elementwise passes, when the run asked for them.
+///
+/// The three passes are three designs and three contexts, and only the ones
+/// the flag named are opened: a design that was not opened is a pass that
+/// stays on the host.
+pub fn open_eltwise(
+    path: &Path,
+    root: &Path,
+    args: &crate::flags::Args,
+) -> Result<Option<Box<dyn npum_model::array::ArrayEltwise>>, String> {
+    use npum_xdna::eltwise::{Eltwise, EltwiseDesign};
+
+    let mut layernorm = None;
+    if wants_layernorm(args) {
+        let design = open_design(path, root, "layernorm", "layn")?;
+        layernorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
+    }
+    let mut gelu = None;
+    if wants_gelu(args) {
+        let design = open_design(path, root, "gelu", "gelu")?;
+        gelu = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
+    }
+    let mut softmax = None;
+    if wants_softmax(args) {
+        let design = open_design(path, root, "softmax", "softm")?;
+        softmax = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
+    }
+    if layernorm.is_none() && gelu.is_none() && softmax.is_none() {
+        return Ok(None);
+    }
+    let backend = Eltwise::new(layernorm, gelu, softmax).map_err(|e| e.to_string())?;
+    Ok(Some(Box::new(backend)))
+}
+
+/// The array's design set, from the container's own copy or from the tree.
+///
+/// The container is the PREFERRED source and the directory is the
+/// fallback: a container that carries its own design set needs nothing
+/// beside it -- no directory, no MLIR-AIE on the reader's machine, no
+/// artifacts to install.
+fn open_design(
+    path: &Path,
+    root: &Path,
+    set: &str,
+    code: &str,
+) -> Result<npum_xdna::array::ArrayDesign<npum_xdna::xrt::XrtTransport>, String> {
+    use npum_xdna::array::ArrayDesign;
+    use npum_xdna::transport::Transport;
+
+    let container =
+        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let own = container
+        .directory()
+        .tensor(&format!("design/{set}/design.json"))
+        .is_some();
+    let transport = npum_xdna::xrt::XrtTransport::open(0)
+        .map_err(|e| format!("{}: cannot open the NPU board: {e}", path.display()))?;
+    if own {
+        ArrayDesign::open_from_container(path, set, transport).map_err(|e| e.to_string())
+    } else {
+        let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
+            format!(
+                "{}: --npu-ops {code} needs the {set} design set: this container does not carry \
+                 one, and no design set was found for it. Pass --artifacts <dir> naming one.",
+                path.display()
+            )
+        })?;
+        ArrayDesign::open(&dir.join(set), transport).map_err(|e| e.to_string())
+    }
 }
 
 /// Whether the run asked for the projections to go on the array.

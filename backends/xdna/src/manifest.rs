@@ -88,7 +88,29 @@ pub struct DesignInfo {
     pub b_layout_hash: String,
 
     /// The design's own tile.
+    #[serde(default, deserialize_with = "de_tile")]
     pub tile: Tile,
+
+    /// What the design computes: `layernorm`, `softmax` or `eltwise` (the
+    /// GELU). Empty for the GEMM designs, which are named by their streams
+    /// instead.
+    #[serde(default)]
+    pub kind: String,
+
+    /// The row width: how many values one row holds.
+    ///
+    /// It is the d_model of a LayerNorm row, the width of a softmax's score
+    /// row, and -- for the GELU, whose "row" is the whole flat span of
+    /// activations -- the span itself.
+    #[serde(default)]
+    pub cols: i64,
+
+    /// How many rows one dispatch covers.
+    ///
+    /// The GELU's is ONE, because its row is the whole span; the others'
+    /// is the design's own capacity.
+    #[serde(default)]
+    pub row_capacity: i64,
 
     /// The instruction stream of slot 0.
     #[serde(default)]
@@ -100,7 +122,12 @@ pub struct DesignInfo {
 }
 
 /// The design's tile: the shape it was compiled for.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// THE GEMM DESIGNS' TILE IS AN OBJECT and the ELTWISE DESIGNS' IS A
+/// NUMBER -- the number of elements one dispatch covers -- and the
+/// manifest has one field for both. The number is kept in `count`, and an
+/// eltwise design's `m`, `k` and `n` are zero: it has no such shape.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Tile {
     /// The rows one dispatch computes.
     #[serde(default)]
@@ -114,7 +141,52 @@ pub struct Tile {
     /// The AIE rows per tile.
     #[serde(default)]
     pub rows: i64,
+    /// The eltwise designs' tile: a plain number.
+    #[serde(default)]
+    pub count: i64,
 }
+
+/// Read the tile, which is an object in one design set and a number in
+/// another.
+fn de_tile<'de, D>(deserializer: D) -> std::result::Result<Tile, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Shape {
+            #[serde(default)]
+            m: i64,
+            #[serde(default)]
+            k: i64,
+            #[serde(default)]
+            n: i64,
+            #[serde(default)]
+            rows: i64,
+        },
+        Count(i64),
+    }
+    match Either::deserialize(deserializer)? {
+        Either::Shape { m, k, n, rows } => Ok(Tile {
+            m,
+            k,
+            n,
+            rows,
+            count: 0,
+        }),
+        Either::Count(count) => Ok(Tile {
+            count,
+            ..Tile::default()
+        }),
+    }
+}
+
+/// The file a design set's own program lives in.
+///
+/// Every design set has one, and the elementwise sets -- which record no
+/// streams at all -- have only this one.
+pub const DEFAULT_STREAM_FILE: &str = "insts.bin";
 
 /// One instruction stream: a slot, a file, and the shape it computes.
 #[derive(Debug, Clone, Deserialize)]
@@ -170,12 +242,27 @@ impl DesignInfo {
     /// are the per-op streams. The Python design harness walks them the same
     /// way, and the two must agree about which file is which slot -- a design
     /// dispatched with the wrong stream computes the wrong shape, correctly.
-    pub fn streams_in_slot_order(&self) -> Vec<&Stream> {
-        let mut out: Vec<&Stream> = Vec::new();
-        if let Some(slot0) = &self.slot0 {
-            out.push(slot0);
+    ///
+    /// THE ELEMENTWISE DESIGNS HAVE NO SLOT-0 RECORD, and their program is
+    /// the file every design set has: `insts.bin`. The C++ runtime read
+    /// that file by name and never looked at the manifest, so a design
+    /// without a record is not a design without a program -- it is a design
+    /// whose program is the conventional one.
+    pub fn streams_in_slot_order(&self) -> Vec<Stream> {
+        let mut out: Vec<Stream> = Vec::new();
+        match &self.slot0 {
+            Some(slot0) => out.push(slot0.clone()),
+            None => out.push(Stream {
+                op: String::new(),
+                batch: 0,
+                slot: 0,
+                file: DEFAULT_STREAM_FILE.to_string(),
+                m: 0,
+                k: 0,
+                n: 0,
+            }),
         }
-        let mut rest: Vec<&Stream> = self.streams.iter().collect();
+        let mut rest: Vec<Stream> = self.streams.clone();
         rest.sort_by_key(|s| s.slot);
         out.extend(rest);
         out

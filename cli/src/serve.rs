@@ -102,7 +102,16 @@ pub fn serve(
             crate::status::print_block(
                 &status,
                 design.as_ref(),
-                artifacts.as_deref().unwrap_or(root),
+                &format!(
+                    "{} (picked from the container's geometry; no --artifacts given)",
+                    artifacts.as_deref().unwrap_or(root).display()
+                ),
+                // THE SERVER RUNS THE HOST'S OPERATIONS.
+                //
+                // The server does not take `--npu-ops`, and it does not
+                // dispatch to the array -- so every operation in the block
+                // is on the host, and the block says so.
+                &crate::status::Places::default(),
             );
         }
         npum_families::Family::Cls => {

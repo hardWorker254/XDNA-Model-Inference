@@ -44,6 +44,7 @@ pub mod array_gemms;
 pub mod conv;
 pub mod design;
 pub mod device;
+pub mod eltwise;
 pub mod gemm;
 pub mod geometry;
 pub mod manifest;
