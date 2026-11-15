@@ -214,13 +214,17 @@ struct CuConfig {
     pad: [u8; 3],
 }
 
-/// `struct amdxdna_hwctx_param_config_cu`.
-#[repr(C)]
-struct HwctxParamConfigCu {
-    num_cus: u16,
-    pad: [u8; 3],
-    cu_configs: [CuConfig; 1],
-}
+/// The header of `struct amdxdna_hwctx_param_config_cu`: the CU count and the
+/// padding the driver checks is zero.
+///
+/// The value is sent as BYTES and not as a struct that holds the header and
+/// the CUs together. The reason is the bytes that sit between `num_cus` and
+/// the first CU: they are the compiler's alignment, not a field, and a struct
+/// literal does not promise to write them. They were zero when the CLI built
+/// the configuration and garbage in a test binary, and the driver answered
+/// the difference with EINVAL on CONFIG_HWCTX -- bytes nobody named decided
+/// whether the CU was configured.
+const CONFIG_CU_HEADER: usize = 8;
 
 /// `struct amdxdna_drm_create_bo`.
 #[repr(C)]
@@ -716,7 +720,10 @@ impl Transport for DirectTransport {
         // The context's tile count is in the device's rows: the partition
         // says how many columns it occupies, and the device says how many
         // rows a column has. The driver divides one by the other, and gets
-        // the number of columns the design asked for.
+        // the number of columns the design asked for. A partition wider than
+        // a column needs the width: given one column, a four-column design
+        // starts, waits for the columns it does not have, and never
+        // completes.
         let metadata = self.aie_metadata()?;
         if metadata.core.row_count == 0 {
             return Err(TransportError::new(
@@ -729,6 +736,9 @@ impl Transport for DirectTransport {
             .ok_or_else(|| {
                 TransportError::new("the design's column count overflows the tile count")
             })?;
+        // ONE CU, whatever the partition's width: the driver takes the first
+        // bit of the packet's CU mask as the CU to start, and the design's
+        // own packet flow drives the rest of the array.
 
         // THE CONTEXT.
         //
@@ -773,20 +783,21 @@ impl Transport for DirectTransport {
         <DirectTransport as Transport>::write(&pdi_buffer, pdi, 0)?;
 
         // THE CU'S CONFIGURATION: the PDI is the CU's program.
-        let mut cu = HwctxParamConfigCu {
-            num_cus: 1,
-            pad: [0; 3],
-            cu_configs: [CuConfig {
-                cu_bo: pdi_buffer.handle,
-                cu_func: 0,
-                pad: [0; 3],
-            }],
-        };
+        //
+        // The CU's program is the array's single PDI image: the xclbin
+        // carries one image however wide its partition header says the
+        // design may be.
+        let mut cu = vec![0u8; CONFIG_CU_HEADER + size_of::<CuConfig>()];
+        cu[0..2].copy_from_slice(&1u16.to_le_bytes());
+        cu[CONFIG_CU_HEADER..CONFIG_CU_HEADER + 4]
+            .copy_from_slice(&pdi_buffer.handle.to_le_bytes());
+        // The rest -- the header's padding, `cu_func`, and its padding --
+        // stays zero: the design has one function, and nothing else to say.
         let mut config = ConfigHwctx {
             handle: context.handle,
             param_type: 0,
-            param_val: &mut cu as *mut HwctxParamConfigCu as u64,
-            param_val_size: size_of::<HwctxParamConfigCu>() as u32,
+            param_val: cu.as_ptr() as u64,
+            param_val_size: cu.len() as u32,
             pad: 0,
         };
         ioctl(
