@@ -58,6 +58,7 @@ pub mod xrt;
 
 pub mod contention;
 pub mod dispatch;
+pub mod xclbin;
 
 pub use array::{ArrayDesign, ArrayError};
 pub use design::{Design, DesignSet};
