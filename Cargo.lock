@@ -714,6 +714,7 @@ dependencies = [
 name = "npum-xdna"
 version = "0.1.0"
 dependencies = [
+ "npum-cpu",
  "npum-format",
  "npum-model",
  "serde",

@@ -34,4 +34,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# The gate beside the convolution one drives a WHOLE FAMILY over the array:
+# the pose network out of a container that ships the array's panels. The
+# family lives in npum-cpu, and a DEV-dependency is the right edge for it:
+# the backend does not know the family at run time, and the test needs both.
+npum-cpu.workspace = true
+
 [build-dependencies]
