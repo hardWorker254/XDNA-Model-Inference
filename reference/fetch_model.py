@@ -26,6 +26,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MODELS = REPO / "models"
+sys.path.append(str(REPO))
+
+from npue_tools.weights import SAFETENSORS_NAME  # noqa: E402
 
 # Only what we actually consume. Weights are NOT in this list: the ONNX export
 # is placed into models/<name>/onnx/ by hand and verified below, never fetched
@@ -44,6 +47,19 @@ ALLOW = [
     # is a silent quality regression, so the table must come from the
     # checkpoint rather than from this repo's memory of it.
     "config_sentence_transformers.json",
+    # THE FLAT CHECKPOINT, since phase 3 made it the preferred weight source
+    # (`npue_tools/weights`). It used to be excluded on the grounds that the
+    # ONNX export was placed by hand and a second copy of the same weights was
+    # several hundred MB of nothing -- but the export is now the FALLBACK, so a
+    # user who fetched config and tokenizer had nothing the packer would read
+    # first, and had to know to download one more file by hand.
+    "model.safetensors",
+    # embeddinggemma's sentence-transformers head is two checkpoints of its own
+    # (the ONNX export fuses them in as /model/st/dense_*; the flat checkpoint
+    # keeps them where sentence-transformers keeps them), so a flat pack needs
+    # these beside model.safetensors.
+    "2_Dense/model.safetensors",
+    "3_Dense/model.safetensors",
 ]
 
 # STRUCTURAL expectations: what this runtime can execute at all. These are
@@ -228,28 +244,48 @@ def check(local, expect_layers):
         for suffix, shape in pl.items():
             want[f"{prefix}.{i}.{suffix}"] = shape
 
-    # The inventory is checked against the ONNX, not against a list of what
-    # an earlier, flat weight file happened to hold: ONNX exports drop the two
-    # pooler tensors
-    # and the position_ids buffer (all three are in IGNORABLE -- dead weight
-    # sentence-transformers never calls), so their absence is expected and
-    # their presence would be the surprise.
-    st = local / MODEL_ONNX
-    if not st.exists():
+    # The inventory is the same list for both sources because both readers
+    # serve the checkpoint's OWN names and orientation -- that is the premise
+    # phase 3 established and the weights gate checks. What differs is the
+    # spelling of a few extras: the export drops the two pooler tensors and the
+    # position_ids buffer (all three in IGNORABLE -- dead weight
+    # sentence-transformers never calls), while the flat checkpoint carries
+    # them, so they are tolerated in both directions.
+    flat = local / SAFETENSORS_NAME
+    source = "onnx"
+    if (local / MODEL_ONNX).exists():
+        with reader(local) as f:
+            names = set(f.keys())
+            shapes = {n: list(f.info(n)[1]) for n in names}
+            dtypes = {n: f.info(n)[0] for n in names}
+    elif flat.exists():
+        # Read through the package the PACKER reads, so a file this check
+        # accepts is a file the packer can open.
+        source = "safetensors"
+        from npue_tools.weights.safetensors import (  # noqa: PLC0415
+            SafetensorsWeights)
+
+        with SafetensorsWeights(flat) as f:
+            names = set(f.keys())
+            info = {n: f.info(n) for n in names}
+        dtypes = {n: info[n]["dtype"] for n in names}
+        shapes = {n: list(info[n]["shape"]) for n in names}
+    else:
         # main() reports this with the instructions; here it is just a
         # problem, because check() must be able to answer for itself.
-        return [f"{MODEL_ONNX} is not present under {local}"]
-    with reader(local) as f:
-        names = set(f.keys())
-        shapes = {n: list(f.info(n)[1]) for n in names}
-        dtypes = {n: f.info(n)[0] for n in names}
+        return [f"neither {MODEL_ONNX} nor {SAFETENSORS_NAME} is present "
+                f"under {local}"]
 
     for name, shape in want.items():
         if name not in names:
             problems.append(f"missing tensor {name}")
         elif shapes[name] != shape:
             problems.append(f"{name}: expected shape {shape}, got {shapes[name]}")
-        elif dtypes[name] not in ("F32", "float32"):
+        elif source == "onnx" and dtypes[name] not in ("F32", "float32"):
+            # The dtype rule is the EXPORT's: an export that widened or
+            # narrowed a weight would have changed the arithmetic the arch
+            # branch was written for. The flat checkpoint's dtypes are the
+            # package's business (F16/BF16 widen losslessly, F64 is refused).
             problems.append(f"{name}: expected F32, got {dtypes[name]}")
 
     unexpected = names - set(want) - IGNORABLE
@@ -286,17 +322,34 @@ def main():
         allow_patterns=ALLOW,
     )
 
-    # Nothing below may run without the weights on disk: CHECKPOINT.json is a
-    # PIN, and a pin written for a file that is not there is worse than no
-    # pin -- every golden and every .npue would be verified against it.
+    # The export is what CHECKPOINT.json pins: every golden and every .npue
+    # records its digest, so `sha256` means "this export" and nothing else. A
+    # flat checkpoint alone is a complete checkpoint for the PACKER (phase 3)
+    # but not a pin: there is no export to name, so the pin stays empty and
+    # this script says so rather than inventing a second meaning for the field.
     src = local / MODEL_ONNX
-    if not src.exists():
-        print(f"\nFAIL -- {src} does not exist.")
-        print("  Weights are not fetched by this script. Place the ONNX "
-              f"export at\n  {local / MODEL_ONNX} (BUILD.md §2.2) and re-run; "
-              "the config and tokenizer\n  have been fetched, and the "
-              "structural check will run then.")
+    flat = local / SAFETENSORS_NAME
+    if not src.exists() and not flat.exists():
+        print(f"\nFAIL -- neither {src} nor {flat} exists.")
+        print("  The flat checkpoint is fetched by this script; it did not "
+              "arrive.\n  The ONNX export is placed by hand (BUILD.md §2.2).")
         return 1
+    if not src.exists():
+        print(f"\n{flat.name} is present; {MODEL_ONNX} is not.")
+        print("  That is a complete checkpoint for the packer, and it is what "
+              "the weights gate\n  compares against the export when one is "
+              "here. CHECKPOINT.json is left unpinned:\n  `sha256` names an "
+              "export, and there is no export to name.")
+        problems = check(local, args.layers)
+        if problems:
+            print("\nFAIL -- checkpoint does not match this repo's structural "
+                  "expectations:")
+            for p in problems:
+                print(f"  - {p}")
+            return 1
+        print("\nOK -- flat checkpoint matches this repo's structural "
+              "expectations (nothing pinned)")
+        return 0
 
     # `file` is a LIST naming exactly the bytes `sha256` covers -- see
     # checkpoint_files(). The bare string MODEL_ONNX written here before

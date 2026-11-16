@@ -35,7 +35,15 @@ _TOOLS_LIB = Path(__file__).resolve().parents[2] / "tools" / "lib"
 if str(_TOOLS_LIB) not in sys.path:
     sys.path.insert(0, str(_TOOLS_LIB))
 
-from onnx_weights import OnnxWeights, model_digest  # noqa: E402
+from onnx_weights import (  # noqa: E402
+    EMBEDDINGGEMMA_RENAME,
+    EMBEDDINGGEMMA_STRIP,
+    WHISPER_DECODER_ONNX,
+    WHISPER_ENCODER_ONNX,
+    Combined,
+    OnnxWeights,
+    model_digest,
+)
 
 
 class OnnxWeightsSource:
@@ -48,6 +56,56 @@ class OnnxWeightsSource:
         self._w = OnnxWeights(self.path, strip=strip, rename=rename)
         self.files = tuple(self._w.source_files())
         self.digest = model_digest(self.path)
+
+    def keys(self):
+        return self._w.keys()
+
+    def __contains__(self, name):
+        return name in self._w
+
+    def info(self, name):
+        return self._w.info(name)
+
+    def array(self, name):
+        return self._w.array(name)
+
+    def close(self):
+        self._w.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class WhisperOnnxSource:
+    """A whisper export: TWO graphs behind one namespace.
+
+    The export splits the model into an encoder and a decoder file, and the
+    encoder's file dropped the `model.encoder.` root its tensors are named for
+    -- `prefix=` puts it back. The packer asks for both halves in one dict and
+    cannot sensibly be split by file, so this is the one place that knows the
+    stitching, and it lives with the ONNX reader rather than in the packer: a
+    second copy of "how the export spells whisper" is how the two drift.
+
+    The digest covers the WHOLE model, not just the two graph files: an export
+    large enough to trip protobuf's 2 GB limit keeps its weights in an
+    `.onnx_data` side file, and hashing only the graphs would pin the tensor
+    names while leaving every weight unguarded.
+    """
+
+    format = "onnx"
+
+    def __init__(self, model_dir):
+        self.path = Path(model_dir)
+        self._w = Combined([
+            OnnxWeights(self.path / WHISPER_ENCODER_ONNX, prefix="model.encoder."),
+            OnnxWeights(self.path / WHISPER_DECODER_ONNX),
+        ])
+        self.digest = model_digest(self.path / WHISPER_ENCODER_ONNX,
+                                   self.path / WHISPER_DECODER_ONNX)
 
     def keys(self):
         return self._w.keys()

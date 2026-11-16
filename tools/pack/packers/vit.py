@@ -76,7 +76,8 @@
 # that can be wrong.
 #
 # Env: numpy only (plus the repo's own npue.py, gemm_i8.py and
-# onnx_weights.py); torch and transformers only under --int8.
+# npue_tools.weights -- which is where any ONNX reading lives); torch and
+# transformers only under --int8.
 
 import json
 import math

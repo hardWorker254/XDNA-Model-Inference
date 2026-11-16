@@ -228,11 +228,10 @@ def onnx_source(model_dir: Path):
     # initializer names against the checkpoint would call all 314 correctly
     # spelled weights missing.
     strip, rename = packer().export_repair(model_dir)
-    if (model_dir / ONNX_NAME).is_file():
-        return open_model(model_dir, prefer="onnx", strip=strip, rename=rename)
-    from packers.whisper import combined_onnx  # noqa: PLC0415
-
-    return combined_onnx(model_dir)
+    # Whichever export layout this model has -- one graph, or whisper's two --
+    # the package answers for it, so the gate and the packer cannot read the
+    # export differently.
+    return open_model(model_dir, prefer="onnx", strip=strip, rename=rename)
 
 
 def canonical_names(names, roots):
@@ -451,13 +450,33 @@ def compare_tensor_data(onnx_path: Path, st_path: Path, da: dict, db: dict,
 
 def compare_containers(model_dir: Path, work: Path, extra: list[str]) -> list[str]:
     problems = []
-    out = {}
-    for source in ("onnx", "safetensors"):
-        path = work / f"{model_dir.name}-{source}.npue"
-        error = pack(model_dir, path, source, extra)
-        if error:
+    out: dict[str, Path] = {}
+    extra = list(extra)
+    while True:
+        failures = []
+        for source in ("onnx", "safetensors"):
+            path = work / f"{model_dir.name}-{source}.npue"
+            error = pack(model_dir, path, source, extra)
+            if error:
+                failures.append((source, error))
+            else:
+                out[source] = path
+        if not failures:
+            break
+        # A width the device's tile_n does not divide is not a SOURCE
+        # difference, and reporting it as one would hide the real answer behind
+        # a tiling message. Both packs are retried at the packer's own
+        # alternative, and the run says so -- bge-large's 1024-wide GEMMs are
+        # the case this exists for (npu1 defaults to tile_n 48).
+        if ("--tile-n" not in extra
+                and all("does not tile" in e for _, e in failures)):
+            extra += ["--tile-n", "32"]
+            out.clear()
+            print("# tiles       the device tile_n does not divide this model's "
+                  "GEMMs; both packs retried at --tile-n 32")
+            continue
+        for source, error in failures:
             return [f"packing from {source} failed:\n{error}"]
-        out[source] = path
 
     da, da_data = container_bytes(out["onnx"])
     db, db_data = container_bytes(out["safetensors"])
@@ -516,12 +535,22 @@ def main() -> int:
                     help="keep the containers (they are deleted otherwise)")
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--device", default="npu1")
+    # The tiling is the container's, and a model whose width is not a multiple
+    # of the device's default tile_n cannot be packed at all -- bge-large's
+    # 1024 wide GEMMs do not tile into npu1's 48, so the gate would report a
+    # SOURCE failure for what is a tile choice. Forwarded to both packs, so
+    # the two containers are still built the same way.
+    ap.add_argument("--tile-k", type=int, default=None)
+    ap.add_argument("--tile-n", type=int, default=None)
     args = ap.parse_args()
 
     dirs = ([Path(p) for p in args.model_dir] if args.model_dir
             else sorted(p for p in (REPO / "models").iterdir() if p.is_dir()))
     checked = skipped = failed = 0
     extra = ["--dtype", args.dtype, "--device", args.device]
+    for flag, value in (("--tile-k", args.tile_k), ("--tile-n", args.tile_n)):
+        if value is not None:
+            extra += [flag, str(value)]
     work = Path(args.work) if args.work else Path(tempfile.mkdtemp())
     work.mkdir(parents=True, exist_ok=True)
 

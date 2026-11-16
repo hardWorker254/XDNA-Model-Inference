@@ -35,7 +35,9 @@
 # uses, does not divide 5120 -- large-v3's FFN -- and would force a per-size
 # repack and a per-size design set.
 #
-# Env: numpy only (plus the repo's own npue.py and onnx_weights.py).
+# Env: numpy only (plus the repo's own npue.py). The weights come through
+# npue_tools.weights -- one flat file, or the export's two graphs stitched by
+# WhisperOnnxSource there -- so this file has no ONNX reader of its own.
 
 import json
 import math
@@ -51,10 +53,8 @@ from gemm_i4 import add_gemm_b_int4                              # noqa: E402
 from npue import (ARCH_WHISPER_ENC_DEC_GELU, MAC_BY_DEVICE,  # noqa: E402
                   MAC_DEFAULT_DEVICE, Writer, gemm_b_layout, layout_hash,
                   mac_for_device, tile_b, to_bf16_bits)
-from onnx_weights import (Combined, OnnxWeights, model_digest,    # noqa: E402
-                          WHISPER_DECODER_ONNX, WHISPER_ENCODER_ONNX)
-from npue_tools.weights import (has_safetensors, open_model,     # noqa: E402
-                                prefer)
+from npue_tools.weights import (WHISPER_DECODER_ONNX,  # noqa: E402
+                                WHISPER_ENCODER_ONNX, open_model)
 from whisper_bpe import VocabMerges, build_table                      # noqa: E402
 
 # Only s and t of the MAC geometry affect the B operand's byte order, and both
@@ -424,55 +424,20 @@ def _embed(w, model_name, datapath, npue_args, where):
 
 
 def whisper_weights(model_dir):
-    """The whole model's weights: one flat file, or the export's two.
+    """The whole model's weights, from whichever source this model has.
 
     A whisper checkpoint is ONE state dict with both halves in it
     (`model.encoder.conv1.weight` and `model.decoder.embed_tokens.weight`
-    side by side), so model.safetensors is read directly and needs no
-    namespace repair. The export split the model into two files and dropped
-    the encoder's `model.encoder.` root, which is why the ONNX path still
-    needs Combined() and a prefix -- and why 30 of its initializers are graph
-    constants (`/model/decoder/Constant_10_output_0`) that a flat checkpoint
-    does not carry at all. Measured on openai/whisper-tiny: 167 tensors in
-    model.safetensors, and all 167 are among the export's 197 names.
+    side by side), so model.safetensors is read directly. The export split the
+    model into two files and dropped the encoder's `model.encoder.` root, so
+    that layout needs stitching -- which `npue_tools.weights` does, not this
+    file: the packer asks one question ("the model's tensors") and gets one
+    answer either way. Measured on openai/whisper-tiny: 167 tensors in
+    model.safetensors, all 167 among the export's 197 names.
 
-    One function so both branches answer the same question, and so the
-    refusal for a forced source is written once.
+    A forced source is refused by `open_model`, once, for every packer.
     """
-    if prefer() == "safetensors" or (prefer() == "auto"
-                                     and has_safetensors(model_dir)):
-        return open_model(model_dir)
-    return combined_onnx(model_dir)
-
-
-def combined_onnx(model_dir):
-    """The two exports behind one namespace, as this packer has always read them.
-
-    This packer asks for `model.encoder.conv1.weight` about a hundred lines
-    after `model.decoder.embed_tokens.weight` and cannot sensibly be split, so
-    Combined() presents them as one namespace and refuses a name that resolves
-    in both. The encoder export dropped the `model.encoder.` root its tensors
-    are named for -- prefix= puts it back -- while the decoder export kept
-    `model.decoder.` and needs nothing; OnnxWeights documents both directions.
-
-    The digest covers the WHOLE model and not just the two graph files: an
-    export large enough to trip protobuf's 2 GB limit keeps its weights in an
-    .onnx_data side file, and hashing only the graphs would pin the tensor
-    names while leaving every weight unguarded.
-    """
-    combined = Combined([
-        OnnxWeights(model_dir / WHISPER_ENCODER_ONNX,
-                    prefix="model.encoder."),
-        OnnxWeights(model_dir / WHISPER_DECODER_ONNX),
-    ])
-    # Combined is a namespace, not a source: it has no format and no digest of
-    # its own. Both are attached here so the packer sees one protocol
-    # whichever branch answered.
-    combined.format = "onnx"
-    combined.export_digest = None
-    combined.digest = model_digest(model_dir / WHISPER_ENCODER_ONNX,
-                                   model_dir / WHISPER_DECODER_ONNX)
-    return combined
+    return open_model(model_dir)
 
 
 def pack_whisper(model_dir, out, max_seq=None, max_target=None,

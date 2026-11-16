@@ -33,7 +33,9 @@ from .base import (
     sha256_file,
     weights_digest,
 )
-from .onnx import OnnxWeightsSource
+from .onnx import (EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP,
+                   WHISPER_DECODER_ONNX, WHISPER_ENCODER_ONNX,
+                   OnnxWeightsSource, WhisperOnnxSource)
 from .safetensors import SafetensorsWeights
 
 __all__ = [
@@ -145,9 +147,14 @@ def open_model(model_dir, *, strip="", rename=(), prefer=None) -> WeightSource:
             f"{model_dir}: --weights-source safetensors, but {SAFETENSORS_NAME} "
             f"is not there"
         )
-    if prefer == "onnx" and not onnx_path.is_file():
+    # An export is ONE graph for most models and TWO for whisper, so "is the
+    # export there" is a question about the model's layout, not one path.
+    whisper_onnx = ((model_dir / WHISPER_ENCODER_ONNX).is_file()
+                    and (model_dir / WHISPER_DECODER_ONNX).is_file())
+    if prefer == "onnx" and not (onnx_path.is_file() or whisper_onnx):
         raise WeightError(
-            f"{model_dir}: --weights-source onnx, but {ONNX_NAME} is not there"
+            f"{model_dir}: --weights-source onnx, but neither {ONNX_NAME} nor "
+            f"{WHISPER_ENCODER_ONNX} is there"
         )
 
     use_safetensors = prefer == "safetensors" or (
@@ -164,9 +171,19 @@ def open_model(model_dir, *, strip="", rename=(), prefer=None) -> WeightSource:
         # catch a genuinely needed rename is the gate, not this refusal: two
         # packs of one checkpoint either agree byte for byte or say why.
         return SafetensorsWeights(st_path)
-    if not onnx_path.is_file():
-        raise WeightError(
-            f"{model_dir}: no weights -- neither {SAFETENSORS_NAME} nor "
-            f"{ONNX_NAME} is there"
-        )
-    return OnnxWeightsSource(onnx_path, strip=strip, rename=rename)
+    if onnx_path.is_file():
+        return OnnxWeightsSource(onnx_path, strip=strip, rename=rename)
+    # Whisper's export is two graphs, and it is still a layout this function
+    # answers for: the packers no longer know that the encoder keeps its
+    # tensors under a root the decoder does not, so the stitching is here.
+    if whisper_onnx:
+        if strip or rename:
+            raise WeightError(
+                f"{model_dir}: strip/rename were asked of a whisper export, "
+                f"whose repair is its own (the encoder's `model.encoder.` "
+                f"root, applied by WhisperOnnxSource)")
+        return WhisperOnnxSource(model_dir)
+    raise WeightError(
+        f"{model_dir}: no weights -- none of {SAFETENSORS_NAME}, {ONNX_NAME}, "
+        f"{WHISPER_ENCODER_ONNX} is there"
+    )

@@ -52,10 +52,10 @@ from npue import (ARCH_GEMMA3_MQA_ROPE_GEGLU, ARCH_GTE_NEW_ROPE_GEGLU,  # noqa: 
                   ARCH_NOMIC_ROPE_SWIGLU, MAC_BY_DEVICE, MAC_DEFAULT_DEVICE,
                   Writer, gemm_b_layout, layout_hash, mac_for_device, tile_b,
                   to_bf16_bits)
-from onnx_weights import EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP  # noqa: E402
+from npue_tools.weights import (EMBEDDINGGEMMA_RENAME,  # noqa: E402
+                                EMBEDDINGGEMMA_STRIP, open_model)
 from xlmr_tokenizer_table import write_table as write_xlmr_table  # noqa: E402
-from npue_tools.weights import (export_digest, open_model,     # noqa: E402
-                                set_prefer)
+from npue_tools.weights import export_digest, set_prefer  # noqa: E402
 
 
 def set_weights_source(name):
