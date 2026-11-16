@@ -65,8 +65,31 @@ pub fn params_from(args: &crate::flags::Args) -> npum_cpu::pose_decode::DecodePa
     p
 }
 
+/// What the array says about itself, in the block.
+///
+/// The three numbers are the DESIGN's: how many shapes it can compute, where
+/// it came from, and how many rows it computes at a time.
+pub struct ArrayInfo {
+    /// How many streams the design set carries.
+    pub streams: usize,
+    /// The design set's directory, as the reader named it.
+    ///
+    /// It is EMPTY when the design came from the container: a container that
+    /// carries its own set needs nothing beside it, and there is no path to
+    /// print.
+    pub designs: String,
+    /// How many rows one dispatch computes.
+    pub rows: usize,
+}
+
 /// The block, printed to stderr before the first image.
-pub fn print_block(name: &str, g: &Geometry, threads: usize, setup_s: f64) {
+pub fn print_block(
+    name: &str,
+    g: &Geometry,
+    threads: usize,
+    setup_s: f64,
+    array: Option<&ArrayInfo>,
+) {
     let strides = g.strides.clone();
     let stride_txt = format!(
         "{}/{}/{}",
@@ -74,7 +97,10 @@ pub fn print_block(name: &str, g: &Geometry, threads: usize, setup_s: f64) {
         strides.get(1).copied().unwrap_or(0),
         strides.get(2).copied().unwrap_or(0)
     );
-    eprintln!("NpuEmbeddings -- body pose (YOLOv8-pose) on the CPU");
+    eprintln!(
+        "NpuEmbeddings -- body pose (YOLOv8-pose) on the {}",
+        if array.is_some() { "AMD NPU" } else { "CPU" }
+    );
     eprintln!(
         "  model      {}: {}px letterbox, {} levels (strides {}), {} cells, head {} = 4 box + {} class + {} keypoints x 3",
         name,
@@ -86,14 +112,36 @@ pub fn print_block(name: &str, g: &Geometry, threads: usize, setup_s: f64) {
         g.num_classes,
         g.num_keypoints
     );
-    eprintln!("  backend    conv on the host (default), everything else on the host");
-    eprintln!(
-        "             pass --npu-ops conv to measure the array instead; see \
-         runtime/include/pose/net.hpp for why the host wins here (2.6x \
-         arithmetic padding waste on N <= 64, 100 of the network's 436 \
-         dispatches for the stem alone, and 660 us per dispatch of which 140 \
-         us is the device's GEMM)."
-    );
+    // WHERE THE CONVOLUTIONS RUN, and the two lines that go with it.
+    //
+    // The row names the side, and the line under it says what the other side
+    // costs -- because a reader who has just been told "the array" deserves
+    // to know that the host is the faster side here, and the oracle measured
+    // that on this network.
+    match array {
+        Some(info) => {
+            eprintln!(
+                "  backend    conv on the array ({} streams), everything else on the host",
+                info.streams
+            );
+            eprintln!("             designs   {}", info.designs);
+            eprintln!(
+                "             {} rows per dispatch; compare against a host run, the two \
+                 numbers are printed per image below.",
+                info.rows
+            );
+        }
+        None => {
+            eprintln!("  backend    conv on the host (default), everything else on the host");
+            eprintln!(
+                "             pass --npu-ops conv to measure the array instead; see \
+                 runtime/include/pose/net.hpp for why the host wins here (2.6x \
+                 arithmetic padding waste on N <= 64, 100 of the network's 436 \
+                 dispatches for the stem alone, and 660 us per dispatch of which 140 \
+                 us is the device's GEMM)."
+            );
+        }
+    }
     let d = npum_cpu::pose_decode::DecodeParams::default();
     eprintln!(
         "  decode     conf {:.2}, iou {:.2}, keypoint {:.2}, max_det {}",
@@ -105,12 +153,24 @@ pub fn print_block(name: &str, g: &Geometry, threads: usize, setup_s: f64) {
     // is the head's [1,16,1,1] DFL projection, folded analytically into the
     // head. Printing 73 would claim a convolution neither path runs.
     let n_convs = g.convs.len().saturating_sub(1);
-    eprintln!(
-        "             {:<26} {:<5} {}",
-        format!("{n_convs} x conv"),
-        "host",
-        format!("im2col + a blocked fp32 GEMM over rows, {threads} threads")
-    );
+    // WHERE THE CONVOLUTIONS RAN. The row says it, and the text under it
+    // says what the split looks like on that side -- a run that dispatched
+    // them to the array and printed "host" would be the one thing the flag
+    // exists to prevent.
+    match array {
+        Some(_) => eprintln!(
+            "             {:<26} {:<5} {}",
+            format!("{n_convs} x conv"),
+            "npu",
+            "im2col on the host, GEMM on the array, bias by the design, SiLU in the host epilogue"
+        ),
+        None => eprintln!(
+            "             {:<26} {:<5} {}",
+            format!("{n_convs} x conv"),
+            "host",
+            format!("im2col + a blocked fp32 GEMM over rows, {threads} threads")
+        ),
+    }
     eprintln!(
         "             {:<26} {:<5} {}",
         "silu",
@@ -183,12 +243,20 @@ pub struct Run {
 /// The per-image lines, on stderr.
 pub fn print_run(image: &str, r: &Run, g: &Geometry) {
     let n_convs = g.convs.len().saturating_sub(1);
+    // WHERE THE CONVOLUTIONS RAN, and how many dispatches that took.
+    //
+    // The count of dispatches is the one that says whether the flag did what
+    // it said: a run that asked for the array and dispatched nothing is a run
+    // that lied, and this is where the lie shows.
+    let on_array = r.timings.convs_array > 0;
     eprintln!(
-        "  {:<40} {:.2} s  {} people  ({} convs host, 0 dispatches)",
+        "  {:<40} {:.2} s  {} people  ({} convs {}, {} dispatches)",
         image,
         r.total_s,
         r.people.len(),
-        n_convs
+        n_convs,
+        if on_array { "array" } else { "host" },
+        r.timings.dispatches
     );
     eprintln!(
         "             {:.1} ms front end, {:.1} ms network, {:.1} ms decode, \
@@ -200,18 +268,56 @@ pub fn print_run(image: &str, r: &Run, g: &Geometry) {
         r.height
     );
     let t = r.timings;
-    eprintln!(
-        "             host conv split: {:.1} ms gemm, {:.1} ms im2col, \
-         {:.1} ms [M,N] transpose, {:.1} ms weight transpose, {:.1} ms \
-         elementwise ({:.1}x torch's {:.1})",
-        t.gemm_s * 1e3,
-        t.im2col_s * 1e3,
-        t.transpose_s * 1e3,
-        t.weight_s * 1e3,
-        t.elementwise_s * 1e3,
-        r.network_s * 1e3 / TORCH_REF_MS,
-        TORCH_REF_MS
-    );
+    // THE HOST'S SPLIT, and only on the host's path: on the array's path no
+    // convolution ran on the host, and a split of nothing is a number with
+    // no meaning.
+    if !on_array {
+        eprintln!(
+            "             host conv split: {:.1} ms gemm, {:.1} ms im2col, \
+             {:.1} ms [M,N] transpose, {:.1} ms weight transpose, {:.1} ms \
+             elementwise ({:.1}x torch's {:.1})",
+            t.gemm_s * 1e3,
+            t.im2col_s * 1e3,
+            t.transpose_s * 1e3,
+            t.weight_s * 1e3,
+            t.elementwise_s * 1e3,
+            r.network_s * 1e3 / TORCH_REF_MS,
+            TORCH_REF_MS
+        );
+    }
+    // THE ARRAY'S SPLIT, and the same span as the host's: every convolution
+    // on the array, from the im2col that fills A to the NCHW transpose of C.
+    // MEASURED, not the device-busy figure -- the array's own counters say
+    // the device is idle for most of it, and a status line that printed only
+    // the busy time would report a speedup the picture does not have. The
+    // two numbers to put side by side are this and network_s.
+    if on_array {
+        let us_each = if t.dispatches > 0 {
+            t.t_array_s * 1e6 / t.dispatches as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "             array conv: {:.1} ms in {} dispatches \
+             ({:.0} us each) -- {:.1} ms GEMM on the device, {:.1} ms the \
+             host's own A repack, {:.1} ms the C transpose. The other \
+             {:.1} ms of the {:.1} ms network is im2col and the \
+             elementwise ops, on the host either way, of which \
+             {:.1} ms is the non-convolution span. im2col itself, which \
+             t_array also spans because t0 is taken before it, is \
+             {:.1} ms.",
+            t.t_array_s * 1e3,
+            t.dispatches,
+            us_each,
+            t.t_array_gemm_s * 1e3,
+            t.t_array_repack_s * 1e3,
+            t.t_array_transpose_s * 1e3,
+            (r.network_s - t.t_array_s) * 1e3,
+            r.network_s * 1e3,
+            t.elementwise_s * 1e3,
+            t.im2col_s * 1e3
+        );
+    }
 }
 
 /// The human summary `--text` prints.
@@ -280,10 +386,16 @@ fn edge_pair(edge: &str) -> Option<(usize, usize)> {
 /// transient, so the writer sees each one once and cannot go back to count
 /// them. A header that does not fit is a refusal, because a truncated list
 /// would read as a short graph.
+///
+/// THE DUMP IS THE RUN'S, and not a second run: the array, when there is
+/// one, is passed in and the dump comes from the same walk the answer comes
+/// from. A dump written by the host while the answer came from the array
+/// would compare two different networks.
 pub fn write_dump(
     path: &Path,
     net: &Network,
     input: &npum_cpu::pose::Tensor,
+    array: npum_model::array::ArrayRef<'_, '_>,
 ) -> Result<(), String> {
     let mut file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     file.write_all(&vec![b' '; DUMP_HEADER])
@@ -308,7 +420,7 @@ pub fn write_dump(
             }
             let _ = file.write_all(&bytes);
         };
-        net.run_with_hook(input, &mut hook)?;
+        net.run_with_hook_on_array(input, &mut hook, array)?;
     }
     let mut header = String::from("{\n  \"nodes\": [\n");
     for (i, line) in index.iter().enumerate() {

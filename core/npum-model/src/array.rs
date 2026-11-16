@@ -282,6 +282,22 @@ pub trait ArrayConvs {
     /// side of the boundary.
     fn convert_seconds(&self) -> f64;
 
+    /// How many rows one dispatch computes.
+    ///
+    /// It is the DESIGN's number and not the family's: the design was
+    /// compiled for a fixed number of rows per dispatch, and a convolution
+    /// with more rows than that is cut into chunks of it. The status block
+    /// prints it, because "how many rows at a time" is what says whether
+    /// the array's number and the host's number are about the same work.
+    fn rows_per_dispatch(&self) -> usize;
+
+    /// How many streams the design set carries.
+    ///
+    /// It is the design's own count of the shapes it can compute, and it is
+    /// printed because a design with fourteen streams and a family with
+    /// fourteen shapes is a coincidence worth seeing.
+    fn stream_count(&self) -> usize;
+
     /// Run one dense convolution on the array.
     ///
     /// `weight` is the convolution's weight name in the container --

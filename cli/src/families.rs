@@ -555,23 +555,10 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        // `--npu-ops conv` is a valid pose request and a valid question, and
-        // this runtime has no answer to it yet: the host path is the ported
-        // one. Accepting the flag and running the host would leave the
-        // command line saying "array" about a run that dispatched nothing.
-        if args
-            .value("--npu-ops")
-            .map(|v| v.split(',').any(|c| c.trim() == "conv"))
-            .unwrap_or(false)
-        {
-            eprintln!(
-                "error: --npu-ops conv: the pose family runs its convolutions on \
-                 the host in this runtime, and the array path is not ported yet. \
-                 Accepting the flag and running the host would make the command \
-                 line say something the run did not do."
-            );
-            return crate::EXIT_REFUSED;
-        }
+        // `--npu-ops conv` moves the convolutions to the array, and the
+        // refusal for a container that cannot do it is the array's own:
+        // a container packed without the panels says so, and the message
+        // says how to pack it.
         let started = std::time::Instant::now();
         let network = match npum_cpu::pose::Network::open(path) {
             Ok(n) => n,
@@ -587,7 +574,36 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| arch.to_string());
         let params = crate::pose::params_from(args);
-        crate::pose::print_block(&name, &geometry, network.threads(), setup_s);
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the convolutions go to the array
+        // and the run says how many it dispatched. A container that cannot
+        // do it is refused HERE, before the first image, with the reason.
+        let mut array = if crate::ocr::wants_conv(args) {
+            let specs = npum_cpu::pose::array_specs(&geometry);
+            match crate::arrayconv::open(path, &specs, args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        let array_info = array.as_ref().map(|backend| crate::pose::ArrayInfo {
+            streams: backend.stream_count(),
+            // THE DESIGN'S OWN PATH, or nothing at all: a container that
+            // carries its own set needs nothing beside it, and there is no
+            // path to print.
+            designs: args
+                .value("--artifacts")
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            rows: backend.rows_per_dispatch(),
+        });
+        crate::pose::print_block(&name, &geometry, network.threads(), setup_s, array_info.as_ref());
         let _ = arch;
 
         let text = args.switch("--text");
@@ -613,14 +629,17 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
             let front_end_s = front.elapsed().as_secs_f64();
 
             if let Some(dump) = dump.as_deref() {
-                if let Err(reason) = crate::pose::write_dump(dump, &network, &input) {
+                if let Err(reason) =
+                    crate::pose::write_dump(dump, &network, &input, array.as_deref_mut())
+                {
                     eprintln!("error: {reason}");
                     return crate::EXIT_REFUSED;
                 }
             }
 
             let net = std::time::Instant::now();
-            let (head, timings) = match network.run_timed(&input) {
+            let (head, timings) = match network.run_timed_on_array(&input, array.as_deref_mut())
+            {
                 Ok(h) => h,
                 Err(reason) => {
                     eprintln!("error: {reason}");
@@ -664,8 +683,16 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
                     scale: letterbox.scale,
                     pad_x: letterbox.pad_x,
                     pad_y: letterbox.pad_y,
-                    dispatches: 0,
-                    convs_host: geometry.convs.len().saturating_sub(1) as i64,
+                    // WHERE THE CONVOLUTIONS RAN. The JSON says it as well as
+                    // the status block does, because the JSON is what a
+                    // program reads: a reader that asked for the array and
+                    // got a host's numbers would have no way to tell.
+                    dispatches: timings.dispatches,
+                    convs_host: if timings.convs_array > 0 {
+                        0
+                    } else {
+                        geometry.convs.len().saturating_sub(1) as i64
+                    },
                 };
                 print!(
                     "{}",
@@ -674,7 +701,7 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
                         &geometry,
                         &params,
                         image,
-                        false
+                        timings.convs_array > 0
                     )
                 );
             }

@@ -292,6 +292,26 @@ impl<T: Transport> npum_model::ArrayConvs for ArrayConvs<T> {
         self.scratch.convert_seconds
     }
 
+    fn rows_per_dispatch(&self) -> usize {
+        // THE DESIGN'S OWN ROWS, and the largest of them.
+        //
+        // Every stream of a conv-only design set computes the same number of
+        // rows -- it is the design's single dispatch chunk -- so the first
+        // stream's M is the design's M. A design with no stream has no rows,
+        // and zero is the honest answer.
+        self.design
+            .info()
+            .streams
+            .iter()
+            .map(|s| s.m as usize)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn stream_count(&self) -> usize {
+        self.design.info().streams.len()
+    }
+
     fn conv(
         &mut self,
         weight: &str,

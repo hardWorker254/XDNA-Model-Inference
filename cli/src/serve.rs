@@ -216,7 +216,11 @@ pub fn serve(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             let geometry = detector.geometry().clone();
-            crate::pose::print_block(&name, &geometry, detector.threads(), setup_s);
+            // THE SERVER RUNS THE HOST, and the block says so: the array's
+            // convolutions are a CLI path in this runtime, and a server that
+            // printed "on the AMD NPU" while dispatching nothing would be
+            // lying twice -- in the block and in the answer.
+            crate::pose::print_block(&name, &geometry, detector.threads(), setup_s, None);
             pose = Some(detector);
         }
         npum_families::Family::MpPose => {

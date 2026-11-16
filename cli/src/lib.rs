@@ -32,6 +32,7 @@
 //! * a pin that can never match is refused rather than stored;
 //! * a container of another family names the program that runs it.
 
+pub mod arrayconv;
 pub mod backend;
 pub mod embed;
 pub mod families;

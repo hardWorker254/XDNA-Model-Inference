@@ -43,6 +43,7 @@
 //! -- for this checkpoint.
 
 use npum_format::Container;
+use npum_model::array::{ArrayRef, ConvSpec};
 use serde_json::Value;
 use std::path::Path;
 
@@ -144,6 +145,14 @@ pub struct Layer {
     pub chan: i64,
     /// The slice's channel count.
     pub nch: i64,
+    /// The array's stream this convolution runs on, when the container was
+    /// packed with `--npu`.
+    ///
+    /// It is the SHAPE the convolution is dispatched against -- "conv64x128"
+    /// -- and it is EMPTY for a container packed without the panels: such a
+    /// container names no stream, and a convolution with no stream is a
+    /// convolution the array cannot be asked about.
+    pub stream: String,
     /// The operands.
     pub inputs: Vec<i32>,
 }
@@ -345,6 +354,7 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
             scale: 0,
             chan: 0,
             nch: 0,
+            stream: String::new(),
             inputs,
         };
         match op {
@@ -355,6 +365,20 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
                     .ok_or_else(|| format!("{where_}: a conv node carries no \"conv\" index"))?
                     as i32;
                 layer.silu = node.get("silu").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+                // THE STREAM, when the container names one.
+                //
+                // It is the packer's word, not this runtime's: the packer
+                // writes the design's stream into the node it dispatches
+                // that convolution against, and a container packed WITHOUT
+                // the panels names none. A default invented here would be a
+                // stream the design does not carry, and a convolution
+                // dispatched against a missing slot is a wrong answer rather
+                // than an error.
+                layer.stream = node
+                    .get("stream")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 // The stride and the padding are READ, not assumed: the stem
                 // is stride 2 and the 1x1s pad nothing, so a default would be
                 // right for most of the network and would silently resize the
@@ -547,6 +571,40 @@ impl ConvW {
     }
 }
 
+/// The pose family's dense convolutions, as the array's list.
+///
+/// THE LIST IS THE FAMILY'S OWN, and it is built from the GRAPH rather than
+/// from the container's directory: a panel exists for a convolution the
+/// graph RUNS, and a panel that no op calls is a panel nobody stages.
+///
+/// A convolution with no stream is left out, and that is what a container
+/// packed WITHOUT `--npu` looks like: the packer writes the stream into the
+/// node when it stages the panel, so a container without panels names no
+/// stream at all. The refusal for that container is the CLI's, and it names
+/// the packing flag.
+pub fn array_specs(geometry: &Geometry) -> Vec<ConvSpec> {
+    let mut specs = Vec::new();
+    for l in &geometry.graph {
+        if l.op != Op::Conv || l.stream.is_empty() {
+            continue;
+        }
+        let Some(cw) = geometry.convs.get(l.conv as usize) else {
+            continue;
+        };
+        if cw.w.is_empty() {
+            continue;
+        }
+        specs.push(ConvSpec {
+            weight: format!("conv.{}.w", cw.index),
+            stream: l.stream.clone(),
+            k: cw.kin() as usize,
+            n: cw.cout as usize,
+            bias: if cw.b.is_empty() { None } else { Some(cw.b.clone()) },
+        });
+    }
+    specs
+}
+
 /// The pose network: the graph walk and the host GEMM.
 /// Where the host convolutions' time went, accumulated over one run.
 ///
@@ -567,6 +625,24 @@ pub struct NetTimings {
     /// Seconds transposing the WEIGHTS. Zero after the first image: the
     /// transpose happens once, at load.
     pub weight_s: f64,
+    /// Seconds in the array's convolutions, im2col included.
+    ///
+    /// It is the WHOLE span of a convolution on the array -- from the im2col
+    /// that fills A to the NCHW transpose of C -- and not the device's busy
+    /// time: the array's own counters say the device is idle for most of it,
+    /// and a status line that printed only the busy time would report a
+    /// speedup the picture does not have.
+    pub t_array_s: f64,
+    /// Seconds inside the array's dispatch, the A repack excluded.
+    pub t_array_gemm_s: f64,
+    /// Seconds the host spent turning its activations into the device's dtype.
+    pub t_array_repack_s: f64,
+    /// Seconds transposing the array's result back into NCHW.
+    pub t_array_transpose_s: f64,
+    /// How many convolutions ran on the array.
+    pub convs_array: i64,
+    /// How many dispatches the array saw.
+    pub dispatches: i64,
 }
 
 pub struct Network {
@@ -636,7 +712,25 @@ impl Network {
     /// requests that have nothing to do with each other.
     pub fn run_timed(&self, input: &Tensor) -> Result<(Tensor, NetTimings), String> {
         let mut timings = NetTimings::default();
-        let head = self.walk(input, &mut |_, _| {}, &mut timings)?;
+        let head = self.walk(input, &mut |_, _| {}, &mut timings, None)?;
+        Ok((head, timings))
+    }
+
+    /// The same walk, on the array's convolutions.
+    ///
+    /// THE ARRAY, OR THE HOST -- and the flag that chose is not read here:
+    /// the caller passes the array's backend when it wants the convolutions
+    /// on the board, and passes nothing when it does not. A run that asked
+    /// for the array and dispatched nothing is a run that lied, and the way
+    /// to keep it from lying is that the array's backend is the only thing
+    /// that can dispatch at all.
+    pub fn run_timed_on_array(
+        &self,
+        input: &Tensor,
+        array: ArrayRef<'_, '_>,
+    ) -> Result<(Tensor, NetTimings), String> {
+        let mut timings = NetTimings::default();
+        let head = self.walk(input, &mut |_, _| {}, &mut timings, array)?;
         Ok((head, timings))
     }
 
@@ -651,7 +745,21 @@ impl Network {
         input: &Tensor,
         hook: &mut dyn FnMut(usize, &Tensor),
     ) -> Result<Tensor, String> {
-        self.walk(input, hook, &mut NetTimings::default())
+        self.walk(input, hook, &mut NetTimings::default(), None)
+    }
+
+    /// The same walk, on the array's convolutions, with a hook.
+    ///
+    /// THE DUMP MUST COME FROM THE RUN THAT ANSWERED. A dump written by the
+    /// host path while the answer came from the array would compare two
+    /// different networks and call the difference the array's.
+    pub fn run_with_hook_on_array(
+        &self,
+        input: &Tensor,
+        hook: &mut dyn FnMut(usize, &Tensor),
+        array: ArrayRef<'_, '_>,
+    ) -> Result<Tensor, String> {
+        self.walk(input, hook, &mut NetTimings::default(), array)
     }
 
     /// The walk itself: the graph in order, the hook on every node, and the
@@ -661,6 +769,7 @@ impl Network {
         input: &Tensor,
         hook: &mut dyn FnMut(usize, &Tensor),
         timings: &mut NetTimings,
+        mut array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let g = &self.geometry;
         if input.c != 3 {
@@ -694,6 +803,7 @@ impl Network {
                         layer.pad_h,
                         layer.pad_w,
                         timings,
+                        array.as_deref_mut(),
                     )?
                 }
                 Op::Concat => {
@@ -740,6 +850,18 @@ impl Network {
     }
 
     /// One convolution: im2col, the GEMM, and the transpose into NCHW.
+    ///
+    /// THE ARRAY, OR THE HOST, and it is ONE branch in ONE place.
+    ///
+    /// The im2col above the branch is the host's either way: it is a gather,
+    /// and the array's MMAC multiplies matrices. So the two paths cannot
+    /// differ in the part that is easy to get wrong -- the column order --
+    /// and they differ only in who multiplies.
+    ///
+    /// They do NOT produce the same numbers, and that is not a bug: the
+    /// array multiplies the weights rounded to bf16 and the host multiplies
+    /// them in f32, so a run on the array is the same network with a coarser
+    /// weight, and the difference is the width of bf16.
     fn conv(
         &self,
         input: &Tensor,
@@ -749,6 +871,7 @@ impl Network {
         pad_h: i64,
         pad_w: i64,
         timings: &mut NetTimings,
+        mut array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         if input.c != w.cin {
             return Err(format!(
@@ -772,19 +895,50 @@ impl Network {
         let a = im2col(input, w.kh, w.kw, pad_h, pad_w, stride, stride)?;
         let im2col_s = t.elapsed().as_secs_f64();
         let mut c = vec![0.0f32; (m * n) as usize];
+
+        // THE ARRAY'S SPAN, AND THE HOST'S.
+        //
+        // The array's own time is measured around the dispatch, and the
+        // A repack inside it is measured by the backend -- the host's own
+        // work, and not the device's, so it is reported separately rather
+        // than folded into the device's number.
+        let mut array_s = 0.0f64;
+        let mut repack_s = 0.0f64;
+        let mut dispatched = 0i64;
+        let mut convs_array = 0i64;
         let wmat = &self.wmat[self.wmat_at[w.index as usize]..];
-        let t = std::time::Instant::now();
-        gemm_rows(
-            &a,
-            m as usize,
-            wmat,
-            k as usize,
-            n as usize,
-            &w.b,
-            &mut c,
-            self.threads,
-        );
-        let gemm_s = t.elapsed().as_secs_f64();
+        let gemm_s = match array.as_deref_mut() {
+            Some(array) => {
+                let name = format!("conv.{}.w", w.index);
+                let before_dispatch = array.dispatches() as i64;
+                let before_convert = array.convert_seconds();
+                let t = std::time::Instant::now();
+                array
+                    .conv(&name, &a, m as usize, k as usize, n as usize, &mut c)
+                    .map_err(|e| format!("pose conv {name}: {e}"))?;
+                array_s = t.elapsed().as_secs_f64();
+                repack_s = array.convert_seconds() - before_convert;
+                // The dispatch is what is left once the repack is taken out:
+                // the device's multiply, the DMA and the wait.
+                dispatched = array.dispatches() as i64 - before_dispatch;
+                convs_array = 1;
+                (array_s - repack_s).max(0.0)
+            }
+            None => {
+                let t = std::time::Instant::now();
+                gemm_rows(
+                    &a,
+                    m as usize,
+                    wmat,
+                    k as usize,
+                    n as usize,
+                    &w.b,
+                    &mut c,
+                    self.threads,
+                );
+                t.elapsed().as_secs_f64()
+            }
+        };
         let mut out = Tensor {
             c: n,
             h: oh,
@@ -802,9 +956,21 @@ impl Network {
         }
         let elementwise_s = if silu { t.elapsed().as_secs_f64() } else { 0.0 };
         timings.im2col_s += im2col_s;
-        timings.gemm_s += gemm_s;
         timings.transpose_s += transpose_s;
         timings.elementwise_s += elementwise_s;
+        if convs_array > 0 {
+            // The array's span INCLUDES the im2col, because the oracle's does
+            // -- its timer starts before the im2col -- and the two numbers
+            // are only comparable if they span the same work.
+            timings.t_array_s += im2col_s + array_s + transpose_s;
+            timings.t_array_gemm_s += gemm_s;
+            timings.t_array_repack_s += repack_s;
+            timings.t_array_transpose_s += transpose_s;
+            timings.convs_array += convs_array;
+            timings.dispatches += dispatched;
+        } else {
+            timings.gemm_s += gemm_s;
+        }
         Ok(out)
     }
 
