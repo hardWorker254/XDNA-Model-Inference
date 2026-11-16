@@ -63,6 +63,7 @@
 use crate::kernels;
 use crate::pose::Tensor;
 use npum_format::Container;
+use npum_model::array::{ArrayRef, ConvSpec};
 use serde_json::Value;
 use std::path::Path;
 
@@ -160,6 +161,21 @@ pub struct Layer {
     pub out_h: i64,
     /// The declared output columns.
     pub out_w: i64,
+    /// The array's stream this convolution runs on, when the container was
+    /// packed with `--npu`.
+    ///
+    /// It is the SHAPE the convolution is dispatched against -- "conv64x128"
+    /// -- and it is EMPTY for a container packed without the panels: such a
+    /// container names no stream, and a convolution with no stream is a
+    /// convolution the array cannot be asked about.
+    pub stream: String,
+    /// The network this node belongs to -- "palm" or "lm".
+    ///
+    /// It is the NAMESPACE of the network's tensors, and it is what makes a
+    /// panel's name: the two graphs number their convolutions from zero, so
+    /// "conv.3" is two different weights in one container, and the panel
+    /// that goes with it is named by the network too.
+    pub net: String,
     /// The operands; -1 is the image.
     pub inputs: Vec<i32>,
 }
@@ -195,6 +211,50 @@ impl ConvW {
     pub fn depthwise(&self) -> bool {
         self.group > 1
     }
+}
+
+/// The hands family's dense convolutions, as the array's list.
+///
+/// THE LIST IS THE FAMILY'S OWN, and it is built from the GRAPHS rather than
+/// from the container's directory: a panel exists for a convolution the graph
+/// RUNS, and a panel that no op calls is a panel nobody stages.
+///
+/// A convolution with no stream is left out, and that is what a container
+/// packed WITHOUT `--npu` looks like: the packer writes the stream into the
+/// node when it stages the panel, so a container without panels names no
+/// stream at all. The refusal for that container is the CLI's, and it names
+/// the packing flag.
+///
+/// THE DEPTHWISE CONVOLUTIONS ARE LEFT OUT ON PURPOSE. A depthwise filter
+/// reduces WITHIN one channel and has no `[M, N]` product in it at all: the
+/// array's instruction stream wants a K-reduction across N output columns,
+/// and a filter that reduces along K within one column is not that.
+pub fn array_specs(geometry: &Geometry) -> Vec<ConvSpec> {
+    let mut specs = Vec::new();
+    for (prefix, graph, convs) in [
+        ("palm", &geometry.palm_graph, &geometry.palm_convs),
+        ("lm", &geometry.lm_graph, &geometry.lm_convs),
+    ] {
+        for l in graph {
+            if l.op != Op::Conv || l.stream.is_empty() {
+                continue;
+            }
+            let Some(cw) = convs.get(l.conv as usize) else {
+                continue;
+            };
+            if cw.depthwise() || cw.w.is_empty() {
+                continue;
+            }
+            specs.push(ConvSpec {
+                weight: format!("{prefix}.conv.{}.w", cw.index),
+                stream: l.stream.clone(),
+                k: cw.kin() as usize,
+                n: cw.cout as usize,
+                bias: if cw.b.is_empty() { None } else { Some(cw.b.clone()) },
+            });
+        }
+    }
+    specs
 }
 
 /// One PReLU's slope vector.
@@ -800,6 +860,8 @@ fn read_one_graph(
             out_c: 0,
             out_h: 0,
             out_w: 0,
+            stream: String::new(),
+            net: prefix.to_string(),
             inputs: Vec::new(),
         };
         match op {
@@ -824,6 +886,19 @@ fn read_one_graph(
                 let (sh, sw) = pair(node, "stride", &nl)?;
                 layer.stride_h = sh;
                 layer.stride_w = sw;
+                // THE STREAM, when the container names one.
+                //
+                // It is the packer's word: the packer writes the design's
+                // stream into the node it stages the panel for, and a
+                // container packed WITHOUT the panels names none. A default
+                // invented here would be a stream the design does not carry,
+                // and a convolution dispatched against a missing slot is a
+                // wrong answer rather than an error.
+                layer.stream = node
+                    .get("stream")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
             }
             Op::MaxPool => {
                 let (kh, kw) = pair(node, "kernel", &nl)?;
@@ -1385,6 +1460,24 @@ pub struct Cost {
     pub t_elementwise: f64,
     /// Seconds in the landmark head's global average pool.
     pub t_pool: f64,
+    /// Seconds in the array's convolutions, im2col included.
+    ///
+    /// It is the WHOLE span of a convolution on the array -- from the im2col
+    /// that fills A to the NCHW transpose of C -- and not the device's busy
+    /// time: the array's own counters say the device is idle for most of it,
+    /// and a status line that printed only the busy time would report a
+    /// speedup the picture does not have.
+    pub t_array_s: f64,
+    /// Seconds inside the array's dispatch, the A repack excluded.
+    pub t_array_gemm_s: f64,
+    /// Seconds the host spent turning its activations into the device's dtype.
+    pub t_array_repack_s: f64,
+    /// Seconds transposing the array's result back into NCHW.
+    pub t_array_transpose_s: f64,
+    /// How many convolutions ran on the array.
+    pub convs_array: i64,
+    /// How many dispatches the array saw.
+    pub dispatches: i64,
 }
 
 /// Both networks, one container.
@@ -1638,6 +1731,7 @@ impl Hands {
             &self.geom.palm_nodes,
             "palm",
             hook,
+            None,
         )
     }
 
@@ -1656,6 +1750,7 @@ impl Hands {
             &self.geom.lm_nodes,
             "lm",
             hook,
+            None,
         )
     }
 
@@ -1677,10 +1772,11 @@ impl Hands {
         names: &[String],
         which: &str,
         hook: &mut dyn FnMut(usize, &Tensor),
+        array: ArrayRef<'_, '_>,
     ) -> Result<Vec<Tensor>, String> {
         let mut cost = Cost::default();
         self.walk_costed(
-            input, graph, convs, net, slopes, names, which, hook, &mut cost,
+            input, graph, convs, net, slopes, names, which, hook, array, &mut cost,
         )
     }
 
@@ -1696,13 +1792,24 @@ impl Hands {
         names: &[String],
         which: &str,
         hook: &mut dyn FnMut(usize, &Tensor),
+        mut array: ArrayRef<'_, '_>,
         cost: &mut Cost,
     ) -> Result<Vec<Tensor>, String> {
         let mut vals: Vec<Tensor> = vec![Tensor::default(); graph.len()];
         for (i, layer) in graph.iter().enumerate() {
             let name = names.get(i).map(|s| s.as_str()).unwrap_or("?");
             let nl = format!("{which} node {i} '{name}'");
-            let out = self.eval(layer, &vals, input, convs, net, slopes, &nl, cost)?;
+            let out = self.eval(
+                layer,
+                &vals,
+                input,
+                convs,
+                net,
+                slopes,
+                &nl,
+                cost,
+                array.as_deref_mut(),
+            )?;
             vals[i] = out;
             // The hook fires on the node's OUTPUT, so it sees the activation
             // too: an activation fused into the convolution is part of what the
@@ -1725,6 +1832,7 @@ impl Hands {
         slopes: &[Slope],
         label: &str,
         cost: &mut Cost,
+        array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let operand = |idx: i32| -> Result<&Tensor, String> {
             if idx == -1 {
@@ -1771,7 +1879,7 @@ impl Hands {
                         layer.conv
                     ));
                 };
-                self.conv(first, layer, conv, net, slope, label, cost)
+                self.conv(first, layer, conv, net, slope, label, cost, array)
             }
             Op::DwConv => {
                 let conv = convs.get(layer.conv as usize).filter(|c| !c.w.is_empty());
@@ -1801,6 +1909,18 @@ impl Hands {
     }
 
     /// The dense convolution: im2col, the shared GEMM, and the transpose.
+    ///
+    /// THE ARRAY, OR THE HOST, and it is ONE branch in ONE place.
+    ///
+    /// The im2col above the branch is the host's either way: it is a gather,
+    /// and the array's MMAC multiplies matrices. So the two paths cannot
+    /// differ in the part that is easy to get wrong -- the column order --
+    /// and they differ only in who multiplies.
+    ///
+    /// They do NOT produce the same numbers, and that is not a bug: the
+    /// array multiplies the weights rounded to bf16 and the host multiplies
+    /// them in f32, so a run on the array is the same network with a coarser
+    /// weight, and the difference is the width of bf16.
     #[allow(clippy::too_many_arguments)]
     fn conv(
         &self,
@@ -1811,6 +1931,7 @@ impl Hands {
         slope: Option<&[f32]>,
         label: &str,
         cost: &mut Cost,
+        mut array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let (oh, ow) = check_extent(layer, input.h, input.w, w.kh, w.kw, label)?;
         if w.cin != input.c {
@@ -1852,9 +1973,43 @@ impl Hands {
         let k = w.kin() as usize;
         let n = w.cout as usize;
         let mut c = vec![0.0f32; m * n];
-        let t = std::time::Instant::now();
-        gemm_rows(&a, m, wmat, k, n, &w.b, &mut c, self.threads);
-        cost.t_gemm += t.elapsed().as_secs_f64();
+        // THE ARRAY'S SPAN, AND THE HOST'S.
+        //
+        // The array's own time is measured around the dispatch, and the
+        // A repack inside it is measured by the backend -- the host's own
+        // work, and not the device's, so it is reported separately rather
+        // than folded into the device's number.
+        let mut array_s = 0.0f64;
+        let mut repack_s = 0.0f64;
+        let mut dispatched = 0i64;
+        let mut convs_array = 0i64;
+        let gemm_s = match array.as_deref_mut() {
+            Some(array) => {
+                // The panel's name is the weight's own, and the two graphs'
+                // convolutions are namespaced -- "palm.conv.3.w" and
+                // "lm.conv.3.w" are two different panels.
+                let name = format!("{}.conv.{}.w", layer.net, w.index);
+                let before_dispatch = array.dispatches() as i64;
+                let before_convert = array.convert_seconds();
+                let t = std::time::Instant::now();
+                array
+                    .conv(&name, &a, m, k, n, &mut c)
+                    .map_err(|e| format!("{label}: {e}"))?;
+                array_s = t.elapsed().as_secs_f64();
+                repack_s = array.convert_seconds() - before_convert;
+                // The dispatch is what is left once the repack is taken out:
+                // the device's multiply, the DMA and the wait.
+                dispatched = array.dispatches() as i64 - before_dispatch;
+                convs_array = 1;
+                (array_s - repack_s).max(0.0)
+            }
+            None => {
+                let t = std::time::Instant::now();
+                gemm_rows(&a, m, wmat, k, n, &w.b, &mut c, self.threads);
+                t.elapsed().as_secs_f64()
+            }
+        };
+        cost.t_gemm += gemm_s;
         let mut out = Tensor {
             c: w.cout,
             h: oh,
@@ -1871,8 +2026,21 @@ impl Hands {
             layer.act,
             slope.unwrap_or(empty),
         );
-        cost.t_transpose += t.elapsed().as_secs_f64();
-        cost.convs_host += 1;
+        let transpose_s = t.elapsed().as_secs_f64();
+        cost.t_transpose += transpose_s;
+        if convs_array > 0 {
+            // The array's span INCLUDES the im2col, because the oracle's does
+            // -- its timer starts before the im2col -- and the two numbers
+            // are only comparable if they span the same work.
+            cost.t_array_s += array_s + transpose_s;
+            cost.t_array_gemm_s += gemm_s;
+            cost.t_array_repack_s += repack_s;
+            cost.t_array_transpose_s += transpose_s;
+            cost.convs_array += convs_array;
+            cost.dispatches += dispatched;
+        } else {
+            cost.convs_host += 1;
+        }
         Ok(out)
     }
 
@@ -2349,6 +2517,7 @@ impl Hands {
             &self.geom.palm_nodes,
             "palm",
             hook,
+            None,
             cost,
         )
     }
@@ -2369,6 +2538,59 @@ impl Hands {
             &self.geom.lm_nodes,
             "lm",
             hook,
+            None,
+            cost,
+        )
+    }
+
+    /// The palm detector's walk, on the array's convolutions.
+    ///
+    /// THE ARRAY, OR THE HOST -- and the flag that chose is not read here:
+    /// the caller passes the array's backend when it wants the convolutions
+    /// on the board, and passes nothing when it does not. A run that asked
+    /// for the array and dispatched nothing is a run that lied, and the way
+    /// to keep it from lying is that the array's backend is the only thing
+    /// that can dispatch at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_palm_costed_on_array(
+        &self,
+        input: &Tensor,
+        hook: &mut dyn FnMut(usize, &Tensor),
+        array: ArrayRef<'_, '_>,
+        cost: &mut Cost,
+    ) -> Result<Vec<Tensor>, String> {
+        self.walk_costed(
+            input,
+            &self.geom.palm_graph,
+            &self.geom.palm_convs,
+            &self.palm,
+            &self.geom.palm_slopes,
+            &self.geom.palm_nodes,
+            "palm",
+            hook,
+            array,
+            cost,
+        )
+    }
+
+    /// The landmark network's walk, on the array's convolutions.
+    pub fn run_lm_costed_on_array(
+        &self,
+        input: &Tensor,
+        hook: &mut dyn FnMut(usize, &Tensor),
+        array: ArrayRef<'_, '_>,
+        cost: &mut Cost,
+    ) -> Result<Vec<Tensor>, String> {
+        self.walk_costed(
+            input,
+            &self.geom.lm_graph,
+            &self.geom.lm_convs,
+            &self.lm,
+            &self.geom.lm_slopes,
+            &self.geom.lm_nodes,
+            "lm",
+            hook,
+            array,
             cost,
         )
     }

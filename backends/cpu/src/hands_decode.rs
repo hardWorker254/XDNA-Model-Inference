@@ -1019,6 +1019,20 @@ pub struct Run {
     pub crop_pad_bias: [f64; 2],
     /// The crop's mean luminance in [0, 1].
     pub crop_mean: f64,
+    /// How many dispatches the array saw, over both networks.
+    ///
+    /// It is the BACKEND's count and not the sum of the two networks': one
+    /// backend serves both graphs, so adding their readings would count every
+    /// dispatch twice.
+    pub array_dispatches: i64,
+    /// Seconds the array spent on the device, over both networks.
+    pub array_s: f64,
+    /// Seconds the host spent turning its activations into the device's dtype.
+    pub array_repack_s: f64,
+    /// Seconds the host spent transposing the array's result back into NCHW.
+    pub array_transpose_s: f64,
+    /// How many convolutions ran on the array, over both networks.
+    pub array_convs: i64,
 }
 
 /// Where a dump hook wants the pipeline to report.
@@ -1029,11 +1043,18 @@ pub struct Run {
 pub type Hook<'a> = dyn FnMut(&str, usize, &Tensor) + 'a;
 
 /// One frame through both networks, with the whole decode between them.
+///
+/// `array` is the array's backend, when the run asked for the array: the
+/// palm detector and the landmark network then dispatch their DENSE
+/// convolutions to the board, and the depthwise ones stay on the host -- a
+/// depthwise filter reduces WITHIN one channel and has no `[M, N]` product
+/// in it to dispatch.
 pub fn detect(
     model: &Hands,
     im: &Image,
     max_hands: i64,
     hook: &mut Hook<'_>,
+    mut array: npum_model::array::ArrayRef<'_, '_>,
 ) -> Result<Run, String> {
     if im.empty() {
         return Err("the image decoded to nothing".into());
@@ -1061,8 +1082,19 @@ pub fn detect(
     let t1 = std::time::Instant::now();
     let mut cost = crate::hands::Cost::default();
     let mut on_node = |i: usize, t: &Tensor| hook("palm", i, t);
-    let pnodes = model.run_palm_costed(&palm_in, &mut on_node, &mut cost)?;
+    let pnodes = model.run_palm_costed_on_array(&palm_in, &mut on_node, array.as_deref_mut(), &mut cost)?;
     r.palm_s = t1.elapsed().as_secs_f64();
+    // THE ARRAY'S COUNTERS, over both networks.
+    //
+    // The host-side spans ARE per network, so they are the ones that are
+    // summed; the device's own time and the dispatch count are the BACKEND's,
+    // and one backend serves both graphs -- so adding the two networks'
+    // readings would count every dispatch twice. They are read once, at the
+    // end of the frame.
+    r.array_s = cost.t_array_gemm_s;
+    r.array_repack_s = cost.t_array_repack_s;
+    r.array_transpose_s = cost.t_array_transpose_s;
+    r.array_convs = cost.convs_array;
     let head = model.palm_head(&pnodes)?;
 
     let t2 = std::time::Instant::now();
@@ -1085,9 +1117,18 @@ pub fn detect(
         let t4 = std::time::Instant::now();
         let mut cost = crate::hands::Cost::default();
         let mut on_node = |j: usize, t: &Tensor| hook("lm", j, t);
-        let lnodes = model.run_lm_costed(&lm_in, &mut on_node, &mut cost)?;
+        let lnodes =
+            model.run_lm_costed_on_array(&lm_in, &mut on_node, array.as_deref_mut(), &mut cost)?;
         let lo = model.lm_head(&lnodes, &mut cost)?;
         r.lm_s += t4.elapsed().as_secs_f64();
+        // THE LANDMARK NETWORK'S SHARE OF THE ARRAY'S TIME.
+        //
+        // The host-side spans are per network, so they add up; the device's
+        // own time is the backend's and is read once, at the end.
+        r.array_s += cost.t_array_gemm_s;
+        r.array_repack_s += cost.t_array_repack_s;
+        r.array_transpose_s += cost.t_array_transpose_s;
+        r.array_convs += cost.convs_array;
 
         if i == 0 {
             r.angle_deg = st.angle;
@@ -1109,6 +1150,9 @@ pub fn detect(
         r.post_s += t5.elapsed().as_secs_f64();
     }
     r.total_s = t0.elapsed().as_secs_f64();
+    // THE BACKEND'S DISPATCH COUNT, read at the very end: the landmark
+    // network runs once per hand, so the count is only final here.
+    r.array_dispatches = array.as_deref().map(|a| a.dispatches() as i64).unwrap_or(0);
     Ok(r)
 }
 
