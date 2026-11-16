@@ -578,6 +578,18 @@ def main() -> int:
                 print(f"  PASS  equal up to the declared export transform -- "
                       f"{decl.sentence}")
 
+        if not args.keep:
+            # One model's pair at a time. The gate holds BOTH packs of EVERY
+            # model until the end otherwise, and the biggest model here is
+            # three gigabytes a pack -- on a 14 GB tmpfs (which is what
+            # tempfile gives you by default) that is the difference between a
+            # run and an ENOSPC, and an ENOSPC looks like a MODEL that failed
+            # rather than like a disk that filled up.
+            for source in ("onnx", "safetensors"):
+                p = work / f"{model_dir.name}-{source}.npue"
+                if p.exists():
+                    p.unlink()
+
     if not args.keep:
         for p in work.glob("*.npue"):
             p.unlink()
