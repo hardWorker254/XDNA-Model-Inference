@@ -252,5 +252,6 @@
     "transcribe": 50359,
     "translate": 50358
   },
-  "transformers_version": "4.31.0.dev0"
+  "transformers_version": "4.38.2",
+  "trust_remote_code": false
 }

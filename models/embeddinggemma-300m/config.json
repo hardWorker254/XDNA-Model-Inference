@@ -56,5 +56,16 @@
   "transformers_version": "4.57.0.dev0",
   "use_bidirectional_attention": true,
   "use_cache": true,
-  "vocab_size": 262144
+  "vocab_size": 262144,
+  "transformers.js_config": {
+    "use_external_data_format": {
+      "model.onnx": 1,
+      "model_fp16.onnx": 1,
+      "model_quantized.onnx": 1,
+      "model_q4.onnx": 1,
+      "model_q4f16.onnx": 1,
+      "model_no_gather_q4.onnx": 1
+    },
+    "kv_cache_dtype": false
+  }
 }
