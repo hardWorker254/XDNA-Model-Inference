@@ -948,23 +948,6 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        // `--npu-ops conv` is a valid mppose request and a valid question, and
-        // this runtime has no answer to it yet: the host path is the ported one.
-        // Accepting the flag and running the host would leave the command line
-        // saying "array" about a run that dispatched nothing -- which is the one
-        // thing this project treats as the worst outcome.
-        if args
-            .value("--npu-ops")
-            .map(|v| v.split(',').any(|c| c.trim() == "conv"))
-            .unwrap_or(false)
-        {
-            eprintln!(
-                "error: --npu-ops conv: the mppose family runs its convolutions on the host \
-                 in this runtime, and the array path is not ported yet. Accepting the flag and \
-                 running the host would make the command line say something the run did not do."
-            );
-            return crate::EXIT_REFUSED;
-        }
         // The other architectures' own flags are REFUSED rather than ignored: they
         // read as "thresholds for the detection" on a mode that also has a
         // detector, and silently dropping them would produce a run whose people
@@ -1027,7 +1010,45 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| arch.to_string());
-        crate::mppose::print_block(&name, network.geometry(), setup_s);
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the DENSE convolutions go to the
+        // array and the depthwise ones stay on the host -- a depthwise
+        // filter reduces WITHIN one channel and has no [M, N] product in it
+        // at all. A container that cannot do it is refused HERE, before the
+        // first image, with the reason.
+        let mut array = if crate::ocr::wants_conv(args) {
+            let specs = npum_cpu::mppose::array_specs(network.geometry());
+            match crate::arrayconv::open(path, &specs, args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        let array_info = array.as_ref().map(|backend| crate::mppose::ArrayInfo {
+            streams: backend.stream_count(),
+            // THE DESIGN'S OWN PATH, or nothing at all: a container that
+            // carries its own set needs nothing beside it, and there is no
+            // path to print.
+            designs: args
+                .value("--artifacts")
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            rows: backend.rows_per_dispatch(),
+            // The panels the container carries, staged once, at load.
+            staged_bytes: backend.staged_bytes(),
+        });
+        crate::mppose::print_block(
+            &name,
+            network.geometry(),
+            setup_s,
+            array_info.as_ref(),
+        );
         let _ = arch;
 
         let dump_path = args.value("--mppose-dump").map(std::path::PathBuf::from);
@@ -1061,7 +1082,13 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
                         d.record(net, node, t);
                     }
                 };
-                npum_cpu::mppose_decode::detect(&network, &decoded, max_people, &mut hook)
+                npum_cpu::mppose_decode::detect(
+                    &network,
+                    &decoded,
+                    max_people,
+                    &mut hook,
+                    array.as_deref_mut(),
+                )
             };
             let run = match run {
                 Ok(r) => r,

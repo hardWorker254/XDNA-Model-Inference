@@ -44,8 +44,27 @@ use std::path::Path;
 /// The 64 KiB the dump reserves for its header.
 const DUMP_HEADER: usize = 1 << 16;
 
+/// What the array says about itself, in the block.
+///
+/// The numbers are the DESIGN's: how many shapes it can compute, where it
+/// came from, and how many bytes of panels the container carries.
+pub struct ArrayInfo {
+    /// How many streams the design set carries.
+    pub streams: usize,
+    /// The design set's directory, as the reader named it.
+    ///
+    /// It is EMPTY when the design came from the container: a container that
+    /// carries its own set needs nothing beside it, and there is no path to
+    /// print.
+    pub designs: String,
+    /// How many rows one dispatch computes.
+    pub rows: usize,
+    /// How many bytes of weight panels are staged on the board.
+    pub staged_bytes: usize,
+}
+
 /// The block, printed to stderr before the first image.
-pub fn print_block(name: &str, g: &Geometry, setup_s: f64) {
+pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&ArrayInfo>) {
     eprintln!("NpuEmbeddings -- mppose (MediaPipe person det + pose landmarks) on the CPU");
     eprintln!(
         "  model      {}: detector {}px, landmarks {}px, {} anchors over {} levels, {} rows \
@@ -84,33 +103,75 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64) {
         g.pose_std.first().copied().unwrap_or(1.0)
     );
     eprintln!("  ops        (npu = dispatched, host = this process)");
-    eprintln!(
-        "             {:<26} {:<5} {}",
-        format!(
-            "{} x conv + {} x dwconv",
-            g.det_dense(),
-            g.det_depthwise()
-        ),
-        "host",
-        format!(
-            "person detector, {} nodes; dwconv has no [M,N] GEMM to dispatch, so it would \
-             not move even with a design set",
-            g.det_graph.len()
-        )
-    );
-    eprintln!(
-        "             {:<26} {:<5} {}",
-        format!(
-            "{} x conv + {} x dwconv",
-            g.pose_dense(),
-            g.pose_depthwise()
-        ),
-        "host",
-        format!(
-            "landmark network, {} nodes, once per person",
-            g.pose_graph.len()
-        )
-    );
+    // WHERE THE CONVOLUTIONS RAN.
+    //
+    // The side is read from the SESSION and not from the flag: a row that
+    // printed "npu" because --npu-ops conv was on the command line would say
+    // so for a run where the design set was missing and everything fell back,
+    // which is the one thing a status block must not do.
+    match array {
+        Some(info) => {
+            eprintln!(
+                "             {:<26} {:<5} {}",
+                format!(
+                    "{} x conv + {} x dwconv",
+                    g.det_dense(),
+                    g.det_depthwise()
+                ),
+                "npu",
+                format!(
+                    "person detector, {} nodes, on the array's {} padded (K, N) slots; \
+                     dwconv has no [M,N] GEMM to dispatch, so it stays here",
+                    g.det_graph.len(),
+                    info.streams
+                )
+            );
+            eprintln!(
+                "             {:<26} {:<5} {}",
+                format!(
+                    "{} x conv + {} x dwconv",
+                    g.pose_dense(),
+                    g.pose_depthwise()
+                ),
+                "npu",
+                format!(
+                    "landmark network, {} nodes, once per person, on the same {} slots \
+                     under a disjoint range",
+                    g.pose_graph.len(),
+                    info.streams
+                )
+            );
+        }
+        None => {
+            eprintln!(
+                "             {:<26} {:<5} {}",
+                format!(
+                    "{} x conv + {} x dwconv",
+                    g.det_dense(),
+                    g.det_depthwise()
+                ),
+                "host",
+                format!(
+                    "person detector, {} nodes; dwconv has no [M,N] GEMM to dispatch, so it \
+                     would not move even with a design set",
+                    g.det_graph.len()
+                )
+            );
+            eprintln!(
+                "             {:<26} {:<5} {}",
+                format!(
+                    "{} x conv + {} x dwconv",
+                    g.pose_dense(),
+                    g.pose_depthwise()
+                ),
+                "host",
+                format!(
+                    "landmark network, {} nodes, once per person",
+                    g.pose_graph.len()
+                )
+            );
+        }
+    }
     eprintln!(
         "             {:<26} {:<5} {}",
         "add, maxpool, resize", "host", "elementwise and memory passes"
@@ -142,6 +203,17 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64) {
         "  setup      {:.3} s (both graphs read, weights transposed once)",
         setup_s
     );
+    // THE PANELS, staged once, at load.
+    //
+    // The row is here and not in the per-image lines because it is a LOAD's
+    // number and not a run's: the panels are staged once and every image
+    // reuses them.
+    if let Some(info) = array {
+        eprintln!(
+            "  array      {:.1} MB of bf16 panels staged, once, at load",
+            info.staged_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
 }
 
 /// The `--mppose-dump` line, once the path is known.
@@ -177,6 +249,20 @@ pub fn print_run(image: &str, r: &Run) {
         r.pose_s * 1e3,
         r.post_s * 1e3
     );
+    // THE ARRAY'S LINE IS PER IMAGE AND NOT IN THE BLOCK, because every
+    // number in it is a property of a RUN and the block is printed before
+    // there has been one. It would read "0 dispatches, 0.0 ms" in the block,
+    // which is true and useless.
+    if r.array_convs > 0 {
+        eprintln!(
+            "             array: {} dispatches, {:.1} ms on the device, {:.1} ms repacking \
+             A and {:.1} ms transposing C on the host",
+            r.array_dispatches,
+            r.array_s * 1e3,
+            r.array_repack_s * 1e3,
+            r.array_transpose_s * 1e3
+        );
+    }
 }
 
 /// The second stage's geometry, on stderr, before the JSON object.

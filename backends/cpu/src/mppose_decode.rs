@@ -161,6 +161,20 @@ pub struct Run {
     pub crop_pad_bias: [f64; 2],
     /// The first crop's mean luminance in [0, 1].
     pub crop_mean: f64,
+    /// How many dispatches the array saw, over both networks.
+    ///
+    /// It is the BACKEND's count and not the sum of the two networks': one
+    /// backend serves both graphs, so adding their readings would count every
+    /// dispatch twice.
+    pub array_dispatches: i64,
+    /// Seconds the array spent on the device, over both networks.
+    pub array_s: f64,
+    /// Seconds the host spent turning its activations into the device's dtype.
+    pub array_repack_s: f64,
+    /// Seconds the host spent transposing the array's result back into NCHW.
+    pub array_transpose_s: f64,
+    /// How many convolutions ran on the array, over both networks.
+    pub array_convs: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -857,11 +871,17 @@ pub fn postprocess(
 /// `hook` is called once per graph node with `(net, node, tensor)`, and once per
 /// network with node `usize::MAX` for the INPUT -- which is the photograph after
 /// the front end, and the first thing a gate should look at.
+///
+/// `array` is the array's backend, when the run asked for the array: the person
+/// detector and the landmark network then dispatch their DENSE convolutions to
+/// the board, and the depthwise ones stay on the host -- a depthwise filter
+/// reduces WITHIN one channel and has no `[M, N]` product in it to dispatch.
 pub fn detect(
     m: &MpPose,
     img: &Image,
     max_people: i64,
     hook: &mut dyn FnMut(&str, usize, &Tensor),
+    mut array: npum_model::array::ArrayRef<'_, '_>,
 ) -> Result<Run, String> {
     let g = m.geometry();
     if img.empty() {
@@ -883,7 +903,12 @@ pub fn detect(
     hook("det", usize::MAX, &det_in);
 
     let t1 = std::time::Instant::now();
-    let dnodes = m.run_det(&det_in, &mut |i, t| hook("det", i, t), &mut r.det_cost)?;
+    let dnodes = m.run_det(
+        &det_in,
+        &mut |i, t| hook("det", i, t),
+        &mut r.det_cost,
+        array.as_deref_mut(),
+    )?;
     r.det_s = t1.elapsed().as_secs_f64();
     let dh = m.det_head(&dnodes)?;
 
@@ -910,7 +935,12 @@ pub fn detect(
         hook("pose", usize::MAX, &pose_in);
 
         let t4 = std::time::Instant::now();
-        let pnodes = m.run_pose(&pose_in, &mut |n, t| hook("pose", n, t), &mut r.pose_cost)?;
+        let pnodes = m.run_pose(
+            &pose_in,
+            &mut |n, t| hook("pose", n, t),
+            &mut r.pose_cost,
+            array.as_deref_mut(),
+        )?;
         let po = m.pose_head(&pnodes)?;
         r.pose_s += t4.elapsed().as_secs_f64();
 
@@ -940,6 +970,19 @@ pub fn detect(
         r.post_s += t5.elapsed().as_secs_f64();
     }
     r.total_s = t0.elapsed().as_secs_f64();
+    // THE ARRAY'S COUNTERS, over both networks.
+    //
+    // The host-side spans ARE per network, so they are the ones that are
+    // summed -- and the landmark network's are summed over the people it ran
+    // for, because its cost is one accumulator for the whole frame. The
+    // device's own time and the dispatch count are the BACKEND's, and one
+    // backend serves both graphs -- so adding the two networks' readings
+    // would count every dispatch twice. They are read once, at the end.
+    r.array_s = r.det_cost.t_array_gemm_s + r.pose_cost.t_array_gemm_s;
+    r.array_repack_s = r.det_cost.t_array_repack_s + r.pose_cost.t_array_repack_s;
+    r.array_transpose_s = r.det_cost.t_array_transpose_s + r.pose_cost.t_array_transpose_s;
+    r.array_convs = r.det_cost.convs_array + r.pose_cost.convs_array;
+    r.array_dispatches = array.as_deref().map(|a| a.dispatches() as i64).unwrap_or(0);
     Ok(r)
 }
 
