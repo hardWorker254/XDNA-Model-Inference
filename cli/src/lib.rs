@@ -32,6 +32,7 @@
 //! * a pin that can never match is refused rather than stored;
 //! * a container of another family names the program that runs it.
 
+pub mod backend;
 pub mod embed;
 pub mod families;
 pub mod flags;
@@ -128,6 +129,20 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
     if let Some(listing) = args.value("--npu-ops") {
         if let Err(reason) = flags::parse_npu_ops(listing) {
             eprintln!("error: {reason}");
+            return EXIT_REFUSED;
+        }
+    }
+
+    // `--backend` is checked against the names this build knows, and it is
+    // checked HERE -- before any model is resolved and before any device
+    // is opened.
+    //
+    // The check is in one place on purpose: a misspelled backend is
+    // refused the same way for every verb, and a name that is not a
+    // backend is never quietly the host.
+    if let Some(name) = args.value("--backend") {
+        if crate::backend::Backend::parse(name).is_none() {
+            eprintln!("error: {}", crate::backend::refuse_unknown(name));
             return EXIT_REFUSED;
         }
     }

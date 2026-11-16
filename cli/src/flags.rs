@@ -62,6 +62,11 @@ pub fn flag_arity(name: &str) -> Option<i32> {
         "--tile-k" => 1,
         "--tile-n" => 1,
         "--npu-ops" => 1,
+        // -- the backend choice: where the ARITHMETIC happens. The host is
+        // the default and the C++'s arithmetic; the GPU is the other one.
+        // A name that is neither is refused by name, like every other
+        // flag this runtime does not accept.
+        "--backend" => 1,
         "--root" => 1,
         // -- read straight off the argument vector by the runtime and the
         // setup headers.

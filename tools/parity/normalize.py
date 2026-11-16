@@ -216,6 +216,19 @@ RULES: list[Rule] = [
         "pid=<PID>",
         "a process id",
     ),
+    _rule(
+        "rust-only-backend-flag",
+        re.compile(r"(?ms)^    --backend cpu\|vulkan\n.*?(?=^    --)"),
+        "",
+        "the Rust runtime has ONE flag the C++ never had: the backend "
+        "choice, which says where the arithmetic happens. The C++ runtime "
+        "had no such flag because it had no second place to run the "
+        "arithmetic in. The block is removed from the comparison so that "
+        "the REST of the help is still compared word for word -- a rule "
+        "that swallowed the whole help would make the help unchecked. If "
+        "the C++ ever grows a --backend flag, this rule must go: it would "
+        "then hide the C++'s own text",
+    ),
 ]
 
 

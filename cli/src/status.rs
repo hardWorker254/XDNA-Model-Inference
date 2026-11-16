@@ -129,6 +129,42 @@ pub struct OpPlace {
     pub device: String,
 }
 
+/// Where one operation runs.
+///
+/// Three places, and the status block says which one it is for every
+/// operation it lists. A row that names the wrong place is worse than no
+/// row: the reader's question is "where did this run", and a row that
+/// answers "the host" about a run that was on the GPU has answered it
+/// wrongly.
+#[derive(Debug, Clone)]
+pub enum OpWhere {
+    /// The host's own kernels.
+    Host,
+    /// The array, and the design that runs the operation.
+    Array(OpPlace),
+    /// The GPU.
+    Gpu {
+        /// The device's name.
+        device: String,
+    },
+}
+
+/// The GPU the run used, and what it ran.
+///
+/// The block's own line for the backend names the passes that are the
+/// GPU's -- and ONLY those. A run that put the projections on the array
+/// and the rest on the GPU has a backend line that says so; a line that
+/// said "the projections, the LayerNorm, the GELU and the softmax on the
+/// GPU" about a run whose projections went to the array would be a line
+/// that lies about the run it describes.
+#[derive(Debug, Clone)]
+pub struct GpuPlace {
+    /// The device's name.
+    pub device: String,
+    /// The passes the GPU runs, in the order the block names them.
+    pub passes: Vec<&'static str>,
+}
+
 /// Where the elementwise passes run.
 ///
 /// `None` for a pass means the host runs it. The flag is the only thing
@@ -136,17 +172,24 @@ pub struct OpPlace {
 /// pass on the host.
 #[derive(Debug, Clone, Default)]
 pub struct Places {
+    /// The GPU the run used, when it used one.
+    ///
+    /// The device's name and the passes it runs. The block says the GPU
+    /// ran the arithmetic even when there is no design set to print the
+    /// per-operation lines after -- which is the case for a run with no
+    /// array in it at all.
+    pub gpu: Option<GpuPlace>,
     /// The LayerNorm's place.
-    pub layn: Option<OpPlace>,
+    pub layn: Option<OpWhere>,
     /// The GELU's place.
-    pub gelu: Option<OpPlace>,
+    pub gelu: Option<OpWhere>,
     /// The softmax's place.
-    pub softm: Option<OpPlace>,
+    pub softm: Option<OpWhere>,
     /// The attention's place.
     ///
     /// It is the projections' set -- `attn_qk` and `attn_av` are streams
     /// INSIDE it -- and so it is the same place the projections would name.
-    pub attn: Option<OpPlace>,
+    pub attn: Option<OpWhere>,
     /// How many bytes of weights the run stages on the device, once.
     ///
     /// Zero on a host run: nothing is staged, because the host's weights
@@ -362,6 +405,22 @@ pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &s
     println!("  artifacts  {artifacts}");
     println!("NpuEmbeddings Rust runtime -- full encode");
     println!("  bo-mode    host_only (data-buffer allocation)");
+    // THE BACKEND, when it is not the host.
+    //
+    // The block's per-operation lines come after the design set's, and a
+    // run with no array in it has no design set and no per-operation
+    // lines -- so the GPU would be invisible in the block, and a reader
+    // would have to take the time split's word for it.
+    //
+    // AND THE PASSES IT NAMES ARE THE PASSES THAT ARE THE GPU'S. A run
+    // that put the projections on the array says so here; a line that
+    // named all four passes about a run whose projections went to the
+    // array would be a line that lies about the run it describes.
+    if let Some(gpu) = &places.gpu {
+        let passes = list(&gpu.passes);
+        println!("  backend   vulkan -- {passes} on the GPU");
+        println!("            ({})", gpu.device);
+    }
     println!(
         "  model      {}: {} tensors, {:.2} MB, checkpoint {}",
         status.model_name,
@@ -471,6 +530,19 @@ pub fn print_tokenizer(vocab: usize) {
     println!("  tokenizer  {vocab} tokens, from the .npum");
 }
 
+/// A list of names, the way a sentence reads.
+///
+/// "a", "a and b", "a, b and c" -- the last name is joined with "and"
+/// and not with a comma, because the line is a sentence and a sentence
+/// with a comma before "and" reads like a list that was cut off.
+fn list(names: &[&str]) -> String {
+    match names {
+        [] => "nothing".to_string(),
+        [one] => (*one).to_string(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    }
+}
+
 /// One operation's row: the code, the long name, and where it runs.
 fn where_host(code: &str, long_name: &str, note: &str) {
     println!("  {code:<6} {long_name:<10} on the HOST (fp32) -- {note}");
@@ -481,24 +553,51 @@ fn where_host(code: &str, long_name: &str, note: &str) {
 /// The array's line names the design and the generation it was built for,
 /// and it is the C++'s line word for word: the design's name (or its kind,
 /// when the design has no name), the architecture number, and the device.
-fn where_op(code: &str, long_name: &str, place: Option<&OpPlace>, note: &str) {
+///
+/// The GPU's line names the device and says that the pass is the GPU's
+/// own. The note under it is the HOST's note -- "N fewer NPU dispatches"
+/// is a statement about the array, and it is true on a GPU run too: the
+/// GPU's pass is a pass the array never makes.
+fn where_op(code: &str, long_name: &str, place: Option<&OpWhere>, note: &str) {
     match place {
-        Some(place) => println!(
+        Some(OpWhere::Array(place)) => println!(
             "  {code:<6} {long_name:<10} on the ARRAY ({}, arch {}{}{})",
             place.name,
             place.arch,
             if place.device.is_empty() { "" } else { " " },
             place.device
         ),
-        None => where_host(code, long_name, note),
+        Some(OpWhere::Gpu { device }) => println!(
+            "  {code:<6} {long_name:<10} on the GPU ({device}, f32) -- the GPU's own pass, and \
+             the NPU dispatch for it is not used"
+        ),
+        _ => where_host(code, long_name, note),
     }
+}
+
+/// What the GPU did, when it did something.
+///
+/// The row is the GPU's own, and it is printed only when there is one: a
+/// host run has no GPU row, and the block's shape is the C++'s.
+#[derive(Debug, Clone)]
+pub struct Gpu {
+    /// The device's name.
+    pub device: String,
+    /// How many operations went to the device.
+    pub dispatches: usize,
 }
 
 /// The time split, printed after the work.
 ///
 /// The rows are the C++'s, in the C++'s order and the C++'s widths, and the
 /// array's own rows are zero -- the host path dispatches nothing.
-pub fn print_time_split(timings: &Timings, lanes: usize, wall_s: f64, dispatches: usize) {
+pub fn print_time_split(
+    timings: &Timings,
+    lanes: usize,
+    wall_s: f64,
+    dispatches: usize,
+    gpu: Option<&Gpu>,
+) {
     let ms = 1e3;
     let busy = timings.busy();
     println!(
@@ -536,6 +635,22 @@ pub fn print_time_split(timings: &Timings, lanes: usize, wall_s: f64, dispatches
     row("host softmax", timings.host_softmax);
     row("host GELU", timings.host_gelu);
     row("bias epilogue", 0.0);
+    // THE GPU'S OWN ROW, and only when the GPU was used.
+    //
+    // The host's rows above are ZERO in that case, because the host did
+    // not do those passes: a row named "host LayerNorm" holding the
+    // GPU's time would be a row that lies about where the work
+    // happened.
+    if let Some(gpu) = gpu {
+        println!(
+            "    {:<22} {:>8.1} ms  {pct:>5.1}%   (the GPU's own time: {} dispatches on {})",
+            "gpu",
+            timings.gpu * ms,
+            gpu.dispatches,
+            gpu.device,
+            pct = if busy > 0.0 { 100.0 * timings.gpu / busy } else { 0.0 },
+        );
+    }
     println!(
         "    {:<22} {:>8.1} ms   (whole attention block as counted by the NPU path)",
         "t_npu", 0.0

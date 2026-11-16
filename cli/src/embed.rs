@@ -51,6 +51,7 @@ pub fn run(
     allow_truncation: bool,
     root: &Path,
     args: &crate::flags::Args,
+    mut ops: Box<dyn npum_model::Ops>,
 ) -> Result<Vec<f32>, Refusal> {
     let container = npum_format::Container::open(path).map_err(|e| Refusal {
         code: crate::EXIT_REFUSED,
@@ -110,13 +111,6 @@ pub fn run(
     println!("  input      {} texts", texts.len());
     let started = std::time::Instant::now();
     let mut timings = npum_cpu::bert::Timings::default();
-    // THE ARITHMETIC, for now the host's alone.
-    //
-    // The walk asks a seam for its four operations, and the host's
-    // implementation of that seam is the one that answers here. A second
-    // implementation -- the GPU's -- plugs in at the same place, and
-    // nothing above this line changes.
-    let mut ops = npum_cpu::ops::CpuOps::best();
     let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
     for (index, text) in texts.iter().enumerate() {
         let raw = match prefix {
@@ -147,7 +141,7 @@ pub fn run(
                 &encoding.mask,
                 1,
                 seq,
-                &mut ops,
+                ops.as_mut(),
                 array.as_deref_mut(),
                 eltwise.as_deref_mut(),
             )
@@ -167,7 +161,20 @@ pub fn run(
     let dispatches = array.as_ref().map(|a| a.dispatches()).unwrap_or(0)
         + array.as_ref().map(|a| a.attn_dispatches()).unwrap_or(0)
         + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
-    crate::status::print_time_split(&timings, 4, elapsed, dispatches);
+    // THE GPU'S OWN LINE, when the run used one.
+    //
+    // The row is the GPU's time and the GPU's dispatch count, and it is
+    // printed only when the GPU was used: a host run's split is the
+    // C++'s split, row for row.
+    let gpu = match ops.place() {
+        npum_model::dispatcher::Placement::Vulkan => Some(crate::status::Gpu {
+            device: ops.device().unwrap_or("the GPU").to_string(),
+            dispatches: ops.dispatches(),
+        }),
+        _ => None,
+    };
+    let total = dispatches + gpu.as_ref().map(|g| g.dispatches).unwrap_or(0);
+    crate::status::print_time_split(&timings, 4, elapsed, total, gpu.as_ref());
 
     if let Some(out) = out_path {
         let mut bytes = Vec::with_capacity(vectors.len() * 4);
@@ -355,24 +362,92 @@ pub fn wants_attn(args: &crate::flags::Args) -> bool {
 /// operation runs -- so the answer is read off the design sets' manifests
 /// and not off the board: a manifest holds the design's name, its
 /// generation and its device, and reading one does not need a board.
-pub fn places(path: &Path, root: &Path, args: &Args) -> crate::status::Places {
+///
+/// # AND THE GPU, WHEN THE RUN ASKED FOR IT
+///
+/// `ops` is the arithmetic the run will use. When it is the GPU's, the
+/// projections' GEMM, the LayerNorm, the GELU and the softmax are the
+/// GPU's -- EXCEPT the passes the array took, because the array and the
+/// GPU are not two answers to the same question: the run splits the work
+/// between them, and the block says where each pass went.
+///
+/// The ATTENTION IS NEVER THE GPU'S: the family's score rows are laid
+/// out in the family's own packed layout, with the heads side by side and
+/// the row at the sequence's width, and the shader's attention takes a
+/// different one. So the attention's line says the host, and the run does
+/// the attention on the host.
+pub fn places(
+    path: &Path,
+    root: &Path,
+    args: &Args,
+    ops: &dyn npum_model::Ops,
+) -> crate::status::Places {
     let mut places = crate::status::Places::default();
-    if wants_layernorm(args) {
-        places.layn = op_place(path, root, "layernorm");
-    }
-    if wants_gelu(args) {
-        places.gelu = op_place(path, root, "gelu");
-    }
-    if wants_softmax(args) {
-        places.softm = op_place(path, root, "softmax");
-    }
+    let gpu = match ops.place() {
+        npum_model::dispatcher::Placement::Vulkan => ops
+            .device()
+            .map(|device| crate::status::OpWhere::Gpu {
+                device: device.to_string(),
+            }),
+        _ => None,
+    };
+    // THE ARRAY'S PLACE FIRST, AND THE GPU'S IF THE ARRAY DOES NOT HAVE
+    // IT.
+    //
+    // The order is the order the run uses: a pass the flag named for the
+    // array is the array's, and a pass the array is not running is the
+    // GPU's when the run asked for the GPU. The host is what is left.
+    //
+    // AND THE FLAG IS WHAT DECIDES THE ARRAY'S PASSES, not the design
+    // set's existence: a design set on the disk is not a dispatch, and a
+    // status block that said "on the ARRAY" for a pass the host computed
+    // would be a block that lies. The C++'s block reads it the same way.
+    places.layn = array_place(path, root, "layernorm", wants_layernorm(args))
+        .map(crate::status::OpWhere::Array)
+        .or_else(|| gpu.clone());
+    places.gelu = array_place(path, root, "gelu", wants_gelu(args))
+        .map(crate::status::OpWhere::Array)
+        .or_else(|| gpu.clone());
+    places.softm = array_place(path, root, "softmax", wants_softmax(args))
+        .map(crate::status::OpWhere::Array)
+        .or_else(|| gpu.clone());
     if wants_attn(args) {
         // The attention's streams are inside the projections' set, so the
         // place it names is that set's.
-        places.attn = op_place(path, root, "gemm_rtp");
+        places.attn = op_place(path, root, "gemm_rtp").map(crate::status::OpWhere::Array);
+    }
+    // THE GPU'S OWN PASSES, for the backend's line.
+    //
+    // The line names what the GPU runs and nothing else. The projections
+    // are the array's when the flag asked the array for them, and the
+    // elementwise passes are the array's when the flag asked for those --
+    // so a run that split the work says exactly how it split it.
+    if let Some(device) = ops.device() {
+        let mut passes = Vec::new();
+        if !wants_gemm(args) {
+            passes.push("the projections");
+        }
+        if is_gpu(&places.layn) {
+            passes.push("the LayerNorm");
+        }
+        if is_gpu(&places.gelu) {
+            passes.push("the GELU");
+        }
+        if is_gpu(&places.softm) {
+            passes.push("the softmax");
+        }
+        places.gpu = Some(crate::status::GpuPlace {
+            device: device.to_string(),
+            passes,
+        });
     }
     places.staged_bytes = staged_bytes(path, root, args);
     places
+}
+
+/// Whether a pass runs on the GPU.
+fn is_gpu(place: &Option<crate::status::OpWhere>) -> bool {
+    matches!(place, Some(crate::status::OpWhere::Gpu { .. }))
 }
 
 /// How many bytes of weights the array run stages on the device, once.
@@ -428,6 +503,24 @@ fn design_cols(path: &Path, root: &Path, set: &str) -> Option<usize> {
 fn layers(path: &Path) -> Option<usize> {
     let container = npum_format::Container::open(path).ok()?;
     container.config().get_i64("num_layers").map(|v| v as usize)
+}
+
+/// One design set's place, when the run asked for it.
+///
+/// The flag is what makes a pass the ARRAY's, and the design set is only
+/// where that pass's name comes from. A design set that is on the disk and
+/// that the run did not ask for is a design set nobody dispatched, and
+/// saying "on the ARRAY" about it would be a status block that lies.
+fn array_place(
+    path: &Path,
+    root: &Path,
+    set: &str,
+    asked: bool,
+) -> Option<crate::status::OpPlace> {
+    if !asked {
+        return None;
+    }
+    op_place(path, root, set)
 }
 
 /// One design set's place, from its own manifest.

@@ -48,8 +48,24 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
         warn_if_unpinned(model);
     }
     with_model(model, npum_families::Family::Embed, root, |path, arch| {
+        // THE BACKEND, and the arithmetic it names.
+        //
+        // The choice is made HERE, before the banner: a machine with no
+        // Vulkan device is refused before a status block that would claim
+        // the GPU is printed.
+        let choice = match crate::backend::choose(args) {
+            Ok(choice) => choice,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
         // The banner comes before the refusal, as in the C++.
-        crate::status::announce(path, root, &crate::embed::places(path, root, args));
+        crate::status::announce(
+            path,
+            root,
+            &crate::embed::places(path, root, args, choice.ops.as_ref()),
+        );
         // `--npu-ops` is a valid request and a valid question, and this
         // runtime answers it for five of the codes: the projections, the
         // LayerNorm, the GELU, the softmax and the attention go to the
@@ -92,6 +108,7 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
             allow_truncation,
             root,
             args,
+            choice.ops,
         ) {
             Ok(_) => 0,
             Err(refusal) => {
@@ -344,6 +361,10 @@ pub fn transcribe(args: &Args, root: &Path) -> Outcome {
             eprintln!("error: the audio file {audio} does not exist.");
             return crate::EXIT_REFUSED;
         }
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Stt) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Stt) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -376,6 +397,10 @@ pub fn classify(args: &Args, root: &Path) -> Outcome {
         return crate::EXIT_REFUSED;
     }
     with_model(model, npum_families::Family::Cls, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Cls) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Cls) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -522,6 +547,10 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
         return crate::EXIT_REFUSED;
     }
     with_model(model, npum_families::Family::Pose, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Pose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Pose) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -679,6 +708,10 @@ pub fn hands(args: &Args, root: &Path) -> Outcome {
         return crate::EXIT_REFUSED;
     }
     with_model(model, npum_families::Family::Hands, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Hands) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Hands) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -854,6 +887,10 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
         return crate::EXIT_REFUSED;
     }
     with_model(model, npum_families::Family::MpPose, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::MpPose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::MpPose) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -1032,6 +1069,10 @@ pub fn ocr(args: &Args, root: &Path) -> Outcome {
         return crate::EXIT_REFUSED;
     }
     with_model(model, npum_families::Family::Ocr, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Ocr) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
         if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Ocr) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;

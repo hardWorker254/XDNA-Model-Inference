@@ -162,7 +162,18 @@ impl Ops for VulkanOps {
     }
 
     fn place(&self) -> Placement {
-        Placement::Vulkan
+        // THE PLACE IS WHERE THE ARITHMETIC ACTUALLY HAPPENS.
+        //
+        // A machine with no Vulkan device gets this object's operations on
+        // the host, and the place says the host: a status block that said
+        // "the GPU" about a run the host computed would be a block that
+        // lies, and the CLI refuses `--backend vulkan` on such a machine
+        // anyway -- this is the truth underneath that refusal.
+        if self.backend.has_gpu() {
+            Placement::Vulkan
+        } else {
+            Placement::Host
+        }
     }
 
     fn device(&self) -> Option<&str> {

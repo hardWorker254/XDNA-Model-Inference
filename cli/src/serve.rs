@@ -56,6 +56,20 @@ pub fn serve(
     };
     let arch = container.config_str("arch").unwrap_or_default().to_string();
 
+    // THE SERVER RUNS ON THE HOST, and a flag that says otherwise is
+    // refused rather than ignored.
+    //
+    // The HTTP path answers with the CPU backend's bytes -- the C++'s
+    // bytes -- and the GPU's arithmetic is not wired into the server's
+    // engine yet. So `--backend vulkan` here is refused by name: a server
+    // that answered with the GPU's vectors while the command line said
+    // the GPU, and the banner said the host, would be a server that lied
+    // twice.
+    if args.value("--backend") == Some("vulkan") {
+        eprintln!("error: {}", crate::backend::refuse_server());
+        return crate::EXIT_REFUSED;
+    }
+
     let this_family = match binary {
         "npuaudio" => npum_families::Family::Stt,
         "npuimage" => npum_families::Family::Cls,
