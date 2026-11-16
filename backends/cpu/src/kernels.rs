@@ -1163,12 +1163,6 @@ pub fn gemm(
         }
         .into());
     }
-    if let Some(acc) = acc {
-        let av_acc = acc.to_f32();
-        for (i, v) in cv.iter_mut().enumerate() {
-            *v += av_acc.get(i).copied().unwrap_or(0.0);
-        }
-    }
     let zeros = vec![0.0f32; n];
     for i in 0..m {
         gemm_nt(
@@ -1180,6 +1174,17 @@ pub fn gemm(
             &zeros,
             &mut cv[i * n..(i + 1) * n],
         );
+    }
+    // AFTER the multiply, and not before it: `gemm_nt` WRITES its output
+    // (`out = a * b + bias`), it does not accumulate into it, so adding the
+    // accumulator first would have had it overwritten and `acc` silently
+    // ignored. Nothing in the tree passed `Some` until the GPU backend's gate
+    // did, which is exactly how a dead branch survives a gate.
+    if let Some(acc) = acc {
+        let av_acc = acc.to_f32();
+        for (i, v) in cv.iter_mut().enumerate() {
+            *v += av_acc.get(i).copied().unwrap_or(0.0);
+        }
     }
     let mut bytes = Vec::with_capacity(cv.len() * 4);
     for v in &cv {
