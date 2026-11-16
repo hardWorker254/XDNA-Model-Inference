@@ -325,30 +325,53 @@ pub fn tokenize(args: &Args, root: &Path) -> Outcome {
     })
 }
 
+enum TokenizeTokenizer {
+    WordPiece(npum_tokenizers::wordpiece::WordPiece),
+    Xlmr(npum_tokenizers::xlmr::XlmrTokenizer),
+}
+
+impl TokenizeTokenizer {
+    fn encode_padded(
+        &self,
+        text: &str,
+        max_len: usize,
+    ) -> npum_tokenizers::Result<(npum_tokenizers::Encoding, bool)> {
+        match self {
+            TokenizeTokenizer::WordPiece(t) => t.encode_padded(text, max_len),
+            TokenizeTokenizer::Xlmr(t) => t.encode_padded(text, max_len),
+        }
+    }
+}
+
 /// The tokenizer a container holds.
 ///
-/// The ARCH decides, not the file name: a container that says it is a BERT
-/// model has a BERT vocabulary, whatever it is called on disk.
+/// The ARCH decides, not the file name.
 fn load_tokenizer(
     container: &npum_format::Container,
     arch: &str,
-) -> std::result::Result<npum_tokenizers::wordpiece::WordPiece, String> {
-    // The arch is checked, and the check is not a formality: a Whisper
-    // container's vocabulary is a BYTE-LEVEL one and a BERT container's is a
-    // WORD-PIECE one, and running the wrong tokenizer over the right
-    // vocabulary produces ids that are all valid and all wrong.
-    if arch.contains("whisper") || arch.contains("gemma") || arch.contains("gte_new_rope") {
+) -> std::result::Result<TokenizeTokenizer, String> {
+    if arch.contains("whisper") || arch.contains("gemma") {
         return Err(format!(
             "the {arch} family has its own tokenizer, and this command does not \
              run it yet"
+        ));
+    }
+    if arch.contains("gte_new_rope") || (arch.contains("gte") && arch.contains("rope")) {
+        let blob = container
+            .tensor_bytes("tokenizer.xlmr_table")
+            .map_err(|_| "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string())?;
+        return Ok(TokenizeTokenizer::Xlmr(
+            npum_tokenizers::xlmr::XlmrTokenizer::from_table_bytes(blob)?,
         ));
     }
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .map_err(|_| "the container holds no vocabulary".to_string())?;
     let text = String::from_utf8_lossy(blob);
-    npum_tokenizers::wordpiece::WordPiece::from_lines(&text)
-        .map_err(|e| format!("the vocabulary is unusable: {e}"))
+    Ok(TokenizeTokenizer::WordPiece(
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&text)
+            .map_err(|e| format!("the vocabulary is unusable: {e}"))?,
+    ))
 }
 
 /// `transcribe`.
