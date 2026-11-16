@@ -53,6 +53,7 @@ from npue import (ARCH_GEMMA3_MQA_ROPE_GEGLU, ARCH_GTE_NEW_ROPE_GEGLU,  # noqa: 
                   Writer, gemm_b_layout, layout_hash, mac_for_device, tile_b,
                   to_bf16_bits)
 from onnx_weights import EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP  # noqa: E402
+from xlmr_tokenizer_table import write_table as write_xlmr_table  # noqa: E402
 from npue_tools.weights import (export_digest, open_model,     # noqa: E402
                                 set_prefer)
 
@@ -552,6 +553,104 @@ def _embed(w, model_name, datapath, args, where):
     return r
 
 
+def export_repair(model_dir):
+    """THE NAME REPAIR THIS MODEL'S EXPORT NEEDS, in one place.
+
+    Two consumers ask the same question -- the packer, because it must read the
+    export at all, and the gate, because a key-set comparison between a flat
+    checkpoint and a mangled export would otherwise report every correctly
+    spelled weight as missing. Keeping the answer here means the gate cannot
+    drift into comparing under different rules than the pipeline.
+    """
+    cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    if str(cfg.get("model_type", "")).startswith("gemma"):
+        # The gemma export keeps a "model." root the checkpoint does not have
+        # and renames three tensor families mid-name; both off, as a pair --
+        # stripping alone would hand back the export's spelling.
+        return EMBEDDINGGEMMA_STRIP, EMBEDDINGGEMMA_RENAME
+    return "", ()
+
+
+def source_name_roots(model_dir):
+    """The roots the two sources may put in FRONT OF the checkpoint's names.
+
+    A separate question from `export_repair`, and for a different reason.
+    gemma's export mangles names in the middle (`attn.k_proj` for
+    `self_attn.k_proj`), which needs a rename table; gte's two sources merely
+    disagree about a root: the trust_remote_code checkpoint spells every tensor
+    `new.embeddings...` and optimum's export spells the same tensors
+    `0.auto_model.embeddings...`, because it traced the wrapper module. The
+    packer already accepts both (see the gte strip below, which removes either
+    root per name); this is the same answer for the gate, so a name-level
+    comparison is not asked to treat two spellings of one weight as a loss.
+
+    Returned as an order-independent tuple: a name is stripped of whichever
+    root it carries, once.
+    """
+    cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    if cfg.get("model_type") == "new":
+        return ("0.auto_model.", "new.")
+    return ()
+
+
+def source_name_roots(model_dir):
+    """The roots the two sources may put in FRONT OF the checkpoint's names.
+
+    A separate question from `export_repair`, and for a different reason.
+    gemma's export mangles names in the middle (`attn.k_proj` for
+    `self_attn.k_proj`), which needs a rename table; gte's two sources merely
+    disagree about a root: the trust_remote_code checkpoint spells every tensor
+    `new.embeddings...` and optimum's export spells the same tensors
+    `0.auto_model.embeddings...`, because it traced the wrapper module. The
+    packer already accepts both (see the gte strip below, which removes either
+    root per name); this is the same answer for the gate, so a name-level
+    comparison is not asked to treat two spellings of one weight as a loss.
+
+    Returned as an order-independent tuple: a name is stripped of whichever
+    root it carries, once.
+    """
+    cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    if cfg.get("model_type") == "new":
+        return ("0.auto_model.", "new.")
+    return ()
+
+
+def _st_linear_head(model_dir, sub):
+    """One sentence-transformers head, in the container's GEMM orientation.
+
+    `sub` is "2_Dense" or "3_Dense": the module directories `modules.json`
+    lists, each a `model.safetensors` holding `linear.weight` as torch stores
+    it, (out, in) -- 2_Dense is (3072, 768), 3_Dense (768, 3072). That is the
+    orientation this packer wants its `d*["linear.weight"]` in, because the
+    emit transposes once on the way into the container (`add_gemm_b_host(...,
+    d2["linear.weight"].T)`), exactly as it does for the export's fused
+    `/model/st/dense_*`, which the reader hands over untransposed. Transposing
+    here as well would put both heads in the container backwards -- silently,
+    since the shapes still fit one another.
+    """
+    from pathlib import Path as _Path
+
+    from npue_tools.weights.safetensors import SafetensorsWeights
+
+    path = _Path(model_dir) / sub / "model.safetensors"
+    if not path.exists():
+        raise SystemExit(
+            f"{path} not found -- the sentence-transformers head is a "
+            f"checkpoint of its own, and a flat model.safetensors does not "
+            f"carry it (the ONNX export fuses it in as /model/st/dense_*). "
+            f"Fetch it from the model repository alongside the weights.")
+    reader = SafetensorsWeights(path)
+    try:
+        w = reader.array("linear.weight")
+    except KeyError:
+        raise SystemExit(
+            f"{path} has no 'linear.weight' -- its keys are "
+            f"{sorted(reader.keys())[:6]}")
+    finally:
+        reader.close()
+    return np.ascontiguousarray(w)
+
+
 def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
                tile_n=None, host_only=False,
                int8=False, int4_group=None, smooth_alpha=0.5, smooth_texts=128,
@@ -637,8 +736,8 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
     # than the packers and the reference encoder being rewritten to match one
     # exporter's convention. They are passed as a pair because stripping
     # without renaming would hand this function the export's spelling back.
-    src, weights = load_model(model_dir, strip=EMBEDDINGGEMMA_STRIP,
-                              rename=EMBEDDINGGEMMA_RENAME)
+    strip, rename = export_repair(model_dir)
+    src, weights = load_model(model_dir, strip=strip, rename=rename)
     src_sha = weights.digest
     export_sha = weights.export_digest
     # The sentence-transformers head is no longer a checkpoint of its own: its
@@ -649,8 +748,21 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
     # (3072x768 and 768x3072, matching encoder_gemma.py:210). The leading slash
     # is the exporter's; strip="model." only removes that prefix, so these are
     # looked up verbatim.
-    d2 = {"linear.weight": src["/model/st/dense_1.weight"]}
-    d3 = {"linear.weight": src["/model/st/dense_2.weight"]}
+    if weights.format == "safetensors":
+        # A FLAT CHECKPOINT HAS NO FUSED HEAD. `/model/st/dense_1` exists only
+        # because the exporter inlined the sentence-transformers modules into
+        # one graph; the checkpoint keeps them where sentence-transformers
+        # keeps them, in 2_Dense/model.safetensors and
+        # 3_Dense/model.safetensors, each holding a torch Linear `weight` in
+        # (out, in) -- the orientation `d2`/`d3` are expected in, since the
+        # emit transposes into the container's (in, out) GEMM block. Reading
+        # them from the checkpoint rather than demanding a second copy fused
+        # into model.safetensors is what keeps the two sources comparable.
+        d2 = {"linear.weight": _st_linear_head(model_dir, "2_Dense")}
+        d3 = {"linear.weight": _st_linear_head(model_dir, "3_Dense")}
+    else:
+        d2 = {"linear.weight": src["/model/st/dense_1.weight"]}
+        d3 = {"linear.weight": src["/model/st/dense_2.weight"]}
 
     L = cfg["num_hidden_layers"]
     hidden = cfg["hidden_size"]
@@ -1503,9 +1615,14 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
 
     tok_blob_path = model_dir / "xlmr_tokenizer.bin"
     if not tok_blob_path.exists():
-        raise SystemExit(
-            f"{tok_blob_path} not found -- generate it first with the C++ "
-            f"packer: `npuembeddings --prepare-model`")
+        # THE BLOB IS BUILT HERE. It used to be the C++ packer's job, which
+        # left this packer unable to produce a gte container at all: the
+        # refusal below told the caller to run a binary from the tree this
+        # port replaces. `xlmr_tokenizer_table` is that builder in Python, so
+        # the table is derived from the checkpoint's own tokenizer.json -- and
+        # the file is written where the container builder reads it, so a
+        # second pack reuses the cache instead of rebuilding 5 MB.
+        write_xlmr_table(model_dir / "tokenizer.json", tok_blob_path)
 
     print(f"packing {model_dir.name} -> {Path(out).name}  (arch=gte_new_rope_geglu)")
     print(f"  hidden={hidden} heads={H} head_dim={head_dim} layers={L} "

@@ -154,12 +154,15 @@ def open_model(model_dir, *, strip="", rename=(), prefer=None) -> WeightSource:
         prefer == "auto" and st_path.is_file()
     )
     if use_safetensors:
-        if strip or rename:
-            raise WeightError(
-                f"{model_dir}: strip/rename are the ONNX reader's repair for "
-                f"names an exporter rewrote; {SAFETENSORS_NAME} carries the "
-                f"checkpoint's own names, so the repair does not apply"
-            )
+        # `strip`/`rename` describe what an EXPORTER did to a name -- a root it
+        # added, a mid-name rewrite. A flat checkpoint carries the checkpoint's
+        # own names, so there is nothing to repair and the arguments are simply
+        # not used. Refusing them here was wrong for the one model that passes
+        # them unconditionally: embeddinggemma's branch always hands its export
+        # repair to `load_model`, and with model.safetensors present the pack
+        # would have refused a source that needs no repair at all. What would
+        # catch a genuinely needed rename is the gate, not this refusal: two
+        # packs of one checkpoint either agree byte for byte or say why.
         return SafetensorsWeights(st_path)
     if not onnx_path.is_file():
         raise WeightError(
