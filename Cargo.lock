@@ -633,6 +633,7 @@ dependencies = [
  "npum-format",
  "npum-model",
  "npum-tokenizers",
+ "npum-vulkan",
  "serde",
  "serde_json",
  "tokio",

@@ -208,15 +208,14 @@ pub fn refuse_if_vulkan(args: &Args, family: npum_families::Family) -> Option<St
     }
 }
 
-/// The refusal for the HTTP server.
+/// The refusal for a server family whose engine cannot run on the GPU.
 ///
-/// The server answers with the CPU backend's bytes, and the GPU's
-/// arithmetic is not wired into its engine yet -- the CLI's `embed` verb
-/// is where the GPU's path runs. So the flag is refused here by name.
+/// The embedding endpoint's server engine can use the Vulkan Ops seam;
+/// other families' server engines run on the host.
 pub fn refuse_server() -> String {
-    "--backend vulkan/--vk-ops: the HTTP server runs on the host. The GPU's arithmetic is \
-     wired into the CLI's `embed` verb, and not into the server's engine yet -- a server \
-     that answered with the GPU's vectors while its banner said the host would be a server \
-     that lied. Run the CLI's `embed` if you want the GPU's numbers."
+    "--backend vulkan/--vk-ops: this family's HTTP server engine runs on the host. The GPU's \
+     arithmetic is not wired into this server path yet -- a server that answered with the \
+     GPU's vectors while its engine ran on the host would be a server that lied. (The \
+     embedding endpoint supports --vk-ops/--backend vulkan.)"
         .to_string()
 }

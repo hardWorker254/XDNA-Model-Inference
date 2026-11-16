@@ -56,25 +56,21 @@ pub fn serve(
     };
     let arch = container.config_str("arch").unwrap_or_default().to_string();
 
-    // THE SERVER RUNS ON THE HOST, and a flag that says otherwise is
-    // refused rather than ignored.
-    //
-    // The HTTP path answers with the CPU backend's bytes -- the C++'s
-    // bytes -- and the GPU's arithmetic is not wired into the server's
-    // engine yet. So `--backend vulkan`/`--vk-ops` here is refused by
-    // name: a server that answered with the GPU's vectors while the
-    // command line asked for the GPU would be a server that lied.
-    if args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some() {
-        eprintln!("error: {}", crate::backend::refuse_server());
-        return crate::EXIT_REFUSED;
-    }
-
     let this_family = match binary {
         "npuaudio" => npum_families::Family::Stt,
         "npuimage" => npum_families::Family::Cls,
         _ => npum_families::Family::Embed,
     };
     let family = npum_families::Family::from_arch(&arch).unwrap_or(npum_families::Family::Embed);
+
+    // THE SERVER RUNS ON THE HOST, except the embedding endpoint which can
+    // use the Vulkan Ops seam (like the CLI's embed). Other families'
+    // engines are host-only.
+    let wants_vulkan = args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some();
+    if wants_vulkan && family != npum_families::Family::Embed {
+        eprintln!("error: {}", crate::backend::refuse_server());
+        return crate::EXIT_REFUSED;
+    }
     let belongs = match this_family {
         npum_families::Family::Embed => family == npum_families::Family::Embed,
         npum_families::Family::Stt => family == npum_families::Family::Stt,
@@ -269,7 +265,10 @@ pub fn serve(
     }
     let status = crate::status::read_container(&container, &path);
 
-    let mut state = build_state(binary, &path, &arch, family, &container, &status, root);
+    let mut state = match build_state(binary, &path, &arch, family, &container, &status, root, args) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     if let Some(encoder) = &state.encoder {
         crate::status::print_tokenizer(encoder.vocab_size());
     }
@@ -410,6 +409,28 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
     let _ = binary;
 }
 
+/// Parse Vulkan op selection for the embed server (implies Vulkan).
+fn vulkan_ops_mask(args: &crate::flags::Args) -> std::result::Result<(bool, bool, bool, bool), String> {
+    if let Some(list) = args.value("--vk-ops") {
+        let codes = crate::flags::parse_vk_ops(list)?;
+        if codes.is_empty() {
+            return Err(
+                "--vk-ops: no Vulkan op named. Valid codes: [gemm, layn, gelu, softm]."
+                    .to_string(),
+            );
+        }
+        Ok((
+            codes.contains(&"gemm"),
+            codes.contains(&"layn"),
+            codes.contains(&"gelu"),
+            codes.contains(&"softm"),
+        ))
+    } else {
+        // --backend vulkan with no --vk-ops: all supported ops.
+        Ok((true, true, true, true))
+    }
+}
+
 /// Build the server's state: the bodies and the engine.
 fn build_state(
     binary: &'static str,
@@ -419,7 +440,8 @@ fn build_state(
     container: &npum_format::Container,
     status: &crate::status::Status,
     root: &std::path::Path,
-) -> ServerState {
+    args: &crate::flags::Args,
+) -> std::result::Result<ServerState, i32> {
     let mut state = ServerState::new(&path.display().to_string(), arch, binary);
 
     // The model id: the container's stem, and -- for the TEXT family only
@@ -458,7 +480,7 @@ fn build_state(
             "this model serves /v1/audio/transcriptions, not {}. `npuaudio serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.",
             "/v1/embeddings"
         );
-        return state;
+        return Ok(state);
     }
     if arch.contains("vit") {
         let labels = container
@@ -484,7 +506,7 @@ fn build_state(
             state.model_id
         );
         state.not_found = "this model serves /v1/classify, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
-        return state;
+        return Ok(state);
     }
     if arch.contains("pose") || arch.contains("mediapipe") {
         state.health = format!(
@@ -492,12 +514,33 @@ fn build_state(
             state.model_id
         );
         state.not_found = "this model serves /v1/pose, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
-        return state;
+        return Ok(state);
     }
 
     // The text family: the embedding endpoint.
     let seq = crate::embed::sequence_length(path, container, root, None);
-    match npuembeddings_server::Embedder::open(path, seq) {
+    let wants_vulkan =
+        args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some();
+    let vulkan_ops = if wants_vulkan {
+        match vulkan_ops_mask(args) {
+            Ok(mask) => Some(mask),
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return Err(crate::EXIT_REFUSED);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(mask) = vulkan_ops {
+        // Refuse early if no device, like the CLI does.
+        let probe = npum_vulkan::ops::VulkanOps::with_ops(mask.0, mask.1, mask.2, mask.3);
+        if !probe.has_gpu() {
+            eprintln!("error: {}", crate::backend::refuse_no_gpu());
+            return Err(crate::EXIT_REFUSED);
+        }
+    }
+    match npuembeddings_server::Embedder::open_with_vulkan(path, seq, vulkan_ops) {
         Ok(encoder) => {
             state.health = format!(
                 "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"embeddings\"}}",
@@ -508,9 +551,10 @@ fn build_state(
         }
         Err(reason) => {
             eprintln!("error: {reason}");
+            return Err(crate::EXIT_REFUSED);
         }
     }
-    state
+    Ok(state)
 }
 
 /// Resolve a model's name or path to a container on disk.

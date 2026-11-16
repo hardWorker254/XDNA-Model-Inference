@@ -315,33 +315,46 @@ fn tensor_f32(container: &npum_format::Container, name: &str) -> std::result::Re
 
 /// The embedding endpoint's engine.
 ///
-/// The tokenizer and the model, and the sequence length they run at. The
-/// numbers it produces are the CPU backend's, and they are the C++'s
-/// numbers: the same container through the same arithmetic gives the same
-/// bytes.
+/// The tokenizer and the model, and the sequence length they run at.
+/// By default the arithmetic is the host's (CPU backend bytes, the C++
+/// reference). When Vulkan ops are selected, the chosen operations run on
+/// the GPU through the same `Ops` seam.
 #[derive(Clone)]
 pub struct Embedder {
     tokenizer: npum_tokenizers::wordpiece::WordPiece,
     model: npum_cpu::bert::BertModel,
     seq: usize,
+    vulkan_ops: Option<(bool, bool, bool, bool)>,
 }
 
 impl Embedder {
-    /// Build an engine from a container.
+    /// Build an engine from a container (host arithmetic).
     pub fn open(path: &std::path::Path, seq: usize) -> std::result::Result<Self, String> {
+        Self::open_with_vulkan(path, seq, None)
+    }
+
+    /// Build an engine from a container, optionally selecting Vulkan ops
+    /// `(gemm, layn, gelu, softm)`.
+    pub fn open_with_vulkan(
+        path: &std::path::Path,
+        seq: usize,
+        vulkan_ops: Option<(bool, bool, bool, bool)>,
+    ) -> std::result::Result<Self, String> {
         let container = npum_format::Container::open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let blob = container
             .tensor_bytes("tokenizer.vocab")
             .map_err(|_| "the container holds no vocabulary".to_string())?;
-        let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-            .map_err(|e| format!("the vocabulary is unusable: {e}"))?;
-        let model = npum_cpu::bert::BertModel::open(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let tokenizer =
+            npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+                .map_err(|e| format!("the vocabulary is unusable: {e}"))?;
+        let model =
+            npum_cpu::bert::BertModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Self {
             tokenizer,
             model,
             seq,
+            vulkan_ops,
         })
     }
 
@@ -358,11 +371,7 @@ impl Embedder {
     /// Embed the texts.
     ///
     /// The vectors and the token count, which the usage block reports.
-    pub fn embed(
-        &self,
-        texts: &[String],
-    ) -> std::result::Result<(Vec<Vec<f32>>, usize), String> {
-        let hidden = self.model.spec.hidden;
+    pub fn embed(&self, texts: &[String]) -> std::result::Result<(Vec<Vec<f32>>, usize), String> {
         let mut vectors = Vec::with_capacity(texts.len());
         let mut tokens = 0usize;
         for text in texts {
@@ -371,17 +380,25 @@ impl Embedder {
                 .encode_padded(text, self.seq)
                 .map_err(|e| e.to_string())?;
             tokens += encoding.mask.iter().filter(|m| **m > 0).count();
-            // THE ARITHMETIC GOES THROUGH THE SEAM, and on the server it is
-            // the host's: the HTTP path answers with the CPU backend's
-            // bytes, which are the C++'s bytes.
-            let mut ops = npum_cpu::ops::CpuOps::best();
-            let chunk = self
-                .model
-                .embed(&encoding.ids, &encoding.mask, 1, self.seq, &mut ops, None, None)
-                .map_err(|e| e.to_string())?;
+            let chunk = if let Some((gemm, layn, gelu, softm)) = self.vulkan_ops {
+                let mut ops = npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm);
+                if !ops.has_gpu() {
+                    return Err(
+                        "no Vulkan device was opened on this machine for --vk-ops/--backend vulkan"
+                            .to_string(),
+                    );
+                }
+                self.model
+                    .embed(&encoding.ids, &encoding.mask, 1, self.seq, &mut ops, None, None)
+                    .map_err(|e| e.to_string())?
+            } else {
+                let mut ops = npum_cpu::ops::CpuOps::best();
+                self.model
+                    .embed(&encoding.ids, &encoding.mask, 1, self.seq, &mut ops, None, None)
+                    .map_err(|e| e.to_string())?
+            };
             vectors.push(chunk);
         }
-        let _ = hidden;
         Ok((vectors, tokens))
     }
 }
