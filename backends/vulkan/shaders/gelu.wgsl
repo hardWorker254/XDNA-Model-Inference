@@ -5,7 +5,15 @@
 // a different function would be a tolerance to explain rather than a
 // backend.
 
+struct Params {
+    count: u32,
+    _pad: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
 @group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
 
 fn gelu(v: f32) -> f32 {
     let u = min(abs(v), 4.0);
@@ -24,7 +32,7 @@ fn gelu(v: f32) -> f32 {
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i < arrayLength(&x)) {
+    if (i < params.count) {
         x[i] = gelu(x[i]);
     }
 }

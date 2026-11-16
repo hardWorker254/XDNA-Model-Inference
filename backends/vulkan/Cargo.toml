@@ -12,6 +12,7 @@ authors.workspace = true
 default = []
 
 [dependencies]
+ash = "0.38"
 npum-cpu.workspace = true
 npum-format.workspace = true
 npum-model.workspace = true
@@ -19,3 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[build-dependencies]
+# The WGSL front end and the SPIR-V back end, and nothing else: the shaders
+# are compiled here rather than at start-up.
+naga = { version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }

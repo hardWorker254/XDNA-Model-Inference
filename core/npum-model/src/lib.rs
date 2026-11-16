@@ -67,6 +67,18 @@ pub enum Error {
 
     #[error(transparent)]
     Tensor(#[from] TensorError),
+
+    /// An operation failed inside a backend -- a driver error, a device that
+    /// went away, a dispatch the GPU refused. The detail names the operation
+    /// and what the driver said, because "the GPU failed" is the same
+    /// message for every cause and teaches the reader nothing.
+    #[error("the {backend} backend failed: {detail}")]
+    Backend {
+        /// The backend's `--backend` name.
+        backend: &'static str,
+        /// What happened, with the operation named.
+        detail: String,
+    },
 }
 
 /// The result type of this crate.

@@ -1,4 +1,17 @@
-//! The shaders: WGSL, compiled at build time and embedded.
+//! The shaders: WGSL compiled to SPIR-V at build time and embedded.
+//!
+//! # Where the source is
+//!
+//! `backends/vulkan/shaders/*.wgsl`. `build.rs` compiles each one with naga
+//! and writes the words into `OUT_DIR/shaders_spv.rs`, which is included
+//! below: a shader that does not parse or does not validate is a build
+//! failure, not a run-time one.
+//!
+//! # Why the constants are `&[u32]`
+//!
+//! `vkCreateShaderModule` reads the module as 32-bit words, and a byte slice
+//! from `include_bytes!` is not guaranteed to be four-byte aligned. A
+//! generated source of `u32` literals has no alignment question at all.
 //!
 //! # Why the GELU shader is a polynomial and not an erf
 //!
@@ -16,29 +29,10 @@
 //! whenever the values are narrowed, and the NaN that one masked element
 //! produces destroys a whole row.
 
-/// The GELU shader: the same degree-8 polynomial the CPU kernel uses.
-pub const GELU: &str = include_str!("../shaders/gelu.wgsl");
-
-/// The layer-normalisation shader.
-pub const LAYERNORM: &str = include_str!("../shaders/layernorm.wgsl");
-
-/// The softmax shader.
-pub const SOFTMAX: &str = include_str!("../shaders/softmax.wgsl");
-
-/// The GEMM shader.
-pub const GEMM: &str = include_str!("../shaders/gemm.wgsl");
-
-/// The attention shader.
-pub const ATTENTION: &str = include_str!("../shaders/attention.wgsl");
-
-/// The elementwise addition shader.
-pub const ADD: &str = include_str!("../shaders/add.wgsl");
-
-/// The elementwise multiplication shader.
-pub const MUL: &str = include_str!("../shaders/mul.wgsl");
+include!(concat!(env!("OUT_DIR"), "/shaders_spv.rs"));
 
 /// Every shader, by name.
-pub const ALL: [(&str, &str); 7] = [
+pub const ALL: [(&str, &[u32]); 7] = [
     ("gemm", GEMM),
     ("gelu", GELU),
     ("layernorm", LAYERNORM),

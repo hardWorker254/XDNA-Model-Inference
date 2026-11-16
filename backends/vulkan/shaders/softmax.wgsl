@@ -19,7 +19,7 @@ struct Params {
 }
 
 @group(0) @binding(0) var<storage, read_write> x: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(5) var<uniform> params: Params;
 
 const FLOOR_LOAD: f32 = -1e30;
 const FLOOR_DIFF: f32 = -100.0;
@@ -32,6 +32,9 @@ var<workgroup> partial: array<f32, 64>;
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
     let row = wid.x;
+    if (row >= params.rows) {
+        return;
+    }
     let base = row * params.width;
 
     var m: f32 = -3.402823e38;
@@ -47,6 +50,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     for (var i = 0u; i < 64u; i = i + 1u) {
         mx = max(mx, partial[i]);
     }
+    workgroupBarrier();
 
     var sum: f32 = 0.0;
     for (var i = lid.x; i < params.width; i = i + 64u) {
@@ -64,6 +68,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         total = total + partial[i];
     }
     let inv = select(0.0, 1.0 / total, total > 0.0);
+    workgroupBarrier();
 
     for (var i = lid.x; i < params.width; i = i + 64u) {
         x[base + i] = x[base + i] * inv;
