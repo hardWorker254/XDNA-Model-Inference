@@ -214,9 +214,14 @@ pub fn conv<T: Transport>(
         // Only the CHUNK'S OWN ROWS are touched: the rows past the chunk
         // keep their old values, and the design's GEMM is row-wise, so they
         // can only reach their own output rows -- which are not read.
+        //
+        // THE ZEROING IS INSIDE THE TIMER, because it is the host's work and
+        // not the device's: it is the padded columns being prepared for the
+        // device, and a "time on the device" that carried it would report the
+        // host's bookkeeping as the device's arithmetic.
         let row_bytes = shape.padded_k * dp.a_bytes;
-        scratch.a_packed[..chunk * row_bytes].fill(0);
         let t_convert = std::time::Instant::now();
+        scratch.a_packed[..chunk * row_bytes].fill(0);
         for r in 0..chunk {
             let src = (done + r) * shape.k;
             let dst = r * row_bytes;
