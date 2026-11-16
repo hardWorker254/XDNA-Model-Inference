@@ -26,9 +26,18 @@ use npum_model::dispatcher::Placement;
 use npum_model::{Ops, Result};
 
 /// The GPU's arithmetic.
+///
+/// The four operations can be selected individually (`--vk-ops`): an
+/// operation not in the selection runs on the host's kernels, so a run
+/// can mix GPU and host arithmetic per op. "Nothing selected" and "all
+/// selected" are the same run -- the whole supported set on the GPU.
 pub struct VulkanOps {
     backend: VulkanBackend,
     dispatches: usize,
+    gemm: bool,
+    layn: bool,
+    gelu: bool,
+    softm: bool,
 }
 
 impl Default for VulkanOps {
@@ -38,16 +47,24 @@ impl Default for VulkanOps {
 }
 
 impl VulkanOps {
-    /// A GPU that is there, or a GPU that is not.
-    ///
-    /// A machine with no Vulkan device gets an object whose operations run
-    /// on the host -- the same numbers the host backend gives. The CLI
-    /// refuses `--backend vulkan` on such a machine instead of letting this
-    /// happen quietly.
+    /// A GPU with every supported operation enabled.
     pub fn new() -> Self {
+        Self::with_ops(true, true, true, true)
+    }
+
+    /// A GPU with a selected set of operations enabled.
+    ///
+    /// Operations with `false` run on the host's own kernels, so the
+    /// arithmetic stays correct and the dispatch count reflects only the
+    /// work that actually went to the device.
+    pub fn with_ops(gemm: bool, layn: bool, gelu: bool, softm: bool) -> Self {
         Self {
             backend: VulkanBackend::new(),
             dispatches: 0,
+            gemm,
+            layn,
+            gelu,
+            softm,
         }
     }
 
@@ -86,6 +103,10 @@ impl Ops for VulkanOps {
         bias: &[f32],
         out: &mut [f32],
     ) -> Result<()> {
+        if !self.gemm {
+            npum_cpu::kernels::gemm_nt(a, m, b, k, n, bias, out);
+            return Ok(());
+        }
         let Some(gpu) = self.backend.device_mut() else {
             npum_cpu::kernels::gemm_nt(a, m, b, k, n, bias, out);
             return Ok(());
@@ -118,6 +139,12 @@ impl Ops for VulkanOps {
         gamma: &[f32],
         beta: &[f32],
     ) -> Result<()> {
+        if !self.layn {
+            for row in values.chunks_mut(width) {
+                npum_cpu::kernels::layernorm_row(row, gamma, beta)?;
+            }
+            return Ok(());
+        }
         let Some(gpu) = self.backend.device_mut() else {
             for row in values.chunks_mut(width) {
                 npum_cpu::kernels::layernorm_row(row, gamma, beta)?;
@@ -137,6 +164,12 @@ impl Ops for VulkanOps {
     }
 
     fn gelu(&mut self, x: &mut [f32]) -> Result<()> {
+        if !self.gelu {
+            for v in x.iter_mut() {
+                *v = npum_cpu::kernels::gelu_f32(*v);
+            }
+            return Ok(());
+        }
         let Some(gpu) = self.backend.device_mut() else {
             for v in x.iter_mut() {
                 *v = npum_cpu::kernels::gelu_f32(*v);
@@ -149,6 +182,12 @@ impl Ops for VulkanOps {
     }
 
     fn softmax_rows(&mut self, values: &mut [f32], rows: usize, width: usize) -> Result<()> {
+        if !self.softm {
+            for row in values.chunks_mut(width) {
+                npum_cpu::kernels::softmax_row(row)?;
+            }
+            return Ok(());
+        }
         let Some(gpu) = self.backend.device_mut() else {
             for row in values.chunks_mut(width) {
                 npum_cpu::kernels::softmax_row(row)?;

@@ -67,6 +67,11 @@ pub fn flag_arity(name: &str) -> Option<i32> {
         // A name that is neither is refused by name, like every other
         // flag this runtime does not accept.
         "--backend" => 1,
+        // -- the GPU's ops, selected like --npu-ops: a comma-separated list
+        // of codes (gemm, layn, gelu, softm). Given alone it implies the
+        // Vulkan backend; given with --backend vulkan it narrows it. The
+        // rest of the arithmetic stays on the host.
+        "--vk-ops" => 1,
         "--root" => 1,
         // -- read straight off the argument vector by the runtime and the
         // setup headers.
@@ -252,6 +257,28 @@ pub fn npu_op_codes() -> String {
         .join(", ")
 }
 
+/// The operation codes `--vk-ops` takes.
+///
+/// The Vulkan backend implements the same four operations the `Ops` seam
+/// exposes (gemm, layernorm, gelu, softmax). A code not in this list is
+/// refused by name -- and `attn`/`conv`/... are NPU-array concerns, not
+/// Vulkan dispatches.
+pub const VK_OP_CODES: &[(&str, &str)] = &[
+    ("gemm", "the per-layer GEMMs"),
+    ("layn", "LayerNorm"),
+    ("gelu", "GELU"),
+    ("softm", "softmax"),
+];
+
+/// The Vulkan op codes, comma-joined.
+pub fn vk_op_codes() -> String {
+    VK_OP_CODES
+        .iter()
+        .map(|(code, _)| *code)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The refusal for a removed flag, if one of them was given.
 ///
 /// The refusal is checked against the WHOLE argument vector, not against the
@@ -309,6 +336,16 @@ pub fn refuse_unknown_npu_op(code: &str) -> String {
     )
 }
 
+/// The refusal for a Vulkan op code this build does not know.
+pub fn refuse_unknown_vk_op(code: &str) -> String {
+    format!(
+        "--vk-ops: '{code}' is not a Vulkan op this build knows. Valid codes: [{}] \
+         (gemm = the per-layer GEMMs, layn = LayerNorm, gelu = GELU, softm = softmax). \
+         Nothing listed means every supported op runs on the host.",
+        vk_op_codes()
+    )
+}
+
 /// The codes `--npu-ops` was given.
 ///
 /// The LAST occurrence of the flag wins, and an empty component is skipped,
@@ -330,6 +367,30 @@ pub fn parse_npu_ops(list: &str) -> Result<Vec<&'static str>, String> {
                 }
             }
             None => return Err(refuse_unknown_npu_op(code)),
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// The codes `--vk-ops` was given.
+///
+/// Same rules as `parse_npu_ops`: LAST occurrence wins, empty components
+/// skipped, sorted and deduplicated.
+pub fn parse_vk_ops(list: &str) -> Result<Vec<&'static str>, String> {
+    let mut out = Vec::new();
+    for item in list.split(',') {
+        let code = item.trim();
+        if code.is_empty() {
+            continue;
+        }
+        match VK_OP_CODES.iter().find(|(known, _)| *known == code) {
+            Some((known, _)) => {
+                if !out.contains(known) {
+                    out.push(*known);
+                }
+            }
+            None => return Err(refuse_unknown_vk_op(code)),
         }
     }
     out.sort_unstable();

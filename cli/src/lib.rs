@@ -134,6 +134,32 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
         }
     }
 
+    // `--vk-ops` selects which operations go to the Vulkan backend. It is
+    // checked early, and the refusal names the valid codes.
+    if let Some(listing) = args.value("--vk-ops") {
+        match flags::parse_vk_ops(listing) {
+            Ok(codes) if codes.is_empty() => {
+                eprintln!(
+                    "error: --vk-ops: no Vulkan op named. Valid codes: [gemm, layn, gelu, softm]. \
+                     Name at least one op to offload, or drop --vk-ops to run on the host."
+                );
+                return EXIT_REFUSED;
+            }
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return EXIT_REFUSED;
+            }
+            Ok(_) => {}
+        }
+        if args.value("--backend") == Some("cpu") {
+            eprintln!(
+                "error: --vk-ops selects operations for the Vulkan backend, but --backend cpu was \
+                 given. Drop --backend cpu, or drop --vk-ops to run everything on the host."
+            );
+            return EXIT_REFUSED;
+        }
+    }
+
     // `--backend` is checked against the names this build knows, and it is
     // checked HERE -- before any model is resolved and before any device
     // is opened.

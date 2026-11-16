@@ -80,8 +80,50 @@ pub struct Choice {
 /// The GPU is opened HERE, once: the choice is made before the run
 /// starts, and a machine with no Vulkan device is refused before it
 /// prints a status block that would claim the GPU.
+///
+/// `--vk-ops` selects which operations go to the GPU (like `--npu-ops`
+/// selects operations for the array) and implies the Vulkan backend.
+/// Given alone it offloads the named ops; the rest stay on the host.
 pub fn choose(args: &Args) -> Result<Choice, String> {
-    let Some(name) = args.value("--backend") else {
+    let vk_ops = args.value("--vk-ops");
+    let backend_name = args.value("--backend");
+
+    if let Some(list) = vk_ops {
+        if backend_name == Some("cpu") {
+            return Err(
+                "--vk-ops selects operations for the Vulkan backend, but --backend cpu was \
+                 given. Drop --backend cpu, or drop --vk-ops to run everything on the host."
+                    .to_string(),
+            );
+        }
+        if let Some(name) = backend_name {
+            if Backend::parse(name) != Some(Backend::Vulkan) {
+                return Err(refuse_unknown(name));
+            }
+        }
+        let codes = crate::flags::parse_vk_ops(list)?;
+        if codes.is_empty() {
+            return Err(
+                "--vk-ops: no Vulkan op named. Valid codes: [gemm, layn, gelu, softm]. \
+                 Name at least one op to offload, or drop --vk-ops to run on the host."
+                    .to_string(),
+            );
+        }
+        let gemm = codes.contains(&"gemm");
+        let layn = codes.contains(&"layn");
+        let gelu = codes.contains(&"gelu");
+        let softm = codes.contains(&"softm");
+        let ops = npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm);
+        if !ops.has_gpu() {
+            return Err(refuse_no_gpu());
+        }
+        return Ok(Choice {
+            backend: Backend::Vulkan,
+            ops: Box::new(ops),
+        });
+    }
+
+    let Some(name) = backend_name else {
         return Ok(Choice {
             backend: Backend::Cpu,
             ops: Box::new(npum_cpu::ops::CpuOps::best()),
@@ -155,13 +197,14 @@ pub fn refuse_family(family: npum_families::Family) -> String {
 
 /// The refusal for a family without a GPU path, if the flag named one.
 ///
-/// The check is by NAME: `--backend vulkan` on a family that cannot run
-/// on the GPU is refused, and `--backend cpu` is the default and says
+/// The check is by NAME: `--backend vulkan` or `--vk-ops` on a family
+/// that cannot run on the GPU is refused, and the default host path says
 /// nothing.
 pub fn refuse_if_vulkan(args: &Args, family: npum_families::Family) -> Option<String> {
-    match args.value("--backend") {
-        Some("vulkan") => Some(refuse_family(family)),
-        _ => None,
+    if args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some() {
+        Some(refuse_family(family))
+    } else {
+        None
     }
 }
 
@@ -171,9 +214,9 @@ pub fn refuse_if_vulkan(args: &Args, family: npum_families::Family) -> Option<St
 /// arithmetic is not wired into its engine yet -- the CLI's `embed` verb
 /// is where the GPU's path runs. So the flag is refused here by name.
 pub fn refuse_server() -> String {
-    "--backend vulkan: the HTTP server runs on the host. The GPU's arithmetic is wired into \
-     the CLI's `embed` verb, and not into the server's engine yet -- a server that answered \
-     with the GPU's vectors while its banner said the host would be a server that lied. Run \
-     the CLI's `embed` if you want the GPU's numbers."
+    "--backend vulkan/--vk-ops: the HTTP server runs on the host. The GPU's arithmetic is \
+     wired into the CLI's `embed` verb, and not into the server's engine yet -- a server \
+     that answered with the GPU's vectors while its banner said the host would be a server \
+     that lied. Run the CLI's `embed` if you want the GPU's numbers."
         .to_string()
 }

@@ -61,11 +61,10 @@ pub fn serve(
     //
     // The HTTP path answers with the CPU backend's bytes -- the C++'s
     // bytes -- and the GPU's arithmetic is not wired into the server's
-    // engine yet. So `--backend vulkan` here is refused by name: a server
-    // that answered with the GPU's vectors while the command line said
-    // the GPU, and the banner said the host, would be a server that lied
-    // twice.
-    if args.value("--backend") == Some("vulkan") {
+    // engine yet. So `--backend vulkan`/`--vk-ops` here is refused by
+    // name: a server that answered with the GPU's vectors while the
+    // command line asked for the GPU would be a server that lied.
+    if args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some() {
         eprintln!("error: {}", crate::backend::refuse_server());
         return crate::EXIT_REFUSED;
     }
