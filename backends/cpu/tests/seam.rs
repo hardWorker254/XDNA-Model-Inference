@@ -125,7 +125,15 @@ fn run(path: &Path, model: &npum_cpu::bert::BertModel, recorder: &mut Recorder) 
         .expect("the text encodes");
     assert!(!truncated, "the text fits");
     model
-        .embed(&encoding.ids, &encoding.mask, 1, SEQ, None, Some(recorder))
+        .embed(
+            &encoding.ids,
+            &encoding.mask,
+            1,
+            SEQ,
+            &mut npum_cpu::ops::CpuOps::best(),
+            None,
+            Some(recorder),
+        )
         .expect("the model runs");
 }
 
@@ -292,6 +300,7 @@ fn run_dense(path: &Path, model: &npum_cpu::bert::BertModel, dense: &mut Dense) 
             &encoding.mask,
             1,
             SEQ,
+            &mut npum_cpu::ops::CpuOps::best(),
             Some(dense),
             None,
         )

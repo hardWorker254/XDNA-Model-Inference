@@ -26,7 +26,10 @@
 
 use crate::kernels;
 use crate::kernels::Isa;
+use crate::ops::CpuOps;
 use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape};
+use npum_model::dispatcher::Placement;
+use npum_model::Ops;
 use std::path::Path;
 
 /// What can go wrong while running a BERT container.
@@ -147,6 +150,13 @@ pub struct Timings {
     /// elementwise passes in the same row as the projections', because
     /// both are the array's time.
     pub array_gemm: f64,
+    /// The GPU's own time, in seconds.
+    ///
+    /// Zero unless the run put the arithmetic on the GPU. The row it
+    /// belongs to is the GPU's, and the host's rows stay zero in that
+    /// case: a row named "host LayerNorm" that holds the GPU's time is a
+    /// row that lies about where the work happened.
+    pub gpu: f64,
 }
 
 impl Timings {
@@ -156,7 +166,12 @@ impl Timings {
     /// and bias rows -- all zero on the host path -- plus the host rows and
     /// the attention.
     pub fn busy(&self) -> f64 {
-        self.host_layernorm + self.host_softmax + self.host_gelu + self.attention + self.array_gemm
+        self.host_layernorm
+            + self.host_softmax
+            + self.host_gelu
+            + self.attention
+            + self.array_gemm
+            + self.gpu
     }
 }
 
@@ -513,16 +528,23 @@ impl BertModel {
     /// `ids` and `mask` are `batch * seq` long: the token ids and the
     /// attention mask, 1 for a real token and 0 for padding. The result is
     /// `batch * hidden` long: the pooled, normalised vectors.
+    ///
+    /// `ops` is WHERE the arithmetic happens: the host's own kernels
+    /// (`crate::ops::CpuOps`) or the GPU's (`npum_vulkan::ops::VulkanOps`).
+    /// The walk below is the same either way -- only the four operations
+    /// change hands.
     pub fn embed(
         &self,
         ids: &[u32],
         mask: &[u32],
         batch: usize,
         seq: usize,
+        ops: &mut dyn Ops,
         array: ArrayTextRef<'_, '_>,
         eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
-        self.embed_on(kernels::gemm_isa(), ids, mask, batch, seq, array, eltwise)
+        let mut timings = Timings::default();
+        self.embed_timed_with(ops, &mut timings, ids, mask, batch, seq, array, eltwise)
     }
 
     /// Embed a batch, and report where the time went.
@@ -533,22 +555,11 @@ impl BertModel {
         mask: &[u32],
         batch: usize,
         seq: usize,
+        ops: &mut dyn Ops,
         array: ArrayTextRef<'_, '_>,
         eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
-        let mut own = Timings::default();
-        let vectors = self.embed_timed_on(
-            kernels::gemm_isa(),
-            &mut own,
-            ids,
-            mask,
-            batch,
-            seq,
-            array,
-            eltwise,
-        )?;
-        *timings = own;
-        Ok(vectors)
+        self.embed_timed_with(ops, timings, ids, mask, batch, seq, array, eltwise)
     }
 
     /// Embed a batch of tokenized sequences, on a named ISA.
@@ -567,13 +578,51 @@ impl BertModel {
         eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
         let mut timings = Timings::default();
-        self.embed_timed_on(isa, &mut timings, ids, mask, batch, seq, array, eltwise)
+        self.embed_timed_with(
+            &mut CpuOps::on(isa),
+            &mut timings,
+            ids,
+            mask,
+            batch,
+            seq,
+            array,
+            eltwise,
+        )
     }
 
     /// Embed a batch on a named ISA, and report where the time went.
     pub fn embed_timed_on(
         &self,
         isa: Isa,
+        timings: &mut Timings,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        array: ArrayTextRef<'_, '_>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+    ) -> Result<Vec<f32>> {
+        self.embed_timed_with(
+            &mut CpuOps::on(isa),
+            timings,
+            ids,
+            mask,
+            batch,
+            seq,
+            array,
+            eltwise,
+        )
+    }
+
+    /// Embed a batch, with the arithmetic going through `ops`.
+    ///
+    /// This is the one that does the work. The two wrappers above are the
+    /// host's own: one asks for the host's best ISA, the other for a named
+    /// one, and the gate that compares the ISAs byte for byte uses the
+    /// second.
+    pub fn embed_timed_with(
+        &self,
+        ops: &mut dyn Ops,
         timings: &mut Timings,
         ids: &[u32],
         mask: &[u32],
@@ -629,7 +678,7 @@ impl BertModel {
 
         // 3. The forward pass.
         let h = self.forward(
-            isa, &mut x, &add_mask, batch, seq, timings, array, eltwise.as_deref_mut(),
+            ops, &mut x, &add_mask, batch, seq, timings, array, eltwise.as_deref_mut(),
         )?;
 
         // 4. The pooling.
@@ -641,7 +690,7 @@ impl BertModel {
     /// The C++'s `BertEncoder::run()`, step for step.
     fn forward(
         &self,
-        isa: Isa,
+        ops: &mut dyn Ops,
         x: &mut [f32],
         add_mask: &[f32],
         batch: usize,
@@ -737,8 +786,12 @@ impl BertModel {
             // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
             timings.array_gemm += t0.elapsed().as_secs_f64();
         } else {
-            layernorm_all(isa, x, hidden, &self.weights.ln_gamma, &self.weights.ln_beta)?;
-            timings.host_layernorm += t0.elapsed().as_secs_f64();
+            ops.layernorm_rows(x, rows, hidden, &self.weights.ln_gamma, &self.weights.ln_beta)?;
+            let spent = t0.elapsed().as_secs_f64();
+            match ops.place() {
+                Placement::Host => timings.host_layernorm += spent,
+                _ => timings.gpu += spent,
+            }
         }
 
         let mut qkv = vec![0.0f32; rows * three_hidden];
@@ -772,7 +825,16 @@ impl BertModel {
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
-                    gemm_nt_on(isa, x, rows, &layer.qkv, hidden, three_hidden, &layer.qkv_bias, &mut qkv);
+                    let t = std::time::Instant::now();
+                    ops.gemm_nt(x, rows, &layer.qkv, hidden, three_hidden, &layer.qkv_bias, &mut qkv)?;
+                    // The host's own GEMM has NO row in the C++'s split --
+                    // the row that holds the projections' time is the
+                    // array's -- so the host's projection time is not
+                    // recorded. The GPU's is, because the GPU's row is
+                    // its own.
+                    if ops.place() != Placement::Host {
+                        timings.gpu += t.elapsed().as_secs_f64();
+                    }
                 }
             }
 
@@ -843,15 +905,32 @@ impl BertModel {
                     // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
                     timings.array_gemm += t_sm.elapsed().as_secs_f64();
                 } else {
+                    // THE MASK, THEN THE SOFTMAX.
+                    //
+                    // The mask goes in first, because the softmax's maximum
+                    // has to see it -- and the mask covers the REAL keys
+                    // only, so the padding columns keep the -1e30 the score
+                    // matrix was laid out with.
                     for r in 0..score_rows {
                         let row = &mut scores[r * seq..(r + 1) * seq];
                         let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
                         for j in 0..seq {
                             row[j] += mk[j];
                         }
-                        kernels::softmax_row_on(isa, row)?;
                     }
-                    timings.host_softmax += t_sm.elapsed().as_secs_f64();
+                    // ONE CALL FOR THE WHOLE MATRIX.
+                    //
+                    // The rows are the rows: the host's softmax normalises a
+                    // row of `seq` keys, and the GPU's normalises a row of
+                    // the same width. The matrix is laid out at the
+                    // SEQUENCE's width here -- the array's padded width is
+                    // the array's path, and the host's path never sees it.
+                    ops.softmax_rows(&mut scores, score_rows, seq)?;
+                    let spent = t_sm.elapsed().as_secs_f64();
+                    match ops.place() {
+                        Placement::Host => timings.host_softmax += spent,
+                        _ => timings.gpu += spent,
+                    }
                 }
                 let t_av = std::time::Instant::now();
                 self.av(&scores, &qkv, &mut ctx, batch, seq, sc_cols);
@@ -881,7 +960,19 @@ impl BertModel {
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
-                    gemm_nt_on(isa, &ctx, rows, &layer.attn_out, hidden, hidden, &layer.attn_out_bias, &mut proj);
+                    let t = std::time::Instant::now();
+                    ops.gemm_nt(
+                        &ctx,
+                        rows,
+                        &layer.attn_out,
+                        hidden,
+                        hidden,
+                        &layer.attn_out_bias,
+                        &mut proj,
+                    )?;
+                    if ops.place() != Placement::Host {
+                        timings.gpu += t.elapsed().as_secs_f64();
+                    }
                 }
             }
             for i in 0..x.len() {
@@ -895,8 +986,12 @@ impl BertModel {
                 eltwise.layernorm(&params, x, rows)?;
                 timings.array_gemm += t_ln.elapsed().as_secs_f64();
             } else {
-                layernorm_all(isa, x, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
-                timings.host_layernorm += t_ln.elapsed().as_secs_f64();
+                ops.layernorm_rows(x, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
+                let spent = t_ln.elapsed().as_secs_f64();
+                match ops.place() {
+                    Placement::Host => timings.host_layernorm += spent,
+                    _ => timings.gpu += spent,
+                }
             }
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
@@ -914,7 +1009,11 @@ impl BertModel {
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
-                    gemm_nt_on(isa, x, rows, &layer.ffn_up, hidden, spec.ffn, &layer.ffn_up_bias, &mut up);
+                    let t = std::time::Instant::now();
+                    ops.gemm_nt(x, rows, &layer.ffn_up, hidden, spec.ffn, &layer.ffn_up_bias, &mut up)?;
+                    if ops.place() != Placement::Host {
+                        timings.gpu += t.elapsed().as_secs_f64();
+                    }
                 }
             }
             let t_gelu = std::time::Instant::now();
@@ -922,8 +1021,12 @@ impl BertModel {
                 eltwise.gelu(&mut up)?;
                 timings.array_gemm += t_gelu.elapsed().as_secs_f64();
             } else {
-                kernels::gelu_row_on(isa, &mut up);
-                timings.host_gelu += t_gelu.elapsed().as_secs_f64();
+                ops.gelu(&mut up)?;
+                let spent = t_gelu.elapsed().as_secs_f64();
+                match ops.place() {
+                    Placement::Host => timings.host_gelu += spent,
+                    _ => timings.gpu += spent,
+                }
             }
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
@@ -941,7 +1044,19 @@ impl BertModel {
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
-                    gemm_nt_on(isa, &up, rows, &layer.ffn_down, spec.ffn, hidden, &layer.ffn_down_bias, &mut down);
+                    let t = std::time::Instant::now();
+                    ops.gemm_nt(
+                        &up,
+                        rows,
+                        &layer.ffn_down,
+                        spec.ffn,
+                        hidden,
+                        &layer.ffn_down_bias,
+                        &mut down,
+                    )?;
+                    if ops.place() != Placement::Host {
+                        timings.gpu += t.elapsed().as_secs_f64();
+                    }
                 }
             }
             for i in 0..x.len() {
@@ -955,8 +1070,12 @@ impl BertModel {
                 eltwise.layernorm(&params, x, rows)?;
                 timings.array_gemm += t_ln.elapsed().as_secs_f64();
             } else {
-                layernorm_all(isa, x, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
-                timings.host_layernorm += t_ln.elapsed().as_secs_f64();
+                ops.layernorm_rows(x, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
+                let spent = t_ln.elapsed().as_secs_f64();
+                match ops.place() {
+                    Placement::Host => timings.host_layernorm += spent,
+                    _ => timings.gpu += spent,
+                }
             }
         }
         Ok(x.to_vec())
@@ -1143,36 +1262,3 @@ fn layernorm_params(gamma: &[f32], beta: &[f32]) -> Vec<f32> {
     params
 }
 
-/// The C++'s `layer_norm_cpu` divides the buffer into rows of `hidden` and
-/// normalises each one; a call that treated the whole buffer as one row
-/// would read past the end of the first row's weights.
-fn layernorm_all(
-    isa: Isa,
-    x: &mut [f32],
-    hidden: usize,
-    gamma: &[f32],
-    beta: &[f32],
-) -> Result<()> {
-    for row in x.chunks_mut(hidden) {
-        kernels::layernorm_row_on(isa, row, gamma, beta)?;
-    }
-    Ok(())
-}
-
-/// The GEMM on a named ISA, refusing a host that does not have it.
-///
-/// A refusal is a refusal: the gate that compares two ISAs must not
-/// silently compare one ISA with another.
-fn gemm_nt_on(
-    isa: Isa,
-    a: &[f32],
-    m: usize,
-    b: &[f32],
-    k: usize,
-    n: usize,
-    bias: &[f32],
-    out: &mut [f32],
-) {
-    let ok = kernels::gemm_nt_on(isa, a, m, b, k, n, bias, out);
-    debug_assert!(ok, "the host does not have the ISA {isa:?}");
-}

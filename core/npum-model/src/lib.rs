@@ -30,6 +30,7 @@ pub mod array;
 pub mod caps;
 pub mod dispatcher;
 pub mod graph;
+pub mod ops;
 pub mod tensor;
 
 pub use array::{
@@ -39,6 +40,7 @@ pub use array::{
 pub use caps::{Caps, OpKind};
 pub use dispatcher::{Dispatcher, Placement};
 pub use graph::{Graph, ModelSpec, Op};
+pub use ops::Ops;
 pub use tensor::{DType, Tensor, TensorError};
 
 use std::path::PathBuf;

@@ -104,7 +104,15 @@ fn the_vector_is_bit_identical_to_the_oracles() {
     assert!(!truncated, "the fixture's text fits");
 
     let vectors = model
-        .embed(&encoding.ids, &encoding.mask, 1, SEQ, None, None)
+        .embed(
+            &encoding.ids,
+            &encoding.mask,
+            1,
+            SEQ,
+            &mut npum_cpu::ops::CpuOps::best(),
+            None,
+            None,
+        )
         .expect("the model runs");
 
     let mut got = Vec::with_capacity(vectors.len() * 4);

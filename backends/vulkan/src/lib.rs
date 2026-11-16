@@ -46,6 +46,7 @@
 //!   back to the host rather than computing a truncated softmax.
 
 pub mod device;
+pub mod ops;
 pub mod shaders;
 
 use npum_model::caps::Precision as CapsPrecision;
@@ -118,6 +119,16 @@ impl VulkanBackend {
 
     /// The GPU, when this operation is one it runs for these tensors.
     fn gpu(&mut self) -> Option<&mut Gpu> {
+        self.gpu.as_mut()
+    }
+
+    /// The device itself, when there is one.
+    ///
+    /// The seam (`crate::ops`) works on flat slices, and the device's own
+    /// methods are the slice-shaped ones -- so the seam borrows the device
+    /// rather than wrapping every activation in a tensor and copying it
+    /// twice.
+    pub fn device_mut(&mut self) -> Option<&mut Gpu> {
         self.gpu.as_mut()
     }
 

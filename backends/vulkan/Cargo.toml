@@ -25,3 +25,8 @@ tracing.workspace = true
 # The WGSL front end and the SPIR-V back end, and nothing else: the shaders
 # are compiled here rather than at start-up.
 naga = { version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }
+
+[dev-dependencies]
+# The gates run the TEXT family end to end, and the family needs a
+# tokenizer to have something to encode.
+npum-tokenizers.workspace = true

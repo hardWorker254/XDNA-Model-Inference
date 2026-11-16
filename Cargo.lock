@@ -703,6 +703,7 @@ dependencies = [
  "npum-cpu",
  "npum-format",
  "npum-model",
+ "npum-tokenizers",
  "serde",
  "serde_json",
  "thiserror",

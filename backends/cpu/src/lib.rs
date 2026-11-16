@@ -43,6 +43,7 @@ pub mod mppose_decode;
 pub mod ocr;
 pub mod ocr_decode;
 pub mod ocr_session;
+pub mod ops;
 pub mod pose;
 pub mod pose_decode;
 pub mod vit;

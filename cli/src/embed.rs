@@ -110,6 +110,13 @@ pub fn run(
     println!("  input      {} texts", texts.len());
     let started = std::time::Instant::now();
     let mut timings = npum_cpu::bert::Timings::default();
+    // THE ARITHMETIC, for now the host's alone.
+    //
+    // The walk asks a seam for its four operations, and the host's
+    // implementation of that seam is the one that answers here. A second
+    // implementation -- the GPU's -- plugs in at the same place, and
+    // nothing above this line changes.
+    let mut ops = npum_cpu::ops::CpuOps::best();
     let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
     for (index, text) in texts.iter().enumerate() {
         let raw = match prefix {
@@ -140,6 +147,7 @@ pub fn run(
                 &encoding.mask,
                 1,
                 seq,
+                &mut ops,
                 array.as_deref_mut(),
                 eltwise.as_deref_mut(),
             )

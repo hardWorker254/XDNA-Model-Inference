@@ -84,7 +84,15 @@ fn the_embedding_matches_the_golden() {
     assert!(!truncated, "the golden's text fits");
 
     let vectors = model
-        .embed(&encoding.ids, &encoding.mask, 1, SEQ, None, None)
+        .embed(
+            &encoding.ids,
+            &encoding.mask,
+            1,
+            SEQ,
+            &mut npum_cpu::ops::CpuOps::best(),
+            None,
+            None,
+        )
         .expect("the model runs");
 
     assert_eq!(vectors.len(), golden.len(), "the vector's width");

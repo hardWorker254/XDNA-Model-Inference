@@ -44,6 +44,18 @@ impl Placement {
             Placement::Host => "host",
         }
     }
+
+    /// The words a status block prints.
+    ///
+    /// "the host", "the GPU", "the array" -- the three places a piece of
+    /// arithmetic can happen, said the way a reader thinks about them.
+    pub fn where_str(self) -> &'static str {
+        match self {
+            Placement::Npu => "the array",
+            Placement::Vulkan => "the GPU",
+            Placement::Host => "the host",
+        }
+    }
 }
 
 /// The dispatcher: a backend, a placement table, and the walk.

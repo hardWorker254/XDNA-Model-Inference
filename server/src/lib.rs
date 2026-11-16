@@ -371,9 +371,13 @@ impl Embedder {
                 .encode_padded(text, self.seq)
                 .map_err(|e| e.to_string())?;
             tokens += encoding.mask.iter().filter(|m| **m > 0).count();
+            // THE ARITHMETIC GOES THROUGH THE SEAM, and on the server it is
+            // the host's: the HTTP path answers with the CPU backend's
+            // bytes, which are the C++'s bytes.
+            let mut ops = npum_cpu::ops::CpuOps::best();
             let chunk = self
                 .model
-                .embed(&encoding.ids, &encoding.mask, 1, self.seq, None, None)
+                .embed(&encoding.ids, &encoding.mask, 1, self.seq, &mut ops, None, None)
                 .map_err(|e| e.to_string())?;
             vectors.push(chunk);
         }
