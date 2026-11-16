@@ -29,6 +29,7 @@ pub mod tables;
 pub mod unigram;
 pub mod whisper;
 pub mod wordpiece;
+pub mod xlmr;
 
 pub use tables::{BertTables, CpRange, Error as TableError, FoldEntry, WhisperTables, XlmrTables};
 

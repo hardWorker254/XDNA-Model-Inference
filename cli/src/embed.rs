@@ -27,7 +27,34 @@
 use crate::flags::Args;
 use npum_cpu::bert::BertModel;
 use npum_tokenizers::wordpiece::WordPiece;
+use npum_tokenizers::xlmr::XlmrTokenizer;
 use std::path::{Path, PathBuf};
+
+/// A tokenizer for the embed/text family (WordPiece or XLM-R Unigram).
+pub enum EmbedTokenizer {
+    WordPiece(WordPiece),
+    Xlmr(XlmrTokenizer),
+}
+
+impl EmbedTokenizer {
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            EmbedTokenizer::WordPiece(t) => npum_tokenizers::Tokenizer::vocab_size(t),
+            EmbedTokenizer::Xlmr(t) => npum_tokenizers::Tokenizer::vocab_size(t),
+        }
+    }
+
+    pub fn encode_padded(
+        &self,
+        text: &str,
+        max_len: usize,
+    ) -> npum_tokenizers::Result<(npum_tokenizers::Encoding, bool)> {
+        match self {
+            EmbedTokenizer::WordPiece(t) => t.encode_padded(text, max_len),
+            EmbedTokenizer::Xlmr(t) => t.encode_padded(text, max_len),
+        }
+    }
+}
 
 /// The result of a refusal, and the message that goes with it.
 pub struct Refusal {
@@ -105,9 +132,7 @@ pub fn run(
 
     // The vocabulary's size, and then the texts. The C++'s order, and the
     // reason for it: the tokenizer is loaded here and not before.
-    crate::status::print_tokenizer(
-        npum_tokenizers::Tokenizer::vocab_size(&tokenizer),
-    );
+    crate::status::print_tokenizer(tokenizer.vocab_size());
     println!("  input      {} texts", texts.len());
     let started = std::time::Instant::now();
     let mut timings = npum_cpu::bert::Timings::default();
@@ -205,23 +230,30 @@ pub fn run(
 
 /// The tokenizer a container holds.
 ///
-/// The ARCH decides, not the file name: a container that says it is a BERT
-/// model has a BERT vocabulary, whatever it is called on disk.
+/// The ARCH decides, not the file name.
 fn load_tokenizer(
     container: &npum_format::Container,
     arch: &str,
-) -> Result<WordPiece, String> {
-    if arch.contains("whisper") || arch.contains("gemma") || arch.contains("gte_new_rope") {
+) -> Result<EmbedTokenizer, String> {
+    if arch.contains("whisper") || arch.contains("gemma") {
         return Err(format!(
             "the {arch} family has its own tokenizer, and this command does not \
              run it yet"
         ));
     }
+    if arch.contains("gte_new_rope") || arch.contains("gte") && arch.contains("rope") {
+        let blob = container
+            .tensor_bytes("tokenizer.xlmr_table")
+            .map_err(|_| "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string())?;
+        let tok = XlmrTokenizer::from_table_bytes(blob)?;
+        return Ok(EmbedTokenizer::Xlmr(tok));
+    }
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .map_err(|_| "the container holds no vocabulary".to_string())?;
     let text = String::from_utf8_lossy(blob);
-    WordPiece::from_lines(&text).map_err(|e| format!("the vocabulary is unusable: {e}"))
+    let wp = WordPiece::from_lines(&text).map_err(|e| format!("the vocabulary is unusable: {e}"))?;
+    Ok(EmbedTokenizer::WordPiece(wp))
 }
 
 /// The sequence length this model's design set was built for.

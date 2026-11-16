@@ -313,6 +313,25 @@ fn tensor_f32(container: &npum_format::Container, name: &str) -> std::result::Re
         .collect())
 }
 
+#[derive(Clone)]
+enum EmbedTokenizer {
+    WordPiece(npum_tokenizers::wordpiece::WordPiece),
+    Xlmr(npum_tokenizers::xlmr::XlmrTokenizer),
+}
+
+impl EmbedTokenizer {
+    fn encode_padded(
+        &self,
+        text: &str,
+        max_len: usize,
+    ) -> npum_tokenizers::Result<(npum_tokenizers::Encoding, bool)> {
+        match self {
+            EmbedTokenizer::WordPiece(t) => t.encode_padded(text, max_len),
+            EmbedTokenizer::Xlmr(t) => t.encode_padded(text, max_len),
+        }
+    }
+}
+
 /// The embedding endpoint's engine.
 ///
 /// The tokenizer and the model, and the sequence length they run at.
@@ -321,7 +340,7 @@ fn tensor_f32(container: &npum_format::Container, name: &str) -> std::result::Re
 /// the GPU through the same `Ops` seam.
 #[derive(Clone)]
 pub struct Embedder {
-    tokenizer: npum_tokenizers::wordpiece::WordPiece,
+    tokenizer: EmbedTokenizer,
     model: npum_cpu::bert::BertModel,
     seq: usize,
     vulkan_ops: Option<(bool, bool, bool, bool)>,
@@ -342,12 +361,21 @@ impl Embedder {
     ) -> std::result::Result<Self, String> {
         let container = npum_format::Container::open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let blob = container
-            .tensor_bytes("tokenizer.vocab")
-            .map_err(|_| "the container holds no vocabulary".to_string())?;
-        let tokenizer =
-            npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-                .map_err(|e| format!("the vocabulary is unusable: {e}"))?;
+        let arch = container.config_str("arch").unwrap_or_default().to_string();
+        let tokenizer = if arch.contains("gte_new_rope") || (arch.contains("gte") && arch.contains("rope")) {
+            let blob = container
+                .tensor_bytes("tokenizer.xlmr_table")
+                .map_err(|_| "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string())?;
+            EmbedTokenizer::Xlmr(npum_tokenizers::xlmr::XlmrTokenizer::from_table_bytes(blob)?)
+        } else {
+            let blob = container
+                .tensor_bytes("tokenizer.vocab")
+                .map_err(|_| "the container holds no vocabulary".to_string())?;
+            EmbedTokenizer::WordPiece(
+                npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+                    .map_err(|e| format!("the vocabulary is unusable: {e}"))?,
+            )
+        };
         let model =
             npum_cpu::bert::BertModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Self {
