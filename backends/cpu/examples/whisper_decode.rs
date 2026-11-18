@@ -1,6 +1,6 @@
 //! Whisper's decoder, dumped as hex.
 //!
-//! The C++ oracle has its own test binary for this
+//! The reference baseline has its own test binary for this
 //! (`runtime/tests/test_whisper_model.cpp`), and it prints the same
 //! lines: `step <pos> <top1> <cols> <hex>`, `logits <pos> <vocab> <hex>`,
 //! `greedy <n> <ids...>` and `text <hex>`. This example is the Rust's

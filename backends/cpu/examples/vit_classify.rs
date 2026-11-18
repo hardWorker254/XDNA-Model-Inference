@@ -1,6 +1,6 @@
 //! The ViT's classifier, printed as the CLI prints it.
 //!
-//! The C++ oracle has its own test binary for the image front end
+//! The reference baseline has its own test binary for the image front end
 //! (`runtime/tests/test_vit_image.cpp`), and it prints the same lines.
 //! This example is the Rust's counterpart, and the two are compared BYTE
 //! for byte.

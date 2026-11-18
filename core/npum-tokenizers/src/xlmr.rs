@@ -1,6 +1,6 @@
 //! The XLM-R SentencePiece Unigram tokenizer.
 //!
-//! Line-for-line port of the C++ oracle (`runtime/src/tokenizers/xlmr.cpp`)
+//! Line-for-line port of the reference baseline (`runtime/src/tokenizers/xlmr.cpp`)
 //! and its executable spec (`tools/lib/xlmr_tokenizer_ref.py`). The blob
 //! format is XLMRTOK1. Scores are f64 end-to-end.
 

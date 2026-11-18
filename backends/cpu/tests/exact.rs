@@ -4,7 +4,7 @@
 //!
 //! `golden.rs` compares against the golden transcripts, which hold SEVEN
 //! SIGNIFICANT DIGITS -- enough to catch a wrong arithmetic, and not enough
-//! to prove a right one. The C++'s HTTP endpoint also speaks
+//! to prove a right one. The reference's HTTP endpoint also speaks
 //! `encoding_format: "base64"`, and that carries the float32 BYTES.
 //!
 //! So this file is the bit-exactness gate: the same container, the same
@@ -15,7 +15,7 @@
 //! # The fixture, and where it came from
 //!
 //! `tools/parity/fixtures/exact/*.b64` holds the oracle's own bytes,
-//! produced by `tools/parity/exact_vector.py` against the C++ binaries. It
+//! produced by `tools/parity/exact_vector.py` against the reference binaries. It
 //! is a fixture and not a golden: it is the INPUT to this comparison, not
 //! the transcript of a run.
 

@@ -18,7 +18,7 @@
 # WHAT IT IS NOT
 # --------------
 # It is not fast. It is a reference: it says what the container MEANS, and the
-# C++ runtime says what it DOES, and the gate compares them. A reference that
+# reference runtime says what it DOES, and the gate compares them. A reference that
 # ran at the runtime's speed would be a second implementation to maintain
 # instead of an independent one to check against.
 #
@@ -421,7 +421,7 @@ class Graph:
 # WHY THIS EXISTS
 # ---------------
 # The numpy reference above is the ORACLE for the runtime: it is an independent
-# reading of the container's own op list, and the C++ runtime is compared
+# reading of the container's own op list, and the reference runtime is compared
 # against it. But it is numpy, and the v5 detector is 20 M parameters over
 # 960x960 maps -- which the numpy reference cannot walk in a reasonable time.
 #

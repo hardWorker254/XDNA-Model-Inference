@@ -3,7 +3,7 @@
 //! # WHAT A LOADED DESIGN IS
 //!
 //! One xclbin, its instruction streams, and its data buffers -- held by the
-//! runtime for as long as the model runs. The C++ runtime called this object
+//! runtime for as long as the model runs. The reference runtime called this object
 //! `npu::Design` and it is the same thing here: a resident design with the
 //! buffers that belong to it.
 //!
@@ -82,7 +82,7 @@ pub struct ArrayDesign<T: Transport> {
     /// `stage` adds. The reason there are slots at all is that each
     /// convolution has its OWN weight panel, and the panels are big: one
     /// buffer per panel would be a buffer per convolution, and the design's
-    /// memory budget is not that large. The C++ runtime has the same slots,
+    /// memory budget is not that large. The reference runtime has the same slots,
     /// and the same rule that a dispatch uses the slot it was bound to.
     slots: Vec<Vec<T::Buffer>>,
     /// Which slot each data buffer is bound to.
@@ -187,7 +187,7 @@ impl<T: Transport> ArrayDesign<T> {
         //
         // The AIE flow's kernels are all called `MLIR_AIE...` and an xclbin
         // may carry several; the manifest names the one the design wants, and
-        // the C++ runtime looked for the first `MLIR_AIE` prefix match. The
+        // the reference runtime looked for the first `MLIR_AIE` prefix match. The
         // manifest's name is used when it has one.
         transport.open_kernel(info.kernel_name())?;
 

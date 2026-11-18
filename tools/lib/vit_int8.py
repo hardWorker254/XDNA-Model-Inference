@@ -43,7 +43,7 @@
 # image statistics. A deployment should pass its own images: --int8-corpus.
 #
 # Env: numpy, torch, transformers, PIL -- BUILD TIME ONLY. The shipped runtime
-# stays C++; this runs when a container is packed, never when it is served.
+# stays reference; this runs when a container is packed, never when it is served.
 
 from __future__ import annotations
 

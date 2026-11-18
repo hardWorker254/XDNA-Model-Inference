@@ -50,7 +50,7 @@ here rather than discovered on the thousandth frame:
 
 WHAT IS THE SAME AS THE POSE FACADE
 -----------------------------------
-The numbers are the C++ runtime's, not Python's: this module runs
+The numbers are the reference runtime's, not Python's: this module runs
 ``npuimage hands`` and parses the JSON that ``hands_mode.hpp`` writes. There
 is no second implementation of the network, the front end or the decoder, so the
 Python and the CLI cannot disagree about a landmark by a rounding step.

@@ -1,6 +1,6 @@
 # NpuEmbeddings -- build-time Python requirements.
 #
-# Build-time ONLY. Nothing here is used at runtime: the runtime is C++, and a
+# Build-time ONLY. Nothing here is used at runtime: the runtime is reference, and a
 # release contains no Python at all (BUILD.md §1).
 #
 # This file is the HUMAN-READABLE list -- the packages this project asks for,
@@ -46,7 +46,7 @@ regex==2026.9.3
 #          shared object file" unless libgl1 is present. It is a build-time
 #          requirement like everything else here, so this is the cost of putting
 #          a demo in the default set rather than the cost of the runtime, which
-#          is C++ and has none of it.
+#          is reference and has none of it.
 #
 #          The wheel is cp37-abi3, so one artifact serves 3.11 through 3.14 and
 #          does not need an AIE_ABI-style pin per interpreter. It adds NO new
@@ -91,7 +91,7 @@ openai==2.14.0
 #          of its own peak -- that is what rules out the PACKER rather than the
 #          runtime. verify_hands.py and verify_mppose.py use it the same way.
 #          It is a build-time requirement like everything else here: the
-#          runtime is C++ and never imports it. One transitive dependency
+#          runtime is reference and never imports it. One transitive dependency
 #          (flatbuffers) arrives with it, which is why the lock gained one line
 #          for it.
 onnxruntime==1.32.0

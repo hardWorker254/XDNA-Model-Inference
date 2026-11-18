@@ -25,7 +25,7 @@
 # The array programs are the ones the M5 experiments developed and are kept
 # byte-for-byte in kernels/: `gelu_poly.cc`, `layernorm.cc`, `softmax.cc`. This
 # tool only wraps them in an IRON program, compiles it once per (op, batch), and
-# copies the two artifacts XRT needs out of the JIT cache. The C++ runtime
+# copies the two artifacts XRT needs out of the JIT cache. The reference runtime
 # compiles nothing (ground rule 3).
 #
 # Usage:

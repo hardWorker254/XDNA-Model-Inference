@@ -8,7 +8,7 @@
 //! different pixels, a different resize gives different pixels, and a
 //! different pixel is a different probability.
 //!
-//! So the JPEG decode calls the SAME libjpeg the C++ runtime calls, through
+//! So the JPEG decode calls the SAME libjpeg the reference runtime calls, through
 //! a shim that keeps libjpeg's struct layout on the C side where libjpeg's
 //! own headers define it. The Rust side sees three integers and a byte
 //! buffer.
@@ -17,7 +17,7 @@
 //!
 //! libjpeg's defaults are libjpeg's defaults: the "fancy" upsampling, the
 //! slow integer IDCT, the YCbCr -> RGB transform libjpeg ships. The one
-//! thing the C++ runtime sets is `out_color_space = JCS_RGB`, so a
+//! thing the reference runtime sets is `out_color_space = JCS_RGB`, so a
 //! grayscale JPEG becomes three channels, and the shim sets the same one.
 
 use std::process::Command;
@@ -75,7 +75,7 @@ fn main() {
             "jpeg_shim.c",
             "npum_jpeg_shim",
             "The image front end decodes JPEG through libjpeg, the same library \
-             the C++ runtime uses, because the classifier's probability is the \
+             the reference runtime uses, because the classifier's probability is the \
              end of a chain that starts with pixels and a different IDCT gives \
              a different answer.\n\
              Install libjpeg's development files (libjpeg-dev, libjpeg-devel) \
@@ -85,7 +85,7 @@ fn main() {
             "png_shim.c",
             "npum_png_shim",
             "The OCR family's front end decodes PNG through libpng, the same \
-             library the C++ runtime uses, because the transcription is the end \
+             library the reference runtime uses, because the transcription is the end \
              of a chain that starts with pixels and a different inflate gives \
              a different character.\n\
              Install libpng's development files (libpng-dev, libpng-devel) \

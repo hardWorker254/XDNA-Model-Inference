@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# NpuEmbeddings -- hold the C++ Whisper audio front end against transformers.
+# NpuEmbeddings -- hold the reference Whisper audio front end against transformers.
 # SPDX-License-Identifier: Apache-2.0
 #
 # WHAT IS BEING CHECKED, AND AGAINST WHAT
@@ -27,7 +27,7 @@
 # failure this project treats as worst: it yields a fluent, plausible, wrong
 # transcript and no signal at all that anything happened.
 #
-# Env: numpy, torch, transformers, ffmpeg for the conversion cases, a C++
+# Env: numpy, torch, transformers, ffmpeg for the conversion cases, a reference
 # toolchain. The binary is built if --exe is not given.
 #
 # Usage:
@@ -90,7 +90,7 @@ def build_exe(path):
     ] + srcs + extra + ["-o", str(path)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("building the C++ front end failed:\n" + r.stderr)
+        print("building the reference front end failed:\n" + r.stderr)
         return None
     return path
 
@@ -174,7 +174,7 @@ def one_minus_cos(a, b):
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Hold the C++ Whisper front end against transformers.")
+        description="Hold the reference Whisper front end against transformers.")
     ap.add_argument("--npue", default=str(REPO / "models" / "whisper-tiny.npue"))
     ap.add_argument("--exe", default=None)
     ap.add_argument("--artifacts", default=None,

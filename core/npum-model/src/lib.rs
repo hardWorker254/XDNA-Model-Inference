@@ -106,7 +106,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// # The nine operations
 ///
-/// The same nine the C++ runtime had, with the same names: `gemm`, `gelu`,
+/// The same nine the reference runtime had, with the same names: `gemm`, `gelu`,
 /// `layernorm`, `softmax`, `attn`, `conv`, `mproj`, `fft`, `logit`. The
 /// count is small on purpose -- every operation is a place where a backend's
 /// arithmetic can differ from the host's, and a tenth would be a tenth more

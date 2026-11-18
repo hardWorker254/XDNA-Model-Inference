@@ -19,7 +19,7 @@
 //!
 //! # The table comes from the container
 //!
-//! The C++ runtime could rebuild Gemma's table at run time -- there was a
+//! The reference runtime could rebuild Gemma's table at run time -- there was a
 //! `gemma_tokenizer_gen.cpp` for it -- and that is exactly what the plan
 //! removes: the table is in the container, and the runtime never generates
 //! one. A runtime that can generate a table and a packer that can generate a

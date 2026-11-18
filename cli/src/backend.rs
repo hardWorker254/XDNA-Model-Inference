@@ -10,9 +10,9 @@
 //!
 //! # THE DEFAULT IS THE HOST
 //!
-//! The host's arithmetic is the C++'s arithmetic, byte for byte, and that
+//! The host's arithmetic is the reference's arithmetic, byte for byte, and that
 //! is the contract the golden transcripts check. So `--backend` is not
-//! needed to get the C++'s numbers: it is needed to ask for DIFFERENT
+//! needed to get the reference's numbers: it is needed to ask for DIFFERENT
 //! ones, on a different machine, and to be told when that machine is not
 //! there.
 //!
@@ -35,7 +35,7 @@ use npum_model::Ops;
 /// The backend a run's arithmetic goes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// The host's own kernels: the reference, and the C++'s numbers.
+    /// The host's own kernels: the reference, and the reference's numbers.
     Cpu,
     /// The GPU.
     Vulkan,

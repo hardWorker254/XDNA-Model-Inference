@@ -1,14 +1,14 @@
-# NpuEmbeddings -- M7: export validation vectors for the C++ runtime.
+# NpuEmbeddings -- M7: export validation vectors for the reference runtime.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The runtime reads weights from the .npue (it has a C++ reader for that) but
+# The runtime reads weights from the .npue (it has a reference reader for that) but
 # the goldens live in .npz (a zip of .npy arrays), and writing a second
-# container parser in C++ to check one number would be the wrong trade. So the
+# container parser in the reference implementation to check one number would be the wrong trade. So the
 # vectors the runtime validates against are dumped here, at build time, as raw
 # little-endian fp32 with a JSON descriptor.
 #
 # These are CHECK data, not model data. Nothing in the inference path reads
-# them; `main.cpp` uses them only to answer "did the C++ runtime reproduce the
+# them; `main.cpp` uses them only to answer "did the reference runtime reproduce the
 # HuggingFace-derived oracle".
 #
 # Env: iron env (numpy only, no NPU).
@@ -108,7 +108,7 @@ def main() -> int:
 
     # -- full-encode vectors --------------------------------------------------
     # emb.sum is the embedding lookup's output BEFORE the first LayerNorm: the
-    # gather is a host op in both runtimes, so handing the C++ side its result
+    # gather is a host op in both runtimes, so handing the reference side its result
     # keeps the two comparable and avoids a 47 MB embedding table read for a
     # check. The mask is the additive form softmax consumes, clamped to a
     # bf16-representable value -- tasks/0021: finfo(float32).min becomes -inf in
@@ -117,7 +117,7 @@ def main() -> int:
     emb_sum = np.ascontiguousarray(taps["emb.sum"].reshape(-1, hidden),
                                    dtype=np.float32)
     am = np.ascontiguousarray(g["attention_mask"], dtype=np.float32)
-    # Same clamp value the C++ runtime itself uses everywhere (main.cpp's
+    # Same clamp value the reference runtime itself uses everywhere (main.cpp's
     # cmask/cmask literals), not the oracle's own np.finfo(float32).min --
     # both are "very negative" enough that softmax zeroes the masked columns
     # either way; matching the runtime's OWN convention here is what makes

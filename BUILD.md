@@ -17,7 +17,7 @@ itself builds in a couple of commands.
 | **AMD Ryzen AI Software** (driver + XRT) | The runtime links `xrt_coreutil.dll`; the build needs XRT's headers and import library. |
 | **MLIR-AIE / IRON** | Compiles the AIE kernels and the dataflow graph into `final.xclbin` + `insts.bin`. This is the dependency that makes the build heavy — everything NPU-side goes through it. |
 | **Peano (LLVM-AIE)** | The kernel compiler IRON drives. Ships with the IRON install. |
-| **MSVC** (VS 2022 or newer) + CMake + Ninja | For the C++ runtime. |
+| **MSVC** (VS 2022 or newer) + CMake + Ninja | For building native components where required. |
 | **Python 3.13** with numpy, torch (CPU), transformers, sentence-transformers | Build-time only: fetching the checkpoint, packing the model, generating tables, and verification. **No Python is used at runtime.** The one exception is the NPU backend itself, which links `PYTHONPATH=/opt/xilinx/xrt/python` so that `xrt._NPU_RUNTIME` resolves; with that variable unset the driver reports the runtime as `cpu` and every export fails at load rather than at build. |
 
 ### Installing MLIR-AIE
@@ -327,11 +327,11 @@ discarded. Use the cache variable.
 ### 2.5 Check it
 
 ```powershell
-# the golden check: does the C++ path reproduce the HuggingFace reference?
+# the golden check: does the runtime reproduce the HuggingFace reference?
 runtime\build\npuembeddings.exe . --artifacts artifacts_b128il --threads 24 --pipeline 2
 
 # the two model packers must agree BYTE FOR BYTE (Python reference vs the
-# C++ one a release uses) -- a disagreement would be right-sized weights in
+# implementation a release uses) -- a disagreement would be right-sized weights in
 # the wrong order, which no tolerance check catches
 & "C:\Users\vegar\.conda\envs\iron\python.exe" tools/verify/verify_pack_parity.py
 
@@ -340,7 +340,7 @@ runtime\build\npuembeddings.exe . --artifacts artifacts_b128il --threads 24 --pi
 # rate, not-audio). Needs ffmpeg for the conversion case
 python tools/verify/verify_whisper_features.py
 
-# the Whisper tokenizer three ways: C++, the reference, HuggingFace
+# the Whisper tokenizer three ways: runtime, the reference, and HuggingFace
 python tools/verify/verify_whisper_tokenizer.py
 
 # the Whisper NPU stacks against transformers: the encoder's hidden states, one
@@ -386,7 +386,7 @@ python tools/verify/verify_design_numerics.py
 
 # WHAT EVERY CODE SAYS ABOUT EVERY ARCHITECTURE: the registry's own shape (63
 # cells, five statuses, one pinned tally), all four generated documents against
-# it, the C++ table against the Python one, and then all 63 cells run against
+# it, the runtime table against the Python one, and then all 63 cells run against
 # THIS binary -- a cell that says `honours` and does not dispatch fails it.
 # Needs the build and the NPU, which is why it is not in the cheap tier
 python tools/verify/verify_npu_op_matrix.py

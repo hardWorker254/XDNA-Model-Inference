@@ -29,7 +29,7 @@
 # shape so the runtime can CHECK its own arithmetic against the checkpoint's
 # rather than trust it.
 #
-# The alternative -- a shape interpreter in C++ -- would be a second ONNX
+# The alternative -- a shape interpreter in the reference implementation -- would be a second ONNX
 # runtime, and the two would disagree about a corner somewhere.
 #
 # WHAT RUNS WHERE
@@ -62,7 +62,7 @@ from tools.lib.npue import (ARCH_PADDLEOCR_DB_SVTR_CTC, Writer,   # noqa: E402
                             cols_for_device, gemm_b_layout, mac_for_device, tile_b,
                             to_bf16_bits)
 
-# Kept as a literal and compared against the C++ header by
+# Kept as a literal and compared against the reference header by
 # tools/verify/verify_ocr_geometry.py, because the two must agree and a test
 # that reads both is the only thing that can say they do.
 ARCH_STRING = "paddleocr_db_svtr_ctc"
@@ -1421,9 +1421,9 @@ def _resize_mode(n):
 # -- the front end's constants -------------------------------------------------
 #
 # These are the numbers PaddleOCR's own pipeline uses, and they are HERE, in the
-# container, rather than in the C++ -- for the reason arch=6's packer writes its
+# container, rather than in the reference -- for the reason arch=6's packer writes its
 # mean and std: the front end is a property of the CONTAINER, so a different
-# checkpoint's preprocessing is two numbers in a file and not a function in C++.
+# checkpoint's preprocessing is two numbers in a file and not a function in the reference implementation.
 #
 # The DETECTOR's normalisation is the ImageNet one PaddleOCR's
 # `NormalizeImage` carries for detection: the image is scaled by 1/255, the

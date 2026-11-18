@@ -2,7 +2,7 @@
 //!
 //! # Why a family is a trait and not a flag
 //!
-//! The C++ runtime had `maybe_*_mode()` functions that returned `-1` when a
+//! The reference runtime had `maybe_*_mode()` functions that returned `-1` when a
 //! mode did not apply. A `-1` is a value the caller must remember to check,
 //! and the check was forgotten once per mode per call site. The result was a
 //! family that answered questions that belonged to another family.

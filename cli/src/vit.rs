@@ -39,7 +39,7 @@ pub use npum_cpu::vit::Geometry;
 /// Read the geometry out of a container.
 ///
 /// Every key is REQUIRED. A container that does not carry the geometry
-/// is refused by the C++'s reader, and a default here would be a
+/// is refused by the reference's reader, and a default here would be a
 /// classifier that answers about a model nobody chose.
 pub fn read_geometry(container: &Container, path: &Path) -> Option<Geometry> {
     Geometry::read(container, path)
@@ -64,7 +64,7 @@ pub fn staged_bytes(g: &Geometry) -> u64 {
 
 /// The block, printed to the stderr.
 ///
-/// The rows are the C++'s, in the C++'s order, with the C++'s widths:
+/// The rows are the reference's, in the reference's order, with the reference's widths:
 /// a row is a name, a place and a reason, and the reason is what makes
 /// the row worth reading.
 pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64) {
@@ -163,7 +163,7 @@ fn row(name: &str, place: &str, why: &str) {
     eprintln!("             {name:<26} {place:<5} {why}");
 }
 
-/// `%.6g`: the C++'s own rendering of the epsilon.
+/// `%.6g`: the reference's own rendering of the epsilon.
 ///
 /// The epsilon is printed with `%.6g` and NOT with a decimal formatting,
 /// which turns the ViT's 1e-12 into "0.000000" -- the wrong number in the

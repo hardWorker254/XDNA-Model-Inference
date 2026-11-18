@@ -27,7 +27,7 @@
 # window. A reference that answers a different question is worse than no
 # reference, so this uses generate() plus the merge function directly.
 #
-# Env: numpy, torch, transformers, a C++ toolchain and XRT, and a built runtime
+# Env: numpy, torch, transformers, a reference toolchain and XRT, and a built runtime
 # (--exe, or runtime/build/npueembed).
 #
 # Usage:

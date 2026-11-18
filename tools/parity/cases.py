@@ -2,7 +2,7 @@
 """The case table: what the golden transcripts cover.
 
 This file IS the contract. Every case names one behaviour of the runtime
-that must not change when the runtime moves from C++ to Rust, and says why
+that must remain stable across runtime implementations, and says why
 it matters. A case with no `why` is a case that should be deleted.
 
 THE COVERAGE, and what it is for
@@ -82,7 +82,7 @@ class Case:
     needs: tuple[str, ...] = ()
     #: The models for whose path this case needs a COMPILED DESIGN SET.
     #:
-    #: The C++ runtime asks for one before it will run the embedding, the
+    #: The reference baseline asks for one before it will run the embedding, the
     #: classification and the transcription paths -- and it asks even when
     #: the container holds row-major host-side operands and every operation
     #: would run on the CPU. The check is unconditional, so a CPU-only
@@ -107,7 +107,7 @@ class Case:
     #: line.
     #:
     #: It does for every case but the ones that test the no-argument
-    #: behaviour, and the reason is not tidiness: the C++ runtime prints the
+    #: behaviour, and the reason is not tidiness: the reference baseline prints the
     #: help when it is given NO arguments at all -- `argc == 1` -- and the
     #: harness's `--root` would make that `argc == 3`, which is a different
     #: command with a different meaning. That command fell through to the
@@ -189,12 +189,11 @@ CASES: list[Case] = [
         binary="npuembeddings",
         argv=("list",),
         why="the catalogue table: its columns, its states and its notes are "
-            "what a reader checks before anything else. NOTE: the C++ "
-            "runtime's `list` IGNORES `--root` and reports the tree its own "
-            "binary lives in, so this case compares the two runtimes only "
-            "when the oracle's default root holds the same containers as the "
-            "fixture root. The Rust runtime honours `--root`, which is the "
-            "fix",
+            "what a reader checks before anything else. NOTE: the reference "
+            "baseline's `list` ignores `--root` and reports the tree its own "
+            "binary lives in, so this case compares runtimes only when the "
+            "reference default root holds the same containers as the fixture "
+            "root. This runtime honours `--root`.",
         tags=("subcommand",),
     ),
     Case(
@@ -341,7 +340,7 @@ CASES: list[Case] = [
         kind="cli",
         binary="npuembeddings",
         argv=("--no-such-flag",),
-        why="an unrecognised option is refused BY NAME; the C++ parser used "
+        why="an unrecognised option is refused BY NAME; the reference parser used "
             "to fall through silently, and a flag that did nothing looked "
             "exactly like a flag that worked",
         expect_code=2,
@@ -524,7 +523,7 @@ CASES: list[Case] = [
         why="the LAST occurrence of a flag wins, not the first: the output is "
             "padded to 64 tokens and nothing was truncated, where the first "
             "occurrence would have given 8 tokens and a note saying so. The "
-            "C++ tree got this wrong once and `serve <whisper> --threads 8` "
+            "A previous implementation got this wrong once and `serve <whisper> --threads 8` "
             "answered with 24 threads",
         tags=("flags",),
     ),

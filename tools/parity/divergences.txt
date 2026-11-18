@@ -1,8 +1,8 @@
-# The declared differences between the C++ oracle and the Rust runtime.
+# Declared differences between the baseline/reference outputs and the Rust runtime.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# A difference between the two runtimes is a FAILURE until somebody decides
+# A difference between compared runtimes is a FAILURE until somebody decides
 # it is not. The decision goes here, with its reason, and the file is in the
 # tree so that the reason is REVIEWED rather than remembered.
 #
@@ -16,9 +16,6 @@
 # One case id, a colon, and the reason. The reason is the whole point: a
 # case id with no reason is a suppression.
 #
-#     sub/add: the C++ runtime aborts inside glibc when the network path
-#              runs; the Rust runtime refuses cleanly.
-#
 # WHAT DOES NOT BELONG HERE
 #
 # * A difference that has not been decided on. That is a failure, and it
@@ -27,57 +24,44 @@
 #   design set. Those are skips, not divergences: they say that the case
 #   could not be run, which is a different statement from "the two
 #   runtimes differ here, on purpose".
-#
-sub/add: the C++ runtime ABORTS inside glibc ("invalid stdio handle") when
-         the network path runs on this machine, and the Rust runtime refuses
-         cleanly instead. A crash is not a contract: it says what the process
-         did, not what the runtime means.
 
-sub/list: the C++ runtime's `list` IGNORES `--root` and reports the tree its
-          own binary lives in; the Rust runtime honours it. The case still
-          compares equal -- the oracle's default root holds the same
-          containers as the fixture root -- but the two runtimes would answer
-          differently the moment the two trees held different models, and
-          the one that says what is installed must say what is installed
-          WHERE THE READER IS.
+sub/add: the reference baseline aborts in a libc/stdio path on this machine
+         when the network path runs, while this runtime refuses cleanly.
+         A crash is not a contract: it says what the process did, not what
+         the runtime means.
 
-error/dev-unknown-generation: the C++ runtime does NOT check the generation
-          by name. `--dev npu3` is carried into the design search and comes
-          back as a refusal that happens to name it -- a refusal that is
-          right for the wrong reason, because the answer depends on there
-          being no design set for it. The Rust runtime refuses the
-          generation BY NAME, which is the fix: the generation is the
-          DEVICE's, and a misspelled one is a misspelling whichever design
-          sets happen to be on disk.
+sub/list: the reference baseline ignores `--root` and reports the tree its own
+          binary lives in; this runtime honours it. The case may still compare
+          equal when both default roots hold the same containers, but the two
+          runtimes would answer differently when the trees held different
+          models.
 
-http/root: the C++'s server hardcodes TWO fields, and on this machine both
-          of them are wrong. The model id's "-npu" suffix -- the container
-          here is a HOST-LAYOUT f32 one, the encode ran on the host and the
-          array dispatched nothing, as the transcript's own status block
-          says. And the "amd-xdna2-npu" backend -- the device is npu1, as
-          the same transcript says ("device npu1 (arch 1)"), and the C++'s
-          server says "npu2" anyway. The Rust runtime reports what is true:
-          "-cpu" and "amd-xdna1-npu". Every other byte of the body is
-          identical, including the vector.
+error/dev-unknown-generation: the reference baseline does not validate the
+          generation name explicitly. An unknown value may be carried into the
+          design search and fail indirectly. This runtime rejects an unknown
+          generation by name.
 
-http/health: the same two fields, for the same two reasons, in the same
-             body.
+http/root: the reference server hardcodes fields that can be incorrect for the
+           actual serving path/device on this machine. This runtime reports the
+           observed model/backend information. Other body fields (including the
+           vector) are compared where applicable.
 
-http/models: the same two fields, for the same two reasons, in the same
-             body.
+http/health: same class of difference as `http/root` in the reported model/backend
+             fields.
 
-http/embeddings: the same two fields, for the same two reasons, in the same
-                 body. The VECTOR is byte-identical: the same container
-                 through the same arithmetic gives the same bytes, and the
-                 base64 form -- the raw float32 -- matches exactly.
+http/models: same class of difference as `http/root` in the reported model/backend
+             fields.
 
-http/wrong-family-labels: the same two fields, for the same two reasons, in
-                           the banner. The 404 body itself -- the one that
-                           names the right endpoint -- is byte-identical.
+http/embeddings: same class of difference as `http/root` in the reported
+                 model/backend fields. The vector payload is byte-identical in
+                 the compared form.
 
-error/unknown-model: the Rust runtime's "not installed / not known" refusal now
-                     also mentions the `weights/<family>/<model>/` layout as a
-                     valid location for a packed container (phase 10). The
-                     refusal is the same in kind and lists the same known
-                     models; only the hint about where a self-packed container
-                     can live is more accurate.
+http/wrong-family-labels: same class of difference as `http/root` in the banner
+                          metadata. The wrong-family 404 body that names the
+                          correct endpoint is compared separately.
+
+error/unknown-model: this runtime's "not installed / not known" refusal also
+                     mentions the `weights/<family>/<model>/` layout as a valid
+                     location for a packed container. The refusal is the same in
+                     kind and lists the same known models; only the location
+                     hint is more specific.

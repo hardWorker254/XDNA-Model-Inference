@@ -4,7 +4,7 @@
 //!
 //! A dense convolution is an im2col on the host and a GEMM on the array:
 //! the host gathers the patches into rows of `K = cin * kh * kw` values, and
-//! the array multiplies those rows by the weight panel. The C++ runtime
+//! the array multiplies those rows by the weight panel. The reference runtime
 //! splits it the same way (`conv::conv_array_dispatch`), and the split is
 //! not a convenience: the array's MMAC multiplies matrices, and the im2col
 //! is the only part of a convolution that is not a matrix multiplication.
@@ -22,7 +22,7 @@
 //! multiplied by the panel's padded rows, and a stale value there is a
 //! wrong number rather than a wrong shape -- which is harder to see than a
 //! wrong shape is. So the padded columns are zeroed, and they are zeroed
-//! FIRST and copied SECOND, exactly as the C++ runtime does it.
+//! FIRST and copied SECOND, exactly as the reference runtime does it.
 //!
 //! # THE BIAS IS PADDED TOO
 //!

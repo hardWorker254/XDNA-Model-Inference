@@ -39,7 +39,7 @@
 # good as the corpus it was measured on.
 #
 # Env: numpy, torch, transformers -- BUILD TIME ONLY. The shipped runtime stays
-# C++; this runs when a container is packed, never when it is served.
+# reference; this runs when a container is packed, never when it is served.
 
 from __future__ import annotations
 

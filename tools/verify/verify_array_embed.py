@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #===----------------------------------------------------------------------===//
-# The text family's array path, against the C++ oracle.
+# The text family's array path, against the reference baseline.
 #
 # Runs the same container through both runtimes with the same --npu-ops and
 # compares the vectors.
@@ -109,7 +109,7 @@ def main() -> int:
         print(f"# ours disp   {ours_disp}")
         # THE DISPATCH COUNTS, AND WHEN THEY CAN BE COMPARED.
         #
-        # The C++ encodes a batch of texts in one tier, so one dispatch
+        # The reference encodes a batch of texts in one tier, so one dispatch
         # computes every text's rows; this runtime encodes one text at a
         # time, so one dispatch computes one text's rows. The two counts
         # are therefore the same only for a single text -- and for one
@@ -120,7 +120,7 @@ def main() -> int:
             return 1
         if a.size // 384 > 1:
             print(
-                f"# note        the counts are per batch: the C++ encoded "
+                f"# note        the counts are per batch: the reference encoded "
                 f"{a.size // 384} texts in one tier and this runtime encoded them one at a "
                 f"time, so {ours_disp} against {oracle_disp} is expected"
             )

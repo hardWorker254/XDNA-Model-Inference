@@ -4,7 +4,7 @@
 //!
 //! Three designs, three shapes, one mechanism: the array computes a block
 //! of rows, the host fills it, the device runs the core, the host reads the
-//! block back. The C++ runtime called the object `NpuEltwise` and it is the
+//! block back. The reference runtime called the object `NpuEltwise` and it is the
 //! same thing here.
 //!
 //! # THREE DESIGNS AND THREE CONTEXTS
@@ -309,8 +309,8 @@ impl<T: Transport> EltwiseDesign<T> {
     ///
     /// The count is the number of times the FAMILY asked the array to do
     /// something, and the attention's own softmax is not the family's ask:
-    /// the C++'s encoder counts the attention's two GEMMs and not the
-    /// softmax between them, and a count that disagreed with the C++'s on
+    /// the reference's encoder counts the attention's two GEMMs and not the
+    /// softmax between them, and a count that disagreed with the reference's on
     /// a run that did exactly the same work would be a count of something
     /// else.
     pub fn softmax_uncounted(&mut self, x: &mut [f32], n_rows: usize) -> Result<(), ArrayError> {

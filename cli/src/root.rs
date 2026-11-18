@@ -2,7 +2,7 @@
 //!
 //! # The search, and why it is in this order
 //!
-//! The C++ runtime had this function and it was the source of a quiet bug:
+//! The reference runtime had this function and it was the source of a quiet bug:
 //! a release staged or unzipped INSIDE the source tree
 //! (`dist\npuembeddings-0.2.0\`) climbed past its own directory, found the
 //! repository's `models/` and `runtime/`, and served the repo's containers
@@ -34,7 +34,7 @@
 //!
 //! The source tree is recognised by BOTH `models/` and `runtime/`, because a
 //! design alone would stop at `runtime/`, which carries the design sets but
-//! not the models. The C++ code had exactly that bug while fixing this
+//! not the models. The reference code had exactly that bug while fixing this
 //! function: checking both conditions at each level made `runtime/` win over
 //! the repository root.
 //!

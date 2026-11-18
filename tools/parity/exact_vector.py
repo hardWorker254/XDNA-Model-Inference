@@ -2,11 +2,11 @@
 """The oracle's EXACT vector: the float32 BYTES, not a decimal rendering.
 
 The golden transcripts hold seven significant digits, which is enough to
-catch a wrong arithmetic and not enough to prove a right one. The C++'s HTTP
+catch a wrong arithmetic and not enough to prove a right one. The reference's HTTP
 endpoint also speaks `encoding_format: "base64"`, and that carries the float32
 bytes themselves -- so this script is the bit-exactness oracle.
 
-    python tools/parity/exact_vector.py --bin <the C++ binaries> --root <the fixture root>
+    python tools/parity/exact_vector.py --bin <the reference binaries> --root <the fixture root>
 
 It prints the base64 of one vector, and the Rust's own test compares against
 those bytes.
@@ -46,7 +46,7 @@ def wait_for_port(port: int, deadline: float, proc) -> bool:
 def main() -> int:
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", required=True, help="the directory with the C++ binaries")
+    ap.add_argument("--bin", required=True, help="the directory with the reference binaries")
     ap.add_argument("--root", default=str(here / "fixtures" / "root"))
     ap.add_argument("--model", default="all-MiniLM-L6-v2")
     ap.add_argument("--text", default="a golden transcript is a contract")

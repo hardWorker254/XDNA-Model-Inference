@@ -15,7 +15,7 @@
 //! while the command line said it was on the array, and that is the
 //! failure the whole flag exists to prevent.
 //!
-//! # The texts are the C++'s, word for word
+//! # The texts are the reference's, word for word
 //!
 //! They are not paraphrases. A refusal is read by someone whose command
 //! line did not work, and the second one they read has to say the same
@@ -26,7 +26,7 @@
 //!
 //! The codes are a SET, so they are in alphabetical order, and the first
 //! one that the architecture does not have is the one that is named. The
-//! listing itself is echoed unchanged where the C++'s echoes it: what
+//! listing itself is echoed unchanged where the reference's echoes it: what
 //! the user typed is evidence, and a message that rewrites it is a
 //! message that hides what was asked.
 
@@ -35,7 +35,7 @@ use crate::Family;
 /// The refusal for an operation code this architecture does not have.
 ///
 /// `listing` is the flag's value as the user typed it, and `codes` are
-/// the codes it parsed to, in alphabetical order -- the order the C++'s
+/// the codes it parsed to, in alphabetical order -- the order the reference's
 /// `std::set` gives.
 ///
 /// `None` when the architecture has every code, and when there is

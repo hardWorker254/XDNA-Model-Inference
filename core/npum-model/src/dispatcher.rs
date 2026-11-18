@@ -9,7 +9,7 @@
 //! | `--vulkan-ops attn,softmax` | new: the GPU takes what the array does badly |
 //! | `--ops-placement auto` | the backend decides, from its capabilities and the profile |
 //!
-//! The mixed mode is the C++ semantics, kept 1:1, because a script with
+//! The mixed mode is the reference semantics, kept 1:1, because a script with
 //! `--npu-ops` in it means something specific and that meaning does not
 //! change because the runtime was rewritten.
 //!
@@ -70,7 +70,7 @@ impl Dispatcher {
     ///
     /// The placement table is built from the backend's plan and the
     /// operation lists the flags carried. An operation in neither list runs
-    /// on the host, which is the C++ default and the safe one: a backend
+    /// on the host, which is the reference default and the safe one: a backend
     /// that was not asked to do something is not asked to do it.
     pub fn new(
         backend: Box<dyn Backend>,

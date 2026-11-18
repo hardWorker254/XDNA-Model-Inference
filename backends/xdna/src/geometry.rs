@@ -9,7 +9,7 @@
 //!   npu2 / aie2p    bf16 (8, 8)   i8 (8, 8)
 //! ```
 //!
-//! The C++ runtime carried these as STRINGS, in two places that had to agree:
+//! The reference runtime carried these as STRINGS, in two places that had to agree:
 //! the packer asked for "npu1" and got (8, 4), the exporter asked for the
 //! same and got (8, 4), and both were written down again in the runtime's
 //! own dispatch code. A container packed for one board and read by a design
@@ -23,7 +23,7 @@
 //!
 //! # The context budget is Option, not a number
 //!
-//! The C++ runtime's `context_budget()` returned a plain integer, and for
+//! The reference runtime's `context_budget()` returned a plain integer, and for
 //! npu2 it returned a number nobody had measured. The comparison then read
 //! as "the budget is zero" and the process refused to run -- or, worse, the
 //! comparison was skipped and the contention went unnoticed.

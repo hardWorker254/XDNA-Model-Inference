@@ -1198,7 +1198,7 @@ pub fn g9(v: f64) -> String {
 
 /// Escape a file name the way the oracle's JSON does.
 ///
-/// The C++ prints the path through `%s`, so the quote and the backslash are the
+/// The reference prints the path through `%s`, so the quote and the backslash are the
 /// only two an editor would notice; the newline is folded to `\n` because a
 /// path with one would break the object it is in.
 fn json_path(s: &str) -> String {

@@ -1,6 +1,6 @@
 //! The pose detector, printed as the CLI prints it.
 //!
-//! The C++ oracle has its own test binary for this
+//! The reference baseline has its own test binary for this
 //! (`runtime/tests/test_pose.py` and the `npuimage pose` transcript), and
 //! this example is the Rust's counterpart. The two are compared BYTE for
 //! byte on the JSON object.

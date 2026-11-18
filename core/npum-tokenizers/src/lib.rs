@@ -2,8 +2,8 @@
 //!
 //! # One source of truth for the tables
 //!
-//! The C++ tree had FOUR tokenizers and the tables in THREE places: the
-//! Python packer wrote them into the container, a C++ generator in the binary
+//! The previous implementation had FOUR tokenizers and the tables in THREE places: the
+//! Python packer wrote them into the container, a reference generator in the binary
 //! could rebuild them, and `whisper_unicode_tables.hpp`,
 //! `xlmr_unicode_tables.hpp` and `bert_unicode_tables.hpp` -- 6 034 lines of
 //! baked-in tables -- sat in the include tree as a third copy.
@@ -13,10 +13,10 @@
 //! differently depending on which code path asks.
 //!
 //! So: the packer ALWAYS puts the table in the container, and the runtime
-//! NEVER generates one. The tables come from the container, and the C++
+//! NEVER generates one. The tables come from the container, and the reference
 //! generators -- `gemma_tokenizer_gen.cpp`, `xlmr_tokenizer_gen.cpp` -- and
 //! the hand-written JSON parser -- `json_min.cpp` -- go away, which is 1 150
-//! lines of C++ and one whole class of bug.
+//! lines of reference and one whole class of bug.
 //!
 //! # Why there is no Python-compatible crate
 //!

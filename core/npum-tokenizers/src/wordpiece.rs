@@ -25,7 +25,7 @@
 //! Because BERT's BasicTokenizer treats every codepoint Python calls a space
 //! as a separator, and the whitespace that reaches step 2 is whatever
 //! survived step 1. A tab and a non-breaking space are both separators -- and
-//! the C++ runtime's `is_space` table was 9 ranges wide for exactly that
+//! the reference runtime's `is_space` table was 9 ranges wide for exactly that
 //! reason.
 //!
 //! # The fold is PER CHARACTER

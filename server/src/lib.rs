@@ -15,7 +15,7 @@
 //!
 //! The response BODIES are 1:1 -- the same JSON, the same keys, the same
 //! numbers -- and so are the status codes and the `Content-Type`. The one
-//! thing that does change is the implementation: the C++ tree had FOUR
+//! thing that does change is the implementation: the previous implementation had FOUR
 //! separate HTTP implementations, each with its own accept loop, and this
 //! is one router with eight routes.
 //!

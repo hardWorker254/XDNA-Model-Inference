@@ -4,19 +4,19 @@
 //!
 //! The container says how many positions it can feed -- 256 for
 //! all-MiniLM-L6-v2 -- and the DESIGN SET says how many it was compiled for,
-//! which is 64. The C++ runtime takes the DESIGN's number, and the
+//! which is 64. The reference runtime takes the DESIGN's number, and the
 //! difference is not academic: a text of a hundred tokens is REFUSED at 64
 //! and answered at 256, and the vector of the first sixty-four tokens is
 //! not the vector of the text.
 //!
-//! So the length is looked up in the same places the C++ looks: the design
+//! So the length is looked up in the same places the reference looks: the design
 //! set on disk, then the design the container carries, and only then the
 //! container's own limit -- which is the last resort, because a CPU-only
 //! run has no reason to need a design set and must not fail without one.
 //!
 //! # The batching
 //!
-//! The C++ encodes in tiers of at most sixteen sequences, because that is
+//! The reference encodes in tiers of at most sixteen sequences, because that is
 //! what its design sets were built for. The Rust encodes in chunks of
 //! sixteen for the same reason -- the memory -- and NOT because the numbers
 //! depend on it: every row of the forward pass is independent of every other
@@ -68,7 +68,7 @@ pub struct Refusal {
 /// Encode the texts and write the vectors.
 ///
 /// `texts` are the lines of the input file, in order, empty ones included:
-/// the C++ pushes every line it reads, and a line that is empty is a text
+/// the reference pushes every line it reads, and a line that is empty is a text
 /// that embeds to something.
 pub fn run(
     path: &Path,
@@ -269,7 +269,7 @@ pub fn run(
     let seq = sequence_length(path, &container, root, artifacts.as_deref());
     let hidden = model.spec.hidden;
 
-    // The vocabulary's size, and then the texts. The C++'s order, and the
+    // The vocabulary's size, and then the texts. The reference's order, and the
     // reason for it: the tokenizer is loaded here and not before.
     crate::status::print_tokenizer(tokenizer.vocab_size());
     println!("  input      {} texts", texts.len());
@@ -454,7 +454,7 @@ fn read_seq_bytes(bytes: &[u8]) -> Option<usize> {
 /// The texts of an input file.
 ///
 /// Every line is a text, empty ones included, and a trailing `\r` is
-/// dropped: the C++ does exactly this, and a file written on Windows would
+/// dropped: the reference does exactly this, and a file written on Windows would
 /// otherwise embed a `\r` into every text.
 pub fn read_texts(path: &str) -> Result<Vec<String>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot open {path}: {e}"))?;
@@ -471,7 +471,7 @@ pub fn wants_out_file(args: &Args) -> Option<String> {
 
 /// The design set's directory, if there is one.
 ///
-/// The C++'s order: the root's `runtime/artifacts/<model>/artifacts_npu1`
+/// The reference's order: the root's `runtime/artifacts/<model>/artifacts_npu1`
 /// first, because that is where the exporter puts it and where the status
 /// block says it is.
 pub fn find_artifacts(root: &Path, model_name: &str) -> Option<PathBuf> {
@@ -567,7 +567,7 @@ pub fn places(
     // AND THE FLAG IS WHAT DECIDES THE ARRAY'S PASSES, not the design
     // set's existence: a design set on the disk is not a dispatch, and a
     // status block that said "on the ARRAY" for a pass the host computed
-    // would be a block that lies. The C++'s block reads it the same way.
+    // would be a block that lies. The reference's block reads it the same way.
     places.layn = array_place(path, root, "layernorm", wants_layernorm(args))
         .map(crate::status::OpWhere::Array)
         .or_else(|| gpu.clone());
@@ -1059,7 +1059,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                 return crate::EXIT_REFUSED;
             }
         };
-        // The banner comes before the refusal, as in the C++.
+        // The banner comes before the refusal, as in the reference.
         crate::status::announce(
             path,
             root,

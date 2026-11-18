@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# The XRT transport: a small C shim over XRT's C++ API, compiled by build.rs.
+# The XRT transport: a small C shim over XRT's reference API, compiled by build.rs.
 #
 # DEFAULT ON, because it is what this project has always used and what a
 # machine with XRT installed has. It is a DEFAULT and not a hard dependency
@@ -22,8 +22,8 @@ xrt = []
 
 # The direct transport: ioctls of the amdxdna driver on /dev/accel/accel0.
 #
-# No XRT, no C++, and no PYTHONPATH=/opt/xilinx/xrt/python -- which is what
-# the C++ runtime needed, and the reason it required Python to run at all.
+# No XRT, no reference, and no PYTHONPATH=/opt/xilinx/xrt/python -- which is what
+# the reference runtime needed, and the reason it required Python to run at all.
 direct = []
 
 [dependencies]

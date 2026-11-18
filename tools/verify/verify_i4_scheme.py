@@ -1,4 +1,4 @@
-# NpuEmbeddings -- the int4 scheme, checked against itself, and against C++.
+# NpuEmbeddings -- the int4 scheme, checked against itself, and against a reference implementation.
 # SPDX-License-Identifier: Apache-2.0
 #
 # WHY THIS EXISTS ALONGSIDE tools/verify/verify_npue.py and verify_i8_scheme.py.
@@ -17,7 +17,7 @@
 # `k // int4_group`. Two implementations of that one order now exist:
 #
 #     npue.fold_i4()                    (Python: at read time, and at pack time)
-#     common/int4_panel.hpp             (C++, at stage time)
+#     common/int4_panel.hpp             (reference, at stage time)
 #
 # Two definitions of one order is exactly what byte equality exists to hold
 # apart, because every failure they can have -- a nibble read at the wrong
@@ -35,7 +35,7 @@
 # panel, ten injected faults each of which the gate must NAME, and the
 # refusals that have to be refusals rather than plausible numbers.
 #
-# Env: numpy, a C++17 compiler, no checkpoint and no NPU. Usage:
+# Env: numpy, a reference17 compiler, no checkpoint and no NPU. Usage:
 #   python tools/verify/verify_i4_scheme.py
 
 import contextlib
@@ -636,7 +636,7 @@ def test_refusals():
                   "a still-packed payload handed to the gate is named")
 
 
-# -- 7. the C++ decode -------------------------------------------------------
+# -- 7. the reference decode -------------------------------------------------------
 
 def probe_path(tmp):
     """Compile int4_panel_probe. Returns (path, None) or (None, message).
@@ -773,7 +773,7 @@ def _local_device():
 
 
 def test_cpp():
-    print("\n7. the C++ decode, compiled and compared byte for byte")
+    print("\n7. the reference decode, compiled and compared byte for byte")
     print("   (the order npue.fold_i4 and common/int4_panel.hpp each define)")
     with tempfile.TemporaryDirectory() as tmp:
         probe, err = probe_path(tmp)
@@ -793,7 +793,7 @@ def test_cpp():
                 names = ["layer.0.qkv", "layernorm.weight"]
                 p = run_probe(probe, path, names)
                 if p.returncode:
-                    report(False, f"C++ agrees with Python at group={g}",
+                    report(False, f"reference agrees with Python at group={g}",
                            f"-> {p.stdout.strip().splitlines()[-1:]}")
                     continue
                 same = True
@@ -804,15 +804,15 @@ def test_cpp():
                         j = next((k for k, (a, b) in
                                   enumerate(zip(want, got)) if a != b),
                                  min(len(want), len(got)))
-                        report(False, f"C++ agrees with Python at group={g}",
+                        report(False, f"reference agrees with Python at group={g}",
                                f"{n}: first difference at byte {j}")
                         same = False
                         break
                 if same:
-                    report(True, f"C++ agrees with Python at group={g}",
+                    report(True, f"reference agrees with Python at group={g}",
                            f"{len(names)} operands, byte-identical")
 
-        # THE REFUSALS, which is where a C++ port usually differs from Python:
+        # THE REFUSALS, which is where a reference implementation usually differs from Python:
         # the two sides' error messages and their ORDER of checks. Each fault
         # below is caught by one of them and this section says which.
         cases = [
@@ -836,7 +836,7 @@ def test_cpp():
                 p = run_probe(probe, path, names, bf16_design=bool(flag))
                 out = p.stdout
                 hit = p.returncode == 1 and needle in out
-                report(hit, f"C++ refuses: {label}",
+                report(hit, f"reference refuses: {label}",
                        "" if hit else f"-> rc={p.returncode} "
                                       f"{out.strip().splitlines()[-1:]}")
 
@@ -849,12 +849,12 @@ def test_cpp():
         with container(w) as (r, path):
             p = run_probe(probe, path, ["layer.0.qkv"])
             hit = p.returncode == 1 and "states no int4_group" in p.stdout
-            report(hit, "C++ refuses: no int4_group in config",
+            report(hit, "reference refuses: no int4_group in config",
                    "" if hit else f"-> rc={p.returncode} {p.stdout.strip()}")
 
 
 def main():
-    print("int4 scheme self-check (numpy + a C++17 compiler, no NPU)\n")
+    print("int4 scheme self-check (numpy + a reference17 compiler, no NPU)\n")
     test_honest()
     test_groups()
     test_zero_column()
@@ -871,7 +871,7 @@ def main():
         return 1
     print("PASS -- the scheme round-trips at every group size, every injected\n"
           "        fault was named by the gate that exists to name it, and the\n"
-          "        C++ decode is byte-identical to Python's")
+          "        reference decode is byte-identical to Python's")
     return 0
 
 

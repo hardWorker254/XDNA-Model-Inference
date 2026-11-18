@@ -26,19 +26,19 @@
 //!
 //! # The kernels
 //!
-//! `kernels.rs` holds the arithmetic, and it is a PORT of the C++ runtime's
+//! `kernels.rs` holds the arithmetic, and it is a PORT of the reference runtime's
 //! host kernels rather than a fresh implementation of the mathematics. The
 //! reasons are in `kernels.rs` itself; the short version is that the golden
 //! transcripts are a contract, and a contract is a number, not a shape.
 //!
 //! The rules the port follows:
 //!
-//! * **The FMA is explicit.** The C++'s AVX2 paths contract the multiply
+//! * **The FMA is explicit.** The reference's AVX2 paths contract the multiply
 //!   and the add into ONE rounding, and `f32::mul_add` is the Rust spelling
 //!   of exactly that. A contraction the compiler does on its own is not
 //!   relied upon, because a compiler is free to stop doing it.
 //!
-//! * **The summation orders are the C++'s.** Floating-point addition is not
+//! * **The summation orders are the reference's.** Floating-point addition is not
 //!   associative, so "sum the row" is not a function until the order is
 //!   named. The orders are named in `kernels.rs`.
 //!

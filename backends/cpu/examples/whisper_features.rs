@@ -1,6 +1,6 @@
 //! Whisper's audio front end, dumped as hex.
 //!
-//! The C++ oracle has its own test binary for this
+//! The reference baseline has its own test binary for this
 //! (`runtime/tests/test_whisper_features.cpp`), and it prints the same
 //! three lines: the samples, the mel tensor and the convolution's
 //! output. This example is the Rust's counterpart of it, and the two

@@ -2,9 +2,9 @@
 //!
 //! # This is a port, not a reimplementation
 //!
-//! The C++ runtime's `BertEncoder::run()` is the definition of what a BERT
+//! The reference runtime's `BertEncoder::run()` is the definition of what a BERT
 //! container means at run time, and the golden transcripts were recorded
-//! through it. So the shape of the pass below is the C++'s shape, including
+//! through it. So the shape of the pass below is the reference's shape, including
 //! the parts that are not how a transformer is usually written:
 //!
 //! * the LayerNorm comes AFTER the attention and AFTER the FFN (post-LN),
@@ -112,7 +112,7 @@ pub const IMPLEMENTED_ARCH: &str = "bert_abs_gelu_postln";
 
 /// What the forward pass spent its time on.
 ///
-/// The C++'s `BertEncoder::reset_timers` / `timings()` pair exists for one
+/// The reference's `BertEncoder::reset_timers` / `timings()` pair exists for one
 /// reason: the status block's TIME SPLIT is the measurement every
 /// optimisation question about this path starts from, and it is only
 /// readable after the pass. The Rust measures the same four things -- the
@@ -121,7 +121,7 @@ pub const IMPLEMENTED_ARCH: &str = "bert_abs_gelu_postln";
 /// nothing.
 ///
 /// The attention is counted TWICE on purpose: `attn` is the whole block and
-/// `qk` and `av` are its halves, and the C++ says so in its own comment --
+/// `qk` and `av` are its halves, and the reference says so in its own comment --
 /// "count it once" -- because counting the block and its halves together
 /// double-counts every attention pass.
 #[derive(Debug, Clone, Copy, Default)]
@@ -142,8 +142,8 @@ pub struct Timings {
     pub host_gelu: f64,
     /// The whole attention block, in seconds.
     ///
-    /// THE C++'s `t_attn` IS QK^T AND softmax.V, and not the softmax: the
-    /// C++ counts the softmax in its own row, and counting it here as well
+    /// THE reference's `t_attn` IS QK^T AND softmax.V, and not the softmax: the
+    /// reference counts the softmax in its own row, and counting it here as well
     /// counts it twice -- once in this row and once in the softmax's.
     pub attention: f64,
     /// The QK^T half of the attention, in seconds.
@@ -154,7 +154,7 @@ pub struct Timings {
     ///
     /// The projections and the elementwise passes, measured around the
     /// call. It is zero on a host run -- which is what the status block's
-    /// split is read against -- and the C++'s own split puts the
+    /// split is read against -- and the reference's own split puts the
     /// elementwise passes in the same row as the projections', because
     /// both are the array's time.
     pub array_gemm: f64,
@@ -170,7 +170,7 @@ pub struct Timings {
 impl Timings {
     /// The sum of the rows the status block prints.
     ///
-    /// The C++'s `busy`: the array's conversion, upload, dispatch, download
+    /// The reference's `busy`: the array's conversion, upload, dispatch, download
     /// and bias rows -- all zero on the host path -- plus the host rows and
     /// the attention.
     pub fn busy(&self) -> f64 {
@@ -731,7 +731,7 @@ impl BertModel {
 
     /// The forward pass over `[rows, hidden]`, in place.
     ///
-    /// The C++'s `BertEncoder::run()`, step for step.
+    /// The reference's `BertEncoder::run()`, step for step.
     fn forward(
         &self,
         ops: &mut dyn Ops,
@@ -881,7 +881,7 @@ impl BertModel {
                         &layer.qkv_bias,
                         &mut qkv,
                     )?;
-                    // The host's own GEMM has NO row in the C++'s split --
+                    // The host's own GEMM has NO row in the reference's split --
                     // the row that holds the projections' time is the
                     // array's -- so the host's projection time is not
                     // recorded. The GPU's is, because the GPU's row is
@@ -991,7 +991,7 @@ impl BertModel {
                 let av_s = t_av.elapsed().as_secs_f64();
                 timings.av += av_s;
                 // THE ATTENTION BLOCK IS QK^T AND softmax.V, and not the
-                // softmax: the C++'s `t_attn` is those two, and the softmax
+                // softmax: the reference's `t_attn` is those two, and the softmax
                 // is counted in its own row. Counting it here as well counts
                 // it twice.
                 timings.attention += qk_s + av_s;
@@ -1140,7 +1140,7 @@ impl BertModel {
         Ok(x.to_vec())
     }
 
-    /// `QK^T`, as the C++'s `qk_impl` computes it.
+    /// `QK^T`, as the reference's `qk_impl` computes it.
     ///
     /// For every (sequence, head, query position): the query against every
     /// key of the same sequence and head. The dot product is eight lanes
@@ -1189,7 +1189,7 @@ impl BertModel {
         }
     }
 
-    /// `softmax.V`, as the C++'s `av_impl` computes it.
+    /// `softmax.V`, as the reference's `av_impl` computes it.
     ///
     /// Eight lane accumulators, one per eight of the head's width, and an
     /// FMA per key.
@@ -1216,7 +1216,7 @@ impl BertModel {
             for i in 0..seq {
                 let a = &scores[(p * seq + i) * sc_cols..][..seq];
                 let o = &mut ctx[(b * seq + i) * hidden + h * head_dim..][..head_dim];
-                // One accumulator per eight of the head's width: the C++'s
+                // One accumulator per eight of the head's width: the reference's
                 // `__m256 acc[NV]`, and not one accumulator for the whole
                 // head. The difference is the ORDER of the additions, and
                 // the order is the answer.
@@ -1235,7 +1235,7 @@ impl BertModel {
         }
     }
 
-    /// The pooling, as the C++'s `pool_rows` computes it.
+    /// The pooling, as the reference's `pool_rows` computes it.
     ///
     /// The accumulator is a DOUBLE, and so is the norm. The mean pooling
     /// divides by the number of unmasked positions, and the `[CLS]` pooling
@@ -1251,7 +1251,7 @@ impl BertModel {
             let mut acc = vec![0.0f64; hidden];
             if self.spec.cls_pooling {
                 if amb[0] == 0.0 {
-                    // The C++ throws here. A refusal is the Rust's shape for
+                    // The reference throws here. A refusal is the Rust's shape for
                     // the same condition: an empty sequence has no pooled
                     // vector, and zero is a plausible answer to a question
                     // nobody asked.

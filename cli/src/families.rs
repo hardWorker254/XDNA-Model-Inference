@@ -33,7 +33,7 @@ pub type Outcome = i32;
 
 /// `embed`.
 ///
-/// The vectors come from the CPU backend, and they are the C++'s vectors:
+/// The vectors come from the CPU backend, and they are the reference's vectors:
 /// the same container through the same arithmetic gives the same bytes, and
 /// `backends/cpu/tests/exact.rs` is the gate that says so.
 
@@ -75,7 +75,7 @@ pub(crate) fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String>
 
 /// The warning for a model this build cannot verify.
 ///
-/// The C++'s `warn_if_unpinned`: loud, and first, because what it warns
+/// The reference's `warn_if_unpinned`: loud, and first, because what it warns
 /// about -- weights that NOTHING checks -- is a property of the model and
 /// not of the run. A run that goes quietly is how an unverified model
 /// ends up in production.

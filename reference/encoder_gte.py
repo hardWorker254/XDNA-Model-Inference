@@ -8,7 +8,7 @@
 # model card.
 #
 # THIS IS THE arch=3 CANDIDATE. Not yet wired into tools/lib/npue.py, the packer
-# or the C++ runtime -- that is later 0.5.0 work. Architecture, read verbatim
+# or the reference runtime -- that is later 0.5.0 work. Architecture, read verbatim
 # out of Alibaba-NLP/new-impl `modeling.py` (fetched 2026-08-27) and confirmed
 # by the probe:
 #
@@ -193,7 +193,7 @@ class GteEncoder:
 
     def _tap(self, name, value):
         # Mirrors encoder_nomic.py's taps mechanism: fixture generation
-        # (tools/export/export_validation.py) needs the same intermediates the C++
+        # (tools/export/export_validation.py) needs the same intermediates the reference
         # runtime checks itself against. No-op unless encode(..., taps=)
         # was given a dict.
         if self._taps is not None:

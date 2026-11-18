@@ -37,12 +37,12 @@
 # It does NOT check that the runtime agrees -- that is verify_pose_quant.py, on
 # detections, because the only error an operator can see is a detection.
 #
-# It DOES check one thing no numpy function can: that the C++ reader's
+# It DOES check one thing no numpy function can: that the reference reader's
 # dequantisation is the same arithmetic. `rt_reads` below is a line-by-line
 # transcription of runtime/src/pose/geometry.cpp's i8 and i4 paths, and it has
 # to agree with conv_quant.dequantise BIT for BIT. Two implementations of one
 # scheme that agree to 1e-7 would still disagree in the last place the last
-# weight lands, and there is no test of the C++ reader here that would notice.
+# weight lands, and there is no test of the reference reader here that would notice.
 #
 # Env: numpy + onnx.
 #
@@ -70,7 +70,7 @@ def rt_reads(payload, wscale, gscale, N, K, dtype, group):
     same sign extension, the same `k / group` and the same [G, N] stride. It is
     a transcription to be COMPARED, not an implementation to be fast, and the
     obvious vectorised version of it is the thing most likely to differ from the
-    C++ in exactly the way this is looking for.
+    reference in exactly the way this is looking for.
     """
     # A TENSOR WITH NO SCALE SIDECAR, and read first so that `None` never has
     # to be turned into an array below: bf16 stores the weight's own bits and
@@ -255,7 +255,7 @@ def main():
                 bad = np.argwhere(rt != deq)
                 n, k = (int(x) for x in bad[0])
                 raise SystemExit(
-                    f"{base}: the C++ reader and the packer disagree at [{n}, "
+                    f"{base}: the reference reader and the packer disagree at [{n}, "
                     f"{k}] -- runtime {rt[n, k]!r}, packer {deq[n, k]!r}, "
                     f"{len(bad)} of {N * K} values. The scheme is agreed by this "
                     f"script; the two implementations of it are not, and only "
@@ -271,7 +271,7 @@ def main():
                       f"rel_fro {rel:.4g}")
         print(f"  checked {checked} convolutions against the checkpoint")
         print(f"  worst relative Frobenius {worst[0]:.4g}  {worst[1]}")
-        print(f"  C++ reader and packer agree bit-for-bit on all of them")
+        print(f"  reference reader and packer agree bit-for-bit on all of them")
         print()
         print("This gates the CONTAINER against the checkpoint. It does not say "
               "the detections are the same -- tools/verify/verify_pose_quant.py "

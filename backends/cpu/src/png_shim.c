@@ -15,13 +15,13 @@
 // a word that reads right. Calling the same library the oracle calls is not
 // a shortcut here; it is the only way to be RIGHT.
 //
-// So this file is the C++ runtime's `decode_png`, unchanged in what it asks
+// So this file is the reference runtime's `decode_png`, unchanged in what it asks
 // libpng for, with the struct layout kept on the C side where libpng's
 // headers define it. The Rust side sees three integers and a byte buffer.
 //
 // WHAT IT DOES NOT CHANGE
 // -----------------------
-// The same decisions the C++ runtime makes, and for the same reasons:
+// The same decisions the reference runtime makes, and for the same reasons:
 //
 //   * a PALETTE image becomes RGB (png_set_palette_to_rgb);
 //   * a GRAY or GRAY_ALPHA image becomes RGB by REPLICATION

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Verify an arch=8 MediaPipe Pose container and the C++ runtime built from it.
+"""Verify an arch=8 MediaPipe Pose container and the reference runtime built from it.
 
 WHAT THIS FILE IS, AND WHAT IT IS NOT
 -------------------------------------
@@ -8,7 +8,7 @@ The arithmetic of the convolutions is written in numpy here, because this file i
 checking the PACKER's weights and graph and then the RUNTIME's front end, and
 neither is evidence about anyone's kernels. Its job is narrower than that of a
 kernel benchmark and it says so: "this container holds these two checkpoints in
-this arrangement, and the C++ front end answers the recorded OpenCV zoo's
+this arrangement, and the reference front end answers the recorded OpenCV zoo's
 question."
 
 FOUR SECTIONS, AND THE SPLIT IS THE USEFUL PART
@@ -18,7 +18,7 @@ FOUR SECTIONS, AND THE SPLIT IS THE USEFUL PART
      difference of front ends. All seven graph outputs of both networks.
   2. the anchor table, against an independent derivation from the container's own
      pyramid levels.
-  3. the C++ runtime, against the numbers recorded from the OpenCV zoo.
+  3. the reference runtime, against the numbers recorded from the OpenCV zoo.
   4. the array path, against the host path, on the same frame.
 
 Section 1 passing and section 3 failing is a FRONT END fault and nothing else.
@@ -627,7 +627,7 @@ def section_2(reader, verbose):
 
 
 # ==============================================================================
-# section 3 -- the C++ runtime, against the recorded zoo answer
+# section 3 -- the reference runtime, against the recorded zoo answer
 # ==============================================================================
 
 
@@ -802,7 +802,7 @@ def section_4(reader, verbose):
 
 
 def section_3(reader, verbose):
-    print("  3. the C++ runtime, against the numbers recorded from the OpenCV zoo")
+    print("  3. the reference runtime, against the numbers recorded from the OpenCV zoo")
     with open(GOLDEN_DET) as f:
         gd = json.load(f)
     with open(GOLDEN_POSE) as f:
@@ -937,7 +937,7 @@ def section_3(reader, verbose):
 # worse than no case at all: it is a claim that the section covers something it
 # does not.
 #
-# They are all faults in THIS file's reader or in the container it reads. The C++
+# They are all faults in THIS file's reader or in the container it reads. The reference
 # binary is not faulted from here -- a binary would have to be rebuilt per case,
 # and arch=8's own refusals (--serve, --npu-ops, --artifacts, arch=6's and
 # arch=7's flags) are covered by verify_cli_flags and verify_serve_dispatch
@@ -1054,7 +1054,7 @@ def _run_and_report(quiet):
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description="verify an arch=8 MediaPipe Pose container and the C++ "
+        description="verify an arch=8 MediaPipe Pose container and the reference "
                     "runtime built from it. A container whose config declares "
                     "a quantised conv_weight_dtype gets sections 1, 3 and 4 "
                     "as measurements -- the fp32 tolerances are not a bar "
@@ -1141,7 +1141,7 @@ def main():
     if _QUANT["dtype"] is None:
         print("OK: the container holds these two checkpoints in this arrangement, "
               "the anchor table is the one the packer verified against the zoo's "
-              "literal one, the C++ runtime reproduces the recorded answer, and the "
+              "literal one, the reference runtime reproduces the recorded answer, and the "
               "array path dispatches against a design set checked in both "
               "directions -- slower than the host and a different answer, both "
               "measured and both in the registry cell.")

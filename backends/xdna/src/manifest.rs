@@ -20,9 +20,9 @@
 //!
 //! # WHY THE MANIFEST IS PARSED AND NOT ASSUMED
 //!
-//! The C++ runtime parsed `design.json` with its own small JSON reader and
+//! The reference runtime parsed `design.json` with its own small JSON reader and
 //! read the same fields. The field names here are the file's, so a design
-//! set that the C++ runtime could run is one this parser can read too -- and
+//! set that the reference runtime could run is one this parser can read too -- and
 //! a field that this parser does not know is a field that is ignored rather
 //! than a design that is refused, because the exporter grows fields and a
 //! runtime that refuses new ones is a runtime that stops working when the
@@ -243,7 +243,7 @@ impl DesignInfo {
     /// dispatched with the wrong stream computes the wrong shape, correctly.
     ///
     /// THE ELEMENTWISE DESIGNS HAVE NO SLOT-0 RECORD, and their program is
-    /// the file every design set has: `insts.bin`. The C++ runtime read
+    /// the file every design set has: `insts.bin`. The reference runtime read
     /// that file by name and never looked at the manifest, so a design
     /// without a record is not a design without a program -- it is a design
     /// whose program is the conventional one.
@@ -271,7 +271,7 @@ impl DesignInfo {
     ///
     /// The AIE flow names its kernels `MLIR_AIE...`; the manifest records
     /// the name when it was written and the fallback is the prefix's first
-    /// match, which is what the C++ runtime looked for.
+    /// match, which is what the reference runtime looked for.
     pub fn kernel_name(&self) -> &str {
         if self.kernel.is_empty() {
             "MLIR_AIE"

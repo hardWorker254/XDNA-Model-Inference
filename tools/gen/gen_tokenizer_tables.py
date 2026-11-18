@@ -1,4 +1,4 @@
-# NpuEmbeddings -- generate the Unicode tables the C++ WordPiece tokenizer needs.
+# NpuEmbeddings -- generate the Unicode tables the reference WordPiece tokenizer needs.
 # SPDX-License-Identifier: Apache-2.0
 #
 # WHY GENERATE INSTEAD OF LINKING ICU
@@ -12,7 +12,7 @@
 #
 # So: do it the way this project does everything else -- compute it offline in
 # Python (build-time Python is explicitly allowed, CLAUDE.md rule 5) and emit a
-# static C++ table. The tables are then EXACTLY what HuggingFace would compute,
+# static reference table. The tables are then EXACTLY what HuggingFace would compute,
 # by construction rather than by careful reading.
 #
 # WHAT IS FOLDED INTO ONE LOOKUP
@@ -24,7 +24,7 @@
 #
 # The one context-dependent case Python has is Greek capital sigma, which
 # lowercases to the final form at the end of a word. That cannot live in a
-# per-codepoint table, so it is emitted as a constant and handled in the C++.
+# per-codepoint table, so it is emitted as a constant and handled in the reference.
 #
 # Env: any Python 3 (no NPU, no torch).
 # Usage:
@@ -126,7 +126,7 @@ def main() -> int:
         "//",
         "// The Unicode facts BERT's BasicTokenizer is defined in terms of, computed",
         f"// from Python {sys.version.split()[0]}'s unicodedata (UCD "
-        f"{unicodedata.unidata_version}) so the C++ agrees with HuggingFace by",
+        f"{unicodedata.unidata_version}) so the reference agrees with HuggingFace by",
         "// construction rather than by careful reading.",
         "//",
         f"//   fold      {len(keys)} codepoints whose lower()+NFD-drop-Mn differs",

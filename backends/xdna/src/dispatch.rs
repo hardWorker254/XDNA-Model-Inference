@@ -2,7 +2,7 @@
 //!
 //! # Why every function here says "not yet"
 //!
-//! The C++ runtime's dispatch code was 4 000 lines of XRT calls and buffer
+//! The reference runtime's dispatch code was 4 000 lines of XRT calls and buffer
 //! arithmetic, and it is the part of the port that carries the most risk and
 //! the least insight. It is written LAST, against a gate that compares the
 //! array's numbers with the CPU reference's, and not before.
@@ -25,7 +25,7 @@ use crate::XdnaBackend;
 ///
 /// It is an error and not a panic: a runtime that panics on an operation the
 /// array does not have yet is a runtime that takes the whole process down
-/// with it, and the C++ runtime's contract was to say what was wrong and
+/// with it, and the reference runtime's contract was to say what was wrong and
 /// stop.
 fn not_yet(op: npum_model::OpKind) -> npum_model::Error {
     npum_model::Error::NotImplemented {

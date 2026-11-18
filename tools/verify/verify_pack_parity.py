@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # There are two implementations of the .npue layout: tools/pack/pack_npue.py (the
-# reference, used at build time) and `npuembeddings --prepare-model` (C++, so a
+# reference, used at build time) and `npuembeddings --prepare-model` (reference, so a
 # downloaded release can build the container without Python).
 #
 # Two implementations of one binary layout is a real risk. A disagreement would
@@ -10,7 +10,7 @@
 # tasks/0022 hit, which produced rel_fro 1.186 and which no size check can
 # catch. So the gate is not a tolerance. It is byte equality.
 #
-# It has already earned its keep. The first C++ version differed in three
+# It has already earned its keep. The first reference version differed in three
 # independent ways, and none would have been found by comparing embeddings:
 #
 #   1. the source checksum was left empty, so the container could not say
@@ -148,7 +148,7 @@ def main() -> int:
             print(f"pack_npue.py failed:\n{r.stdout}\n{r.stderr}")
             return 2
 
-        # --dev is what the C++ packer resolves its sub-tile from: it is the
+        # --dev is what the reference packer resolves its sub-tile from: it is the
         # same generation name the design set is built for, read before the
         # pack path runs.
         # --model is not optional in practice: `--prepare-model` refuses to

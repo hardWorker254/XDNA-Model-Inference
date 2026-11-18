@@ -16,7 +16,7 @@
 // looks right. Calling the same library the oracle calls is not a
 // shortcut here; it is the only way to be RIGHT.
 //
-// So this file is the C++ runtime's `decode_jpeg`, unchanged in what it
+// So this file is the reference runtime's `decode_jpeg`, unchanged in what it
 // asks libjpeg for, with the struct layout kept on the C side where
 // libjpeg's headers define it. The Rust side sees three integers and a
 // byte buffer.
@@ -24,7 +24,7 @@
 // WHAT IT DOES NOT CHANGE
 // -----------------------
 // libjpeg's defaults are libjpeg's defaults: the "fancy" upsampling, the
-// slow integer IDCT, the YCbCr -> RGB transform libjpeg ships. The C++
+// slow integer IDCT, the YCbCr -> RGB transform libjpeg ships. The reference
 // runtime sets exactly one thing -- `out_color_space = JCS_RGB`, so a
 // grayscale JPEG becomes three channels -- and so does this.
 
@@ -94,7 +94,7 @@ int npue_jpeg_decode(const unsigned char *data, unsigned long length,
   }
 
   // Grayscale and CMYK JPEGs to RGB, so the normalise step's per-channel
-  // mean and std both exist. This is the ONE thing the C++ runtime sets,
+  // mean and std both exist. This is the ONE thing the reference runtime sets,
   // and this sets the same one.
   cinfo.out_color_space = JCS_RGB;
   jpeg_start_decompress(&cinfo);

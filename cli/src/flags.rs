@@ -2,11 +2,11 @@
 //!
 //! # Why this is a hand-written parser and not clap
 //!
-//! Three properties of the C++ parser are CONTRACT, not implementation
+//! Three properties of the reference parser are CONTRACT, not implementation
 //! detail, and clap's derive API does not have all three:
 //!
 //! 1. **"The last occurrence wins."** `--pipeline 4 --pipeline 1` disables
-//!    pipelining. The C++ tree got this wrong once -- `serve <whisper>
+//!    pipelining. The previous implementation got this wrong once -- `serve <whisper>
 //!    --threads 8` answered with 24 threads -- and it cost a bug report.
 //!
 //! 2. **A flag may follow a positional argument.** `embed model in.txt
@@ -63,7 +63,7 @@ pub fn flag_arity(name: &str) -> Option<i32> {
         "--tile-n" => 1,
         "--npu-ops" => 1,
         // -- the backend choice: where the ARITHMETIC happens. The host is
-        // the default and the C++'s arithmetic; the GPU is the other one.
+        // the default and the reference's arithmetic; the GPU is the other one.
         // A name that is neither is refused by name, like every other
         // flag this runtime does not accept.
         "--backend" => 1,
@@ -202,7 +202,7 @@ pub fn flag_is_known_short(name: &str) -> bool {
 /// Each one's refusal names the replacement, so a stale command line cannot
 /// look like it worked.
 ///
-/// The replacements are the C++ runtime's, word for word, and they are not
+/// The replacements are the reference runtime's, word for word, and they are not
 /// all the same shape: `--npu-eltwise` becomes a LIST of codes, because it
 /// used to be three flags in one, while `--host-gelu` becomes the same flag
 /// with a code REMOVED from it. That difference is the whole reason these
@@ -352,7 +352,7 @@ pub fn refuse_unknown_vk_op(code: &str) -> String {
 /// so a trailing comma and `--npu-ops ""` are the same thing.
 pub fn parse_npu_ops(list: &str) -> Result<Vec<&'static str>, String> {
     let mut out = Vec::new();
-    // The codes come back SORTED, because the C++'s are a `std::set` and
+    // The codes come back SORTED, because the reference's are a `std::set` and
     // every message that names them walks that set. The order the user
     // typed them in is echoed unchanged where it is echoed at all.
     for item in list.split(',') {
@@ -551,7 +551,7 @@ pub fn parse(argv: &[String]) -> Result<Args, ParseError> {
 /// with a DIGIT. `--serve=8080` is not accepted, because nothing has ever
 /// documented it.
 ///
-/// ONE reader, and that is the point: the C++ tree had three hand-written
+/// ONE reader, and that is the point: the previous implementation had three hand-written
 /// scans of the same two flags, and that is how `--serve` with no port came
 /// to mean port 0 in the speech mode -- `atoi("")` is 0, and 0 is a legal
 /// request to bind(), so the server started, printed its banner and

@@ -339,7 +339,7 @@ def dequantise_payload(payload, wscale, gscale, N, K, dtype, group=None):
     So the comparison tools/verify/verify_conv_quant.py makes is THIS against its
     transcription of geometry.cpp: both sides read the same payload and the same
     scales off disk, and every factor is the file's. The order of the two
-    multiplies is left-to-right, which is the C++'s order and not an
+    multiplies is left-to-right, which is the reference's order and not an
     implementation detail -- `(v * s) * r` and `v * (s * r)` are different
     float32 numbers.
     """

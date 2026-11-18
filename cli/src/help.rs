@@ -2,14 +2,14 @@
 //!
 //! # Why this is hand-written and not generated
 //!
-//! The C++ help is not a clap template and not a doc comment: it is a
+//! The reference help is not a clap template and not a doc comment: it is a
 //! free-form block whose verb sections are GUARDED by which binary is
 //! running, and whose prose explains what each flag MEANS and what it
 //! refuses. Generating it would lose the guards, and the guards are the
 //! point -- help that lists a verb and then sends the reader to another
 //! program for it is the failure the binary split exists to end.
 //!
-//! The text below is the C++ text, transcribed. It is checked against the
+//! The text below is the reference text, transcribed. It is checked against the
 //! oracle's output by the parity harness, so a divergence is a failing gate
 //! and not a thing a reader has to notice.
 
@@ -246,7 +246,7 @@ const OPTIONS: &str = concat!(
     "    --backend cpu|vulkan\n",
     "                      where the ARITHMETIC happens. The default is\n",
     "                      the host, and the host's arithmetic is the\n",
-    "                      C++'s arithmetic byte for byte. 'vulkan' runs\n",
+    "                      reference's arithmetic byte for byte. 'vulkan' runs\n",
     "                      the text family's projections, its LayerNorm,\n",
     "                      its GELU and its softmax on the GPU: the same\n",
     "                      network on a different machine, so the vectors\n",

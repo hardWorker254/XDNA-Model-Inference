@@ -91,11 +91,11 @@ fn main() {
     println!("cargo:rustc-link-lib=static=npum_xrt_shim");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=xrt_coreutil");
-    // THE C++ RUNTIME, because the shim is C++.
+    // THE reference RUNTIME, because the shim is reference.
     //
     // The shim catches XRT's exceptions and reports them as a message, so it
-    // uses the C++ runtime's own machinery -- and a static archive that
-    // references it has to be linked against it. On Windows the C++ runtime
+    // uses the reference runtime's own machinery -- and a static archive that
+    // references it has to be linked against it. On Windows the reference runtime
     // is part of the toolchain's default, and there is no separate library
     // to name.
     if cfg!(target_os = "linux") {
@@ -112,7 +112,7 @@ fn main() {
 
 /// Where XRT is installed.
 ///
-/// The same order the C++ runtime's CMake uses: the environment first, the
+/// The same order the reference runtime's CMake uses: the environment first, the
 /// usual installation second. An environment variable that points at
 /// nothing is not silently ignored -- it is a build that says so.
 fn xrt_root() -> Option<PathBuf> {

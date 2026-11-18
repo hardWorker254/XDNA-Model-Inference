@@ -1,6 +1,6 @@
 //! Whisper's encoder, dumped as hex.
 //!
-//! The C++ oracle has its own test binary for this
+//! The reference baseline has its own test binary for this
 //! (`runtime/tests/test_whisper_model.cpp`), and it prints the same
 //! line: `enc <rows> <cols> <hex>`. This example is the Rust's
 //! counterpart of it, and the two are compared BYTE for byte.

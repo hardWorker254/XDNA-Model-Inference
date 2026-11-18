@@ -36,7 +36,7 @@
 //!
 //! # THE ARITHMETIC IS TRANSCRIBED FROM THE ORACLE'S OBJECT FILE
 //!
-//! Where the C++ source leaves a multiply and an add adjacent, the compiler
+//! Where the reference source leaves a multiply and an add adjacent, the compiler
 //! fused some of them and not others, and the difference is one rounding. The
 //! four places it matters here were read off the oracle's disassembly
 //! (`objdump -d runtime/build/libnpue_core.a`, `vfmadd`/`vmulss`):

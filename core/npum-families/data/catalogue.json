@@ -4,7 +4,7 @@
     "how to run, with the geometry the packer cross-checks against the",
     "downloaded config.json.",
     "",
-    "This file is the source of truth. It was extracted from the C++",
+    "This file is the source of truth. It was extracted from the reference",
     "runtime's table (runtime/src/common/hub.cpp) when the runtime moved",
     "to Rust, and the extraction was verified row for row against the",
     "oracle's own `list` output and its `not installed and is not a model",

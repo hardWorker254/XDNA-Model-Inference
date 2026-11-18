@@ -24,7 +24,7 @@ def load_targets(path: str | Path) -> dict:
     Read and validate tools/data/npu_targets.json.
 
     Validation is structural only: schema version, known keys and value types.
-    Parity with the C++ catalog in runtime/src/common/hub.cpp is a separate
+    Parity with the reference catalog in runtime/src/common/hub.cpp is a separate
     check (tools/verify_targets.py, S7).
     """
     p = Path(path).expanduser()

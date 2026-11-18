@@ -608,7 +608,7 @@ def pack_vit(model_dir, out, fold_scale=True, dry_run=False, device=None,
         "n_patches": n_patch,
         # -- the image front end, AS DATA. Read from the checkpoint's own
         # preprocessor_config.json above and refused rather than defaulted, so a
-        # consumer that is not this Python -- the C++ runtime's PNG/JPEG reader,
+        # consumer that is not this Python -- the reference runtime's PNG/JPEG reader,
         # or anyone writing their own -- has the checkpoint's numbers instead of
         # a hardcoded 0.5 that happens to be right for this one model.
         #

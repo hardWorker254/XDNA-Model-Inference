@@ -405,9 +405,9 @@ pub struct Detection {
 
 /// The whole answer, as the JSON object.
 ///
-/// The C++'s shape, in the C++'s order. The image's label is escaped the
-/// way the C++'s escapes it -- the quote, the backslash and the newline --
-/// and the numbers are the C++'s own widths.
+/// The reference's shape, in the reference's order. The image's label is escaped the
+/// way the reference's escapes it -- the quote, the backslash and the newline --
+/// and the numbers are the reference's own widths.
 pub fn result_json(
     r: &Detection,
     g: &Geometry,

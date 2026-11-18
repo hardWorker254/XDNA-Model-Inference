@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The parity harness's entry point.
 
-    python tools/parity/run.py record   --oracle   <the C++ binaries>
+    python tools/parity/run.py record   --oracle   <path-to-reference-binaries>
     python tools/parity/run.py compare  --candidate <the Rust binaries>
     python tools/parity/run.py list
     python tools/parity/run.py rules

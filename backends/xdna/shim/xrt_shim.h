@@ -40,7 +40,7 @@ void shim_device_close(void *device);
 /* THE HARDWARE CONTEXT AND THE KERNEL IN IT.
  *
  * The xclbin is handed over as BYTES, not as a path: a design set that lives
- * inside a container has no file to point at, and the C++ runtime solved the
+ * inside a container has no file to point at, and the reference runtime solved the
  * same problem by handing the blob to XRT (`xrt::xclbin` takes a vector).
  */
 int shim_context_open(void *device, const uint8_t *xclbin, size_t bytes,

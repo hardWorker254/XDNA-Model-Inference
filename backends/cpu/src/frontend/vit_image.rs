@@ -129,7 +129,7 @@ unsafe extern "C" {
 
 /// Decode a JPEG into RGB.
 ///
-/// The same libjpeg the C++ runtime calls, with the same one setting --
+/// The same libjpeg the reference runtime calls, with the same one setting --
 /// `out_color_space = JCS_RGB`, so a grayscale JPEG becomes three
 /// channels. Everything else is libjpeg's defaults: the "fancy"
 /// upsampling, the slow integer IDCT, libjpeg's own YCbCr -> RGB.
@@ -191,7 +191,7 @@ unsafe extern "C" {
 
 /// Decode a PNG into RGB.
 ///
-/// The same libpng the C++ runtime calls, and the same decisions it makes:
+/// The same libpng the reference runtime calls, and the same decisions it makes:
 /// a palette becomes RGB, a grayscale becomes RGB by REPLICATION (which is
 /// what PIL's `convert("RGB")` does and therefore what the checkpoint was
 /// trained to see), a `tRNS` key becomes a real alpha, and a four-channel

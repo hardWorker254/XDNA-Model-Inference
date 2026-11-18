@@ -3,7 +3,7 @@
 //! # This is the reference
 //!
 //! Every other implementation of `npum_model::Ops` is measured against this
-//! one, and this one is the port of the C++ runtime's host kernels. So the
+//! one, and this one is the port of the reference runtime's host kernels. So the
 //! implementation here is not "a way to compute a GEMM" -- it is THE way,
 //! down to the FMA in the reduction and the order the row kernels fold
 //! their lanes in.

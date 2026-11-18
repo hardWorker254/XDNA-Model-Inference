@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-# NpuEmbeddings -- hold the C++ Whisper tokenizer against the reference and
+# NpuEmbeddings -- hold the reference Whisper tokenizer against the reference and
 # against HuggingFace.
 # SPDX-License-Identifier: Apache-2.0
 #
 # THREE IMPLEMENTATIONS, ONE TABLE
 # -------------------------------
-#   C++       runtime/src/tokenizers/whisper.cpp, the one that ships
+#   reference       runtime/src/tokenizers/whisper.cpp, the one that ships
 #   reference tools/lib/whisper_tokenizer_ref.py, the executable specification
 #   HF        transformers' own WhisperTokenizer over the same checkpoint
 #
-# The reference exists so the C++ has something to be written against, and the
+# The reference exists so the reference has something to be written against, and the
 # reference is only worth anything if it is itself held against HuggingFace --
 # which is why all three run here rather than two.
 #
@@ -28,7 +28,7 @@
 # English sentence proves nothing here: it is the case where every
 # implementation agrees.
 #
-# Env: numpy + regex for the reference, transformers for HuggingFace, a C++
+# Env: numpy + regex for the reference, transformers for HuggingFace, a reference
 # toolchain for the binary. The binary is built if --exe is not given.
 #
 # Usage:
@@ -78,7 +78,7 @@ CORPUS = [
 ]
 
 # The control tokens a transcription cannot start or end without. Their ids are
-# not invented: the packer carries them and the C++ looks them up by name.
+# not invented: the packer carries them and the reference looks them up by name.
 CONTROL = ("<|startoftranscript|>", "<|notimestamps|>", "<|transcribe|>",
            "<|translate|>", "<|endoftext|>")
 
@@ -94,7 +94,7 @@ def build_exe(path):
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("building the C++ tokenizer failed:\n" + r.stderr)
+        print("building the reference tokenizer failed:\n" + r.stderr)
         return None
     return path
 
@@ -128,7 +128,7 @@ def run_cpp(exe, npue, corpus):
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Hold the C++ Whisper tokenizer against the reference "
+        description="Hold the reference Whisper tokenizer against the reference "
                     "and against HuggingFace.")
     ap.add_argument("--model-dir", default=str(REPO / "models" / "whisper-tiny"))
     ap.add_argument("--npue", default=str(REPO / "models" / "whisper-tiny.npue"))
@@ -163,14 +163,14 @@ def main() -> int:
     ref_ids = [ref.encode(t) for t in corpus]
 
     bad = 0
-    print(f"C++   vocab {len(ref.tokens)} merges {ref.t.n_merges}, "
+    print(f"reference   vocab {len(ref.tokens)} merges {ref.t.n_merges}, "
           f"{len(CORPUS)} cases\n")
 
     for i, (text, why) in enumerate(CORPUS):
         problems = []
         if cpp_ids[i] != ref_ids[i]:
             problems.append(f"ids differ from the reference:\n"
-                            f"        C++ {cpp_ids[i]}\n"
+                            f"        reference {cpp_ids[i]}\n"
                             f"        ref {ref_ids[i]}")
         # The round trip is exact for every case except the empty string, where
         # there is nothing to round-trip, and the astral cases, where the
@@ -193,7 +193,7 @@ def main() -> int:
             hf = WhisperTokenizerFast.from_pretrained(args.model_dir)
         except Exception as exc:  # noqa: BLE001
             print(f"\n  HuggingFace unavailable ({exc}); "
-                  f"the C++/reference comparison above still stands")
+                  f"the reference/reference comparison above still stands")
         else:
             hf_bad = 0
             for i, (text, why) in enumerate(CORPUS):
@@ -203,7 +203,7 @@ def main() -> int:
                     bad += 1
                     print(f"  FAIL [{i:2d}] ids differ from HuggingFace "
                           f"({why})\n    text {text!r}\n"
-                          f"        C++ {cpp_ids[i]}\n        HF  {want}")
+                          f"        reference {cpp_ids[i]}\n        HF  {want}")
             print(f"\n  HuggingFace: {len(CORPUS) - hf_bad}/{len(CORPUS)} exact")
 
     missing = [t for t in CONTROL if t not in controls]

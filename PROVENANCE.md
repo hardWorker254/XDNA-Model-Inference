@@ -106,7 +106,7 @@ targets in order are:
 2. **`docs/CURRENT_STATUS.md`** — cited wherever a measured number's verdict
    (pass/fail, adopted/rejected) is recorded.
 3. **`docs/04-model/npue-format.md`** — the container layout, one citation in
-   the C++ packer and one in the header.
+   another packer implementation and one in the header.
 
 For `tasks/`, the numbers are dense and sequential (0004 … 0138), so the log
 either exists in full or the citations have to become the record. If it does not

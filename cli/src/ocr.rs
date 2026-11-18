@@ -1,6 +1,6 @@
 //! The ocr family's status block, its per-image lines and its node dump.
 //!
-//! # The block is the C++'s, row for row
+//! # The block is the reference's, row for row
 //!
 //! `npuimage ocr` printed a block before every run and the golden transcript
 //! holds it, so the block is a contract and not a greeting.
@@ -20,7 +20,7 @@
 //! a transposed convolution is a sum of SHIFTED contributions and has no
 //! `[M, N]` GEMM in it to dispatch -- and the row says so.
 //!
-//! # The dump is the C++'s format, byte for byte
+//! # The dump is the reference's format, byte for byte
 //!
 //! 1 MiB of header, then every node's fp32 in graph order, for BOTH graphs,
 //! with the header rewritten once the node count is known. The reader looks

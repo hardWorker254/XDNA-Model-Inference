@@ -13,17 +13,17 @@
  * The reason is that a shim which decides anything is a second implementation
  * of the runtime's rules, and the two would drift. The rules -- the widths a
  * design accepts, the packing of an operand, the order of the buffers -- live
- * in Rust, where they can be read, tested and changed without a C++ compiler.
+ * in Rust, where they can be read, tested and changed without a compiler.
  *
- * WHY IT IS C++ AND NOT C
+ * WHY IT IS reference AND NOT C
  * -----------------------
- * XRT's API is C++ and there is no C API for it. The ABI exposed here is C,
- * so the Rust side needs no C++ headers, no C++ standard library and no
+ * XRT's API is reference and there is no C API for it. The ABI exposed here is C,
+ * so the Rust side needs no reference headers, no reference standard library and no
  * knowledge of XRT's types.
  *
- * THE SHIM'S SHAPE IS THE C++ RUNTIME'S
+ * THE SHIM'S SHAPE IS THE reference RUNTIME'S
  * -------------------------------------
- * The C++ runtime did exactly this -- `xrt::bo`, `xrt::hw_context`,
+ * The reference runtime did exactly this -- `xrt::bo`, `xrt::hw_context`,
  * `xrt::kernel`, `xrt::run` -- so the semantics of these calls are known:
  * the same buffer flags, the same group ids, the same argument order. A port
  * whose transport differs from the original's is a port with a second thing
@@ -97,7 +97,7 @@ int shim_context_open(void *device, const uint8_t *xclbin, size_t bytes,
                       void **out_context) {
   return guard([&]() {
     // FROM MEMORY, not from a path. A design set that lives inside a
-    // container has no file to point at, and the C++ runtime solved the same
+    // container has no file to point at, and the reference runtime solved the same
     // problem the same way (`xrt::xclbin` takes a vector of chars).
     std::vector<char> blob(reinterpret_cast<const char *>(xclbin),
                            reinterpret_cast<const char *>(xclbin) + bytes);
@@ -180,7 +180,7 @@ int shim_run_start(void *kernel, void *instr_bo, uint32_t words, void **args,
     // The leading integer is the design's own first argument -- the AIE
     // kernel takes a scalar before the instruction stream -- and it is NOT an
     // iteration count: `xrt::autostart` is the type that would say that, and
-    // a plain integer is an argument like any other. The C++ runtime and the
+    // a plain integer is an argument like any other. The reference runtime and the
     // Python design harness both pass 3 here, and this is the same call.
     xrt::run *r = nullptr;
     switch (n_args) {

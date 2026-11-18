@@ -284,7 +284,7 @@ fn power_30s(padded: &[f64], num_frames: usize, window: &[f64]) -> Vec<f32> {
     let n_bins = NFFT / 2 + 1;
     let mut power = vec![0.0f32; n_bins * MEL_FRAMES];
     // The windowed frame goes through FLOAT32 before the transform, and
-    // that rounding is part of the contract: the C++ keeps the frames in
+    // that rounding is part of the contract: the reference keeps the frames in
     // a float32 matrix (it is the GEMM's A operand) and reads them back
     // as float64 for the transform. A frame that stays in double all the
     // way through is a different frame, and the log10 downstream turns a

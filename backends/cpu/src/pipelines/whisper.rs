@@ -24,7 +24,7 @@
 //! The encoder's real input is `(1500, d)`: conv2's stride 2 turns 3000 mel
 //! frames into 1500 positions, and 1500 is `max_source_positions` for
 //! every shipped size. The design set was exported for a FIXED row count
-//! (512 for whisper-tiny), so the C++ walks the tensor in row chunks --
+//! (512 for whisper-tiny), so the reference walks the tensor in row chunks --
 //! 512, 512, 476 -- and the last chunk's padded rows are zeroed.
 //!
 //! The chunking does not change a single number: the GEMM reduces over K
@@ -794,14 +794,14 @@ pub fn logits_from(h: &[f32], embed_tokens: &[f32], d: usize, vocab: usize) -> V
     out
 }
 
-/// LayerNorm over one row, as the C++'s `layernorm_rows` computes it.
+/// LayerNorm over one row, as the reference's `layernorm_rows` computes it.
 ///
 /// The mean and the variance are accumulated in DOUBLE and rounded to
 /// float32 once, and the epsilon is the container's -- 1e-5 for Whisper,
 /// not BERT's 1e-12.
 ///
 /// The epilogue is an FMA: `(x - mean) * inv * gamma + beta` contracts to
-/// one rounding, and the C++'s compiler contracts it.
+/// one rounding, and the reference's compiler contracts it.
 pub fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32], eps: f64) {
     let d = row.len();
     let mut sm = 0.0f64;
@@ -856,7 +856,7 @@ pub fn attention(
         for h in 0..heads {
             // QK^T, one row of scores at a time. The accumulation is eight
             // lane accumulators with an FMA per element, finished with the
-            // same eight-lane horizontal sum the C++'s `hsum256` does.
+            // same eight-lane horizontal sum the reference's `hsum256` does.
             for (j, slot) in scores.iter_mut().enumerate().take(n_kv) {
                 let qh = &q[i * q_stride + h * head_dim..][..head_dim];
                 let kj = &kv[j * kv_stride + h * head_dim..][..head_dim];
@@ -888,7 +888,7 @@ pub fn attention(
             let inv = if sum > 0.0 { 1.0f32 / sum } else { 0.0f32 };
 
             // softmax.V, into this head's slice of the output row. One
-            // accumulator per eight of the head's width -- the C++'s
+            // accumulator per eight of the head's width -- the reference's
             // `__m256 acc[NV]`, and not one accumulator for the whole head.
             // The difference is the ORDER of the additions, and the order is
             // the answer.

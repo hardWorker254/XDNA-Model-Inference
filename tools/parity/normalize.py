@@ -10,7 +10,7 @@ the way, and they are different kinds of thing:
 
 2. **Renames.** The container's extension changed from `.npue` to `.npum`, and
    the runtime lives in a different directory. These differ between the
-   ORACLE and the CANDIDATE for a reason that is known and recorded, so they
+   baseline and the candidate for a reason that is known and recorded, so they
    are normalised -- and the normalisation is EXPLICIT, one named rule per
    thing, so that a reader can see what is being forgiven.
 
@@ -205,9 +205,9 @@ RULES: list[Rule] = [
         "runtime-name",
         re.compile(r"(?m)^(NpuEmbeddings )(?:C\+\+|Rust) runtime"),
         r"\1runtime",
-        "the implementation word in the runtime's own banner. The C++ tree "
-        "says 'C++ runtime' and this tree says 'Rust runtime', because a "
-        "runtime that calls itself C++ is lying about what it is. The word "
+        "the implementation word in the runtime's own banner. A reference baseline "
+        "may identify itself differently from this runtime; the word "
+        "names the implementation and not the contract. "
         "names the implementation and not the contract",
     ),
     _rule(
@@ -220,14 +220,14 @@ RULES: list[Rule] = [
         "rust-only-backend-flag",
         re.compile(r"(?ms)^    --backend cpu\|vulkan\n.*?(?=^    --)"),
         "",
-        "the Rust runtime has ONE flag the C++ never had: the backend "
-        "choice, which says where the arithmetic happens. The C++ runtime "
+        "this runtime may have flags the reference baseline does not: the backend "
+        "choice, which says where the arithmetic happens. The reference baseline "
         "had no such flag because it had no second place to run the "
         "arithmetic in. The block is removed from the comparison so that "
         "the REST of the help is still compared word for word -- a rule "
         "that swallowed the whole help would make the help unchecked. If "
-        "the C++ ever grows a --backend flag, this rule must go: it would "
-        "then hide the C++'s own text",
+        "the reference baseline ever grows a --backend flag, this rule must go: it would "
+        "then hide the reference text",
     ),
 ]
 

@@ -1,24 +1,24 @@
-# NpuEmbeddings -- generate the Unicode category tables the C++ XLM-R
+# NpuEmbeddings -- generate the Unicode category tables the reference XLM-R
 # tokenizer's grapheme-cluster walk needs.
 # SPDX-License-Identifier: Apache-2.0
 #
 # WHY THIS EXISTS
 # ----------------
-# tools/lib/xlmr_tokenizer_ref.py (the executable spec for the C++ port,
+# tools/lib/xlmr_tokenizer_ref.py (the executable spec for the reference implementation,
 # tasks/0127) classifies codepoints for its UAX #29 extended-grapheme
 # approximation using Python's `unicodedata.category()`: Mn/Me -> Extend,
-# Mc -> SpacingMark, Cc/Cf/Zl/Zp -> Control. The C++ port
+# Mc -> SpacingMark, Cc/Cf/Zl/Zp -> Control. The reference implementation
 # (runtime/src/tokenizer_xlmr.cpp) must make the IDENTICAL classification
 # or grapheme boundaries -- and with them the Precompiled normalizer's
 # whole-cluster replacements -- drift on exactly the decomposed-diacritic
 # inputs the verifier stresses. Same reasoning and same mechanism as
 # tools/gen/gen_tokenizer_tables.py -> bert_unicode_tables.hpp: compute the
 # category ranges offline from the same interpreter's unicodedata
-# (build-time Python is allowed, CLAUDE.md rule 5) and emit a static C++
+# (build-time Python is allowed, CLAUDE.md rule 5) and emit a static reference
 # header, so the two implementations agree by construction.
 #
 # Only the three merged classes the reference actually branches on are
-# emitted, not the raw categories -- the C++ consumer asks the same three
+# emitted, not the raw categories -- the reference consumer asks the same three
 # questions the Python does, nothing more. Everything else the classifier
 # needs (CR/LF/ZWJ/ZWNJ, the Prepend set, regional indicators, Hangul,
 # White_Space, Extended_Pictographic) is explicit codepoint ranges in the
@@ -81,7 +81,7 @@ def main() -> int:
         "// The Unicode general-category facts tokenizer_xlmr.cpp's grapheme",
         f"// classifier branches on, computed from Python {sys.version.split()[0]}'s "
         f"unicodedata (UCD {unicodedata.unidata_version})",
-        "// so the C++ agrees with tools/lib/xlmr_tokenizer_ref.py by construction.",
+        "// so the reference agrees with tools/lib/xlmr_tokenizer_ref.py by construction.",
         "//",
         f"//   extend (Mn+Me)          {len(extend)} ranges",
         f"//   spacing_mark (Mc)       {len(spacing)} ranges",

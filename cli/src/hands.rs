@@ -1,6 +1,6 @@
 //! The hands family's status block, its per-image lines and its node dump.
 //!
-//! # The block is the C++'s, row for row
+//! # The block is the reference's, row for row
 //!
 //! `npuimage hands` printed a block before every run and the golden transcript
 //! holds it, so the block is a contract and not a greeting. Every row says
@@ -21,7 +21,7 @@
 //! levels, the node counts, the depthwise split. Nothing here is a constant that
 //! happens to match.
 //!
-//! # The dump is the C++'s format, byte for byte
+//! # The dump is the reference's format, byte for byte
 //!
 //! 64 KiB of header, then every node's fp32 NCHW in graph order, for BOTH
 //! networks, with the header rewritten once the node count is known. The reader

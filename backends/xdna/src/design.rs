@@ -2,7 +2,7 @@
 //!
 //! # The fit check is a PURE FUNCTION
 //!
-//! `design_fits()` in the C++ runtime read the environment and compared
+//! `design_fits()` in the reference runtime read the environment and compared
 //! STRINGS. This one takes a `Caps`, a `Design` and a `Layout` and answers.
 //! Nothing it reads is ambient:
 //!
@@ -14,7 +14,7 @@
 //! # Fail-closed
 //!
 //! A design set built for the OTHER generation is refused, even when the
-//! geometry happens to agree. The C++ runtime did this by comparing the
+//! geometry happens to agree. The reference runtime did this by comparing the
 //! `device` string that the exporter wrote into `design.json`; that check
 //! stays, and it stays strict, because the alternative -- accepting a set
 //! whose geometry coincides -- is how a wrong-but-plausible answer arrives.
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// One compiled design, described: what it is and what it was built for.
 ///
 /// The DESCRIPTION, not the design itself: the thing on the board is
-/// `array::ArrayDesign`, and this is what the fit checks look at. The C++
+/// `array::ArrayDesign`, and this is what the fit checks look at. The reference
 /// runtime had no such split -- its `npu::Design` was both -- and the
 /// difference between "the description does not fit" and "the board refused"
 /// is worth keeping.

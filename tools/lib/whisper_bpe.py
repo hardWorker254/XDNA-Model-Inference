@@ -7,7 +7,7 @@
 # without them.
 #
 # This module is the SINGLE definition of the table's binary layout and of the
-# byte-level alphabet. The C++ reader (runtime/src/tokenizers/whisper.cpp) and
+# byte-level alphabet. The reference reader (runtime/src/tokenizers/whisper.cpp) and
 # the Python oracle (tools/verify/verify_whisper.py) both consume what this produces;
 # neither re-derives it. A second copy of the layout is how the three pooling
 # implementations and the two npue layout descriptors ended up disagreeing in
@@ -193,7 +193,7 @@ def build_table(vm):
     out += struct.pack(HEADER_FORMAT, MAGIC, VERSION, len(vm.tokens),
                        len(pairs), len(pool), 0)
     out += pool
-    # Two SEPARATE arrays, not interleaved (off,len) pairs: the C++ reader
+    # Two SEPARATE arrays, not interleaved (off,len) pairs: the reference reader
     # memcpys each one straight out of the mapping, and a reader that has to
     # stride by two u32s to get the lengths is a reader that will be written
     # wrong once.
@@ -209,7 +209,7 @@ def build_table(vm):
 
 
 class TableReader:
-    """Reference reader, so the C++ side has something to be checked against."""
+    """Reference reader, so the reference side has something to be checked against."""
 
     def __init__(self, blob):
         (magic, version, n_vocab, n_merges, pool_bytes, _res) = struct.unpack_from(

@@ -10,7 +10,7 @@
 # whose checkpoints are not in an onnx/ directory.
 #
 # WHAT THIS IS FOR. Phase 0 of RUST_MIGRATION_PLAN.md records golden
-# transcripts of the C++ binaries. A transcript of a command that refuses
+# transcripts of the reference binaries. A transcript of a command that refuses
 # because the model is missing is not a transcript of the command -- it is a
 # transcript of the absence -- so the fixtures have to be models that RUN.
 #

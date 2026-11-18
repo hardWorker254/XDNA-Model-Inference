@@ -606,7 +606,7 @@ def main() -> int:
     # -- the runtime's OWN answer, on the same images -------------------------
     #
     # Sections 1-3 are numpy. They check the container's bytes and the SCHEME's
-    # arithmetic, and they were all green while the shipped C++ answered
+    # arithmetic, and they were all green while the shipped reference answered
     # 'water jug' at p=0.019 for a picture whose fp32 answer is 'minibus' at
     # p=0.629 -- because VitEncoder::gemm1 divided each activation by asmooth
     # where NpuGemm::run_i8 documents 1/asmooth. No amount of numpy re-derives
@@ -618,10 +618,10 @@ def main() -> int:
     # runtime's own probability for its own label has to be within a factor of
     # transformers', which is 0.019 against 0.629 on the bus and 0.636 against
     # 0.629 once fixed. Three orders of magnitude of headroom, not a coin flip.
-    print("\n4. the C++ runtime's own answer, against transformers")
+    print("\n4. the reference runtime's own answer, against transformers")
     exe = REPO / "runtime" / "build" / "npuimage"
     if not exe.is_file():
-        report(False, "the C++ binary is built",
+        report(False, "the reference binary is built",
                f"{exe} is absent -- `cmake --build runtime/build`. Without it "
                f"this section is the only one that exercises the runtime, so "
                f"it is not optional.")

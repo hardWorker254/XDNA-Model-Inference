@@ -2,18 +2,18 @@
 //!
 //! # These are not "a reasonable f32 implementation"
 //!
-//! They are the C++ runtime's arithmetic, down to the last bit, and the
+//! They are the reference runtime's arithmetic, down to the last bit, and the
 //! difference is not academic. The golden transcripts in `tools/parity/golden`
-//! were recorded from the C++ binaries on an AVX2 host, and a golden is a
+//! were recorded from the reference binaries on an AVX2 host, and a golden is a
 //! contract: the numbers in it are the numbers the runtime owes its users.
 //! A "correct" f32 implementation that differs in the last bit is not correct
 //! here -- it is a different runtime with a different answer.
 //!
-//! So every kernel below is a port of one C++ function, and where the C++
+//! So every kernel below is a port of one reference function, and where the reference
 //! made a choice that a textbook would not, the port keeps the choice and
 //! says so. The four that matter:
 //!
-//! | kernel | what a textbook would do | what the C++ does |
+//! | kernel | what a textbook would do | what the reference does |
 //! |---|---|---|
 //! | GEMM | `acc += a * b` | `acc = fma(b, a, acc)` -- one rounding, not two |
 //! | LayerNorm | sum in f32, variance in f32 | eight lane sums, then a fixed tree, and an FMA in the variance |
@@ -22,9 +22,9 @@
 //!
 //! # The FMA, and why it is written `mul_add`
 //!
-//! The C++'s AVX2 paths use `_mm256_fmadd_ps`: the multiply and the add are
-//! ONE rounding, not two. The scalar fallback in the C++ rounds twice, and
-//! the C++ says so in its own header: "the two paths are a reproducibility
+//! The reference's AVX2 paths use `_mm256_fmadd_ps`: the multiply and the add are
+//! ONE rounding, not two. The scalar fallback in the reference rounds twice, and
+//! the reference says so in its own header: "the two paths are a reproducibility
 //! fact, and changing either one silently is exactly what the gate exists to
 //! catch". The oracle ran the AVX2 path, so this port reproduces the AVX2
 //! path -- and `f32::mul_add` is the Rust spelling of a fused
@@ -44,7 +44,7 @@
 //!
 //! # The width must be a multiple of eight
 //!
-//! The C++'s AVX2 LayerNorm and softmax read a row eight floats at a time
+//! The reference's AVX2 LayerNorm and softmax read a row eight floats at a time
 //! and have NO tail: a row whose width is not a multiple of eight reads past
 //! its end. The port refuses such a row rather than reading past it, and the
 //! model's own shapes are checked against it when the container is opened.
@@ -55,7 +55,7 @@ use npum_model::{Result, Tensor, TensorError};
 ///
 /// # Why the choice is a VALUE and not a compile-time flag
 ///
-/// The C++ runtime picked its ISA with `-march`, and the choice was a build
+/// The reference runtime picked its ISA with `-march`, and the choice was a build
 /// flag: `x86-64-v3` for a portable baseline, `native` for the build
 /// machine's own silicon -- and `native` on a Zen 4 turned on AVX-512,
 /// which changed the numbers, which is why the tree pins the baseline
@@ -70,7 +70,7 @@ use npum_model::{Result, Tensor, TensorError};
 /// | variant | what it is | why it exists |
 /// |---|---|---|
 /// | `Portable` | plain Rust, `mul_add` everywhere | the reference; a host without AVX2 |
-/// | `Avx2` | AVX2 + FMA, eight floats at a time | the C++'s own ISA baseline (`x86-64-v3`) |
+/// | `Avx2` | AVX2 + FMA, eight floats at a time | the reference's own ISA baseline (`x86-64-v3`) |
 /// | `Avx512` | AVX-512, sixteen floats at a time | twice the width on the GEMM |
 ///
 /// # What AVX-512 may and may not change
@@ -156,7 +156,7 @@ pub fn has_avx512f() -> bool {
     false
 }
 
-/// The epsilon the C++'s host LayerNorm adds to the variance.
+/// The epsilon the reference's host LayerNorm adds to the variance.
 ///
 /// It is HARDCODED there -- `1e-12f`, in both the AVX2 and the scalar path --
 /// and it is NOT the container's `layer_norm_eps`. The two agree for every
@@ -164,7 +164,7 @@ pub fn has_avx512f() -> bool {
 /// constant wins: the golden was recorded from the runtime.
 pub const LAYERNORM_EPS: f32 = 1e-12;
 
-/// The eight-lane horizontal sum, in the C++'s exact order.
+/// The eight-lane horizontal sum, in the reference's exact order.
 ///
 /// `_mm256` holds eight lanes; `hsum256` folds them with two `_mm_hadd_ps`:
 /// first `[l0+l1, l2+l3, l0+l1, l2+l3]`, then the halves added again. The
@@ -188,7 +188,7 @@ pub fn hsum8(lanes: [f32; 8]) -> f32 {
     h[0] + h[1]
 }
 
-/// The eight-lane horizontal MAXIMUM, in the C++'s exact order.
+/// The eight-lane horizontal MAXIMUM, in the reference's exact order.
 ///
 /// `_mm_max_ps` on the two halves, then on the pairs, then on the first
 /// two: `max(max(m0, m4), max(m2, m6))` against `max(max(m1, m5), max(m3, m7))`.
@@ -212,10 +212,10 @@ pub fn hmax8(lanes: [f32; 8]) -> f32 {
 
 /// `_mm256_cvttps_epi32`: the float to int32 conversion with truncation.
 ///
-/// The C++'s conversion returns the "integer indefinite" value `0x80000000`
+/// The reference's conversion returns the "integer indefinite" value `0x80000000`
 /// for a value that does not fit and for NaN, and Rust's `as` saturates
 /// instead. The difference is invisible for any real score and visible for a
-/// pathological one, so the port reproduces the C++ exactly.
+/// pathological one, so the port reproduces the reference exactly.
 #[inline]
 fn cvttps_i32(x: f32) -> i32 {
     if x.is_nan() || x >= 2_147_483_648.0 || x < -2_147_483_648.0 {
@@ -225,9 +225,9 @@ fn cvttps_i32(x: f32) -> i32 {
     }
 }
 
-/// The degree-7 polynomial `exp2`, as the C++'s `exp2_avx2` computes it.
+/// The degree-7 polynomial `exp2`, as the reference's `exp2_avx2` computes it.
 ///
-/// Not `libm`'s `exp2`, and not `2^x` by another route: the C++ splits `x`
+/// Not `libm`'s `exp2`, and not `2^x` by another route: the reference splits `x`
 /// into an integer part and a fraction, evaluates a degree-7 polynomial on the
 /// fraction with FMA, and scales by `2^k` built out of the exponent field.
 ///
@@ -254,19 +254,19 @@ pub fn exp2_poly(x: f32) -> f32 {
     pl = pl.mul_add(f, C5);
     pl = pl.mul_add(f, C6);
     pl = pl.mul_add(f, C7);
-    // 2^k, built out of the exponent field exactly as the C++ does.
+    // 2^k, built out of the exponent field exactly as the reference does.
     let bits = (k.wrapping_add(127) as u32) << 23;
     pl * f32::from_bits(bits)
 }
 
-/// The GELU activation, as the C++'s `gelu_cpu` computes it.
+/// The GELU activation, as the reference's `gelu_cpu` computes it.
 ///
 /// A degree-8 minimax polynomial on `min(|x|, 4)`, NOT the exact erf and NOT
 /// the tanh approximation. The clamp on `|x|` is not cosmetic: the
 /// polynomial is minimax on [0, 4] and diverges outside it, and a large
 /// negative input would otherwise produce a large positive answer.
 ///
-/// The C++'s AVX2 path contracts the polynomial with FMA and its scalar tail
+/// The reference's AVX2 path contracts the polynomial with FMA and its scalar tail
 /// does not, so the two differ in the last bit -- and the oracle ran the
 /// AVX2 path. This is the AVX2 path.
 #[inline]
@@ -295,11 +295,11 @@ pub fn gelu_f32(v: f32) -> f32 {
 
 /// Layer normalisation over one row.
 ///
-/// The width must be a multiple of eight: the C++'s AVX2 path reads eight
+/// The width must be a multiple of eight: the reference's AVX2 path reads eight
 /// floats at a time and has no tail, and a row that is not a multiple of
 /// eight would be read past its end. The port refuses instead.
 ///
-/// The order is the C++'s: eight lane accumulators for the mean, the tree of
+/// The order is the reference's: eight lane accumulators for the mean, the tree of
 /// `hsum8` to finish it, eight lane accumulators with an FMA for the
 /// variance, the same tree to finish it, and an FMA in the epilogue.
 pub fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32]) -> Result<()> {
@@ -308,7 +308,7 @@ pub fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32]) -> Result<()>
 
 /// The LayerNorm, on a named ISA.
 ///
-/// The eight-lane structure is the C++'s and it is the same on every ISA:
+/// The eight-lane structure is the reference's and it is the same on every ISA:
 /// AVX-512 would fold sixteen lanes and fold them differently, so the row
 /// kernels do not take the wider path. See the plan's 5.1a.
 pub fn layernorm_row_on(isa: Isa, row: &mut [f32], gamma: &[f32], beta: &[f32]) -> Result<()> {
@@ -409,12 +409,12 @@ fn layernorm_row_impl(row: &mut [f32], gamma: &[f32], beta: &[f32]) {
     }
 }
 
-/// Softmax over one row, as the C++'s `softmax_cpu` computes it.
+/// Softmax over one row, as the reference's `softmax_cpu` computes it.
 ///
 /// The width must be a multiple of eight, for the same reason as the
 /// LayerNorm's.
 ///
-/// Three things are not textbook and all three are the C++'s:
+/// Three things are not textbook and all three are the reference's:
 ///
 /// * the exponential is `exp2_poly`, not `libm`'s `exp2`;
 /// * the argument is clamped at `-120` BEFORE the polynomial, because a
@@ -422,7 +422,7 @@ fn layernorm_row_impl(row: &mut [f32], gamma: &[f32], beta: &[f32]) {
 ///   NaN bit pattern -- and a masked element must contribute nothing;
 /// * the sum is eight lane accumulators finished with `hsum8`.
 ///
-/// The mask is NOT applied here: the C++'s caller adds the additive mask to
+/// The mask is NOT applied here: the reference's caller adds the additive mask to
 /// the row first, and adding it inside would change the maximum.
 pub fn softmax_row(row: &mut [f32]) -> Result<()> {
     softmax_row_on(row_isa(), row)
@@ -466,7 +466,7 @@ unsafe fn softmax_row_avx2(row: &mut [f32]) {
 fn softmax_row_impl(row: &mut [f32]) {
     let n = row.len();
     // The maximum: eight lanes, then a tree of maxes. Max is associative, so
-    // the tree is not a numerical question -- but it is the C++'s tree.
+    // the tree is not a numerical question -- but it is the reference's tree.
     //
     // The lanes start at the row's FIRST eight elements and not at zero: a
     // row of negatives would otherwise have a maximum of zero, and the
@@ -512,7 +512,7 @@ fn softmax_row_impl(row: &mut [f32]) {
 ///
 /// The accumulation is over K, in order, one column at a time, and each step
 /// is an FMA: `acc[n] = fma(b[k][n], a[m][k], acc[n])`. That is what the
-/// C++'s compiled inner loop does -- `vfmadd213ps` over eight columns, with
+/// reference's compiled inner loop does -- `vfmadd213ps` over eight columns, with
 /// a scalar FMA tail -- and it is why the port is not `acc += a * b`.
 ///
 /// The bias is added AFTER the whole reduction, in a plain addition.
@@ -607,7 +607,7 @@ fn gemm_nt_impl(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32]
 ///
 /// The portable build is not a different function: `mul_add` is a fused
 /// multiply-add on every target, so the builds agree bit for bit and differ
-/// only in speed. The AVX2 build is the C++'s own ISA baseline
+/// only in speed. The AVX2 build is the reference's own ISA baseline
 /// (`x86-64-v3`), and this port asks the host at run time rather than
 /// assuming it.
 ///
@@ -1055,7 +1055,7 @@ unsafe fn gemm_nt_avx512(
 /// The GELU, on a named ISA.
 ///
 /// The polynomial is contracted with FMA on the vector path and not on the
-/// scalar tail, exactly as the C++'s is, and exactly as the C++'s AVX2 and
+/// scalar tail, exactly as the reference's is, and exactly as the reference's AVX2 and
 /// scalar paths differ from each other. The oracle ran the AVX2 path.
 pub fn gelu_row_on(isa: Isa, x: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]

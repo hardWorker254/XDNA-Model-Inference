@@ -218,7 +218,7 @@ def calibrate_smoothing(model_dir, alpha=0.5, n_texts=128, max_len=64,
     extra multiply on values already in registers.
 
     Calibration is BUILD-TIME Python (CLAUDE.md rule 5 allows that; the shipped
-    runtime stays C++). It runs the numpy oracle -- the same
+    runtime stays reference). It runs the numpy oracle -- the same
     `reference/encoder.py` the goldens come from -- so the statistics describe
     exactly the tensors the array will see.
 
@@ -431,7 +431,7 @@ def add_gemm_b_host(w, name, mat):
     the HOST, so there is no DMA descriptor to pre-tile for and no
     layout_hash to check -- `layout=None` (Writer.add's default) is exactly
     that: an entry with no "layout" key, which npue.py's Reader.tensor() and
-    the C++ loader both already treat as "not tiled, read [K,N] row-major".
+    the reference loader both already treat as "not tiled, read [K,N] row-major".
     F32, not bf16: this checkpoint's own weights are F32 on disk (verified in
     tasks/0055 by direct inspection of the checkpoint's bytes, contradicting
     an earlier
@@ -887,7 +887,7 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
     # rule out.
     #
     # Read verbatim from the checkpoint's own config_sentence_transformers
-    # .json, but SORTED BY KEY. json_min.hpp (the C++ mirror's parser) is
+    # .json, but SORTED BY KEY. json_min.hpp (the reference mirror's parser) is
     # explicit that it does not preserve object key order -- it stores objects
     # in an unordered_map because tokenizer.json's 262k-entry vocab makes
     # anything else expensive -- so a source-order emission could not be
@@ -962,7 +962,7 @@ def pack_gemma(model_dir, out, source_repo_override=None, tile_k=None,
         w.add("tokenizer.gemma_table", tb, "U8", "tokenizer", [int(tb.size)])
         print(f"  tokenizer.gemma_table  {tb.size / 1e6:.2f} MB")
     else:
-        print(f"  WARNING: {tok_path} not found (generate it with the C++ "
+        print(f"  WARNING: {tok_path} not found (generate it with the reference "
               f"packer, `npuembeddings --prepare-model`) -- .npue will have no "
               f"tokenizer table")
 
@@ -1344,7 +1344,7 @@ def pack_nomic(model_dir, out, tile_k, tile_n, max_seq, fold_scale,
 
     # -- embeddings: SAME order as the BERT path, including the odd
     # ln.weight -> tokenizer.vocab -> ln.bias interleaving, which is
-    # load-bearing for byte parity with the C++ mirror. --------------------
+    # load-bearing for byte parity with the reference mirror. --------------------
     w.add("embeddings.word", src["embeddings.word_embeddings.weight"],
           "F32", "embedding", [cfg["vocab_size"], hidden])
     # nomic has NO position table -- RoPE is computed inside attention
@@ -1525,7 +1525,7 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
       * tokenizer is the XLMRTOK1 Unigram blob (T52, tasks/0127), stored
         whole as "tokenizer.xlmr_table" at the same interleaved position
         arch=0/2 store their vocab.txt -- load-bearing for byte parity with
-        the future C++ mirror.
+        the future reference mirror.
       * embeddings.word is 250,048 x 768 F32 (768 MB): the same
         deliberately-F32 gather as every other arch (pack_nomic's note).
         Rows 250,002..250,047 are padding, unreachable from the tokenizer.
@@ -1614,7 +1614,7 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
 
     tok_blob_path = model_dir / "xlmr_tokenizer.bin"
     if not tok_blob_path.exists():
-        # THE BLOB IS BUILT HERE. It used to be the C++ packer's job, which
+        # THE BLOB IS BUILT HERE. It used to be the reference packer's job, which
         # left this packer unable to produce a gte container at all: the
         # refusal below told the caller to run a binary from the tree this
         # port replaces. `xlmr_tokenizer_table` is that builder in Python, so
@@ -1716,7 +1716,7 @@ def pack_gte(model_dir, out, tile_k, tile_n, max_seq, fold_scale, int8=False,
 
     # -- embeddings: SAME order as arch=0/2, including the ln.weight ->
     # tokenizer -> ln.bias interleaving (load-bearing for byte parity with
-    # the C++ mirror). ----------------------------------------------------
+    # the reference mirror). ----------------------------------------------------
     w.add("embeddings.word", src["embeddings.word_embeddings.weight"],
           "F32", "embedding", [cfg["vocab_size"], hidden])
     w.add("embeddings.position", np.zeros((max_seq, hidden), dtype=np.float32),
@@ -2427,7 +2427,7 @@ def main():
         # numbers, and this pair's are measured on THIS container rather than
         # inherited: tools/verify/verify_hands.py section 1 compares the packed
         # weights against ORT's float kernels, sections 3-4 against recorded
-        # detections and the C++ runtime. Refusing an unmeasured capability was
+        # detections and the reference runtime. Refusing an unmeasured capability was
         # the choice; the capability plus its measurement is the other one.
         d = args.hands_onnx
         palm = sorted(glob.glob(os.path.join(d, "palm_detection_mediapipe_*.onnx")))
@@ -3026,7 +3026,7 @@ def main():
           "F32", "layernorm", [hidden])
     # The tokenizer vocabulary, verbatim, as bytes. It is not model data and
     # it is not touched by any kernel -- it rides here so that deploying the
-    # model is copying ONE file. The C++ tokenizer reads it straight out of
+    # model is copying ONE file. The reference tokenizer reads it straight out of
     # the mapping, exactly as the weights are read.
     vocab_path = model_dir / "vocab.txt"
     if vocab_path.exists():

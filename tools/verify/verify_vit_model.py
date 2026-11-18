@@ -48,7 +48,7 @@
 # exact things that are exact: the per-row scales, the int8 panel (which IS
 # bit-identical, since it is a store not an arithmetic chain), and the refusal.
 #
-# Env: numpy, a C++ toolchain. No NPU, no XRT, no design set, no checkpoint. The
+# Env: numpy, a reference toolchain. No NPU, no XRT, no design set, no checkpoint. The
 # probe needs a packed container, because the point is to hold the runtime
 # against the bytes it would really read.
 
@@ -357,7 +357,7 @@ def check_i8(exes: dict, npue: Path, g: dict) -> bool:
     q = np.clip(np.rint(v / sc[:, None]), -127, 127).astype(np.int8)
 
     # The synthetic int32 C is the probe's LCG, reproduced here rather than
-    # invented a second time. uint64 wraparound is what C++ does and numpy
+    # invented a second time. uint64 wraparound is what reference does and numpy
     # deliberately does NOT do for scalars, so the mask is the whole trick -- and
     # numpy warns about the overflow it is being asked to wrap through, which is
     # the point rather than a problem, so the warning is silenced HERE and named

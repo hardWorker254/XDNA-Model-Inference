@@ -7,7 +7,7 @@
 # hardware-independent empirical probe), not assumed from the model card.
 #
 # THIS IS THE arch=2 CANDIDATE. Not yet wired into tools/lib/npue.py, the .npue
-# packer, or the C++ runtime -- that is tasks/0069's OTHER half (arch=2
+# packer, or the reference runtime -- that is tasks/0069's OTHER half (arch=2
 # container, pack_nomic()), owned by a different agent working in tools/ at
 # the same time this file was written. See tasks/0068-.../TASK.md for the full
 # empirical derivation of every architectural fact asserted below; this file

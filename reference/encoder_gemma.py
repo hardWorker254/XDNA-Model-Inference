@@ -7,7 +7,7 @@
 # .venv-ref, transformers 5.15.0) rather than assumed.
 #
 # This is a RESEARCH SPIKE (tasks/0055), not production code. It is not wired
-# into the C++ runtime, the .npue packer, or the tokenizer -- see
+# into the reference runtime, the .npue packer, or the tokenizer -- see
 # tasks/0055-.../TASK.md for the go/no-go on that (C2-C4 in the research plan).
 #
 # Architecture, confirmed from the real Gemma3 modeling code (NOT guessed):
@@ -49,7 +49,7 @@
 #    is therefore the whole formula, and adding another 1 double-counts it:
 #    measured against reference/tail/embeddinggemma-300m.f32 that mistake
 #    alone moves p99 from 3.8e-05 to 9.9e-01. Do not "restore" the `1 +`
-#    here or in either C++ encoder -- it is already in the numbers.
+#    here or in either reference encoder -- it is already in the numbers.
 #
 #  * Attention is MQA/GQA: 3 query heads, 1 KV head, head_dim 256 (NOT
 #    hidden/num_heads=256 by coincidence of arithmetic -- head_dim is an

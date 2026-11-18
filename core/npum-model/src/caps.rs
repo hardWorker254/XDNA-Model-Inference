@@ -2,7 +2,7 @@
 //!
 //! # The operation list
 //!
-//! Nine operations, the same nine the C++ runtime had: `gemm`, `gelu`,
+//! Nine operations, the same nine the reference runtime had: `gemm`, `gelu`,
 //! `layernorm`, `softmax`, `attn`, `conv`, `mproj`, `fft`, `logit`.
 //!
 //! The list is deliberately the one the `--npu-ops` flag already accepted, so
@@ -84,7 +84,7 @@ impl fmt::Display for OpKind {
 ///
 /// # What this is for
 ///
-/// The C++ runtime decided "host or NPU" with a scattering of flags and
+/// The reference runtime decided "host or NPU" with a scattering of flags and
 /// boolean fields: `--npu-ops`, a `host_*` flag per operation, and a separate
 /// `npu_ops.cpp` per family. Three backends make the decision explicit, and
 /// this is where the explicit decision is described.

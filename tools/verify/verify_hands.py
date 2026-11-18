@@ -55,7 +55,7 @@ ARCH_STRING = "mediapipe_hands_palm_ssd_lm_heatmap"
 # into measurements: a tolerance measured on those floats is not a
 # bar a quantised container can clear, so what it can do is report
 # how far the quantisation moved it. Sections 4 and 5 compare the
-# container against ITSELF (the C++ reader against this file's
+# container against ITSELF (the reference reader against this file's
 # reader, the array path against the host path) and stay gates at
 # every precision, because there the quantisation is common to both
 # sides and cancels.
@@ -830,7 +830,7 @@ TOL_PROB = 2e-4
 # sigmoid of the head's logit and on this frame it lands at 0.894.
 TOL_SCORE = 2e-3
 
-# -- section 4, the C++ runtime ------------------------------------------------
+# -- section 4, the reference runtime ------------------------------------------------
 # The tolerances for the runtime against THIS file's own front end. They are
 # measured, like every other number in this file, and the measurement is
 # recorded in tools/verify/README or in the section's docstring when it drifts.
@@ -896,7 +896,7 @@ RTQ_PROB = 2e-4         # measured 1.35e-4
 RTQ_WORLD = 1.8e-3      # measured 1.21e-3
 # Where the runtime binary is expected. It is BUILT, not shipped, so a gate that
 # cannot find it says so and stops -- a runtime section that quietly skipped
-# itself would leave the C++ path unmeasured while reporting OK.
+# itself would leave the reference path unmeasured while reporting OK.
 BINARY = os.path.join(REPO, "runtime", "build", "npuimage")
 
 
@@ -1271,7 +1271,7 @@ def section_5_array(reader, verbose):
 
 
 def section_4(reader, verbose):
-    """The C++ runtime, against this file's own front end and networks.
+    """The reference runtime, against this file's own front end and networks.
 
     SECTIONS 1 TO 3 NEVER TOUCH THE RUNTIME
     ---------------------------------------
@@ -1282,7 +1282,7 @@ def section_4(reader, verbose):
     their language:
 
       * the runtime reads the container's graphs with common/json_min.hpp and
-        walks them in C++, where this file reads the same JSON with json.loads;
+        walks them in reference, where this file reads the same JSON with json.loads;
       * it ROUNDS the letterboxed palm input back to 8 bits, because cv2 does
         and this file deliberately does not, so on this frame the two
         implementations' detection boxes differ by 0.618 px before anything else
@@ -1290,7 +1290,7 @@ def section_4(reader, verbose):
       * it accumulates the convolutions in its own GEMM order, so its tensors
         differ from numpy's by float32 rounding rather than by agreement.
 
-    So this section is not "does the C++ agree with itself". It is the one place
+    So this section is not "does the reference agree with itself". It is the one place
     where the shipped binary is measured at all, and its tolerances come from
     the run recorded above rather than from a round number.
 
@@ -1309,7 +1309,7 @@ def section_4(reader, verbose):
     A MISSING BINARY STOPS THE GATE
     --------------------------------
     Not skips it. The runtime is built, not committed, so on a fresh checkout
-    this section has nothing to run and saying "OK" would report the C++ path as
+    this section has nothing to run and saying "OK" would report the reference path as
     measured when it was not measured at all. Build it first:
         cmake -S runtime -B runtime/build && cmake --build runtime/build
 
@@ -1325,13 +1325,13 @@ def section_4(reader, verbose):
     hand outright is reported as such, with the two readers'
     agreement still gated.
     """
-    print("  4. the C++ runtime against this file's own front end")
+    print("  4. the reference runtime against this file's own front end")
     if not os.path.exists(BINARY):
         raise Fail(
             f"the runtime binary is not at {BINARY}, and this is the only "
             f"place any gate measures it. Sections 1 to 3 run the container "
             f"through numpy and would pass in full without it, so skipping is "
-            f"not an option -- report OK would mean the C++ path was measured. "
+            f"not an option -- report OK would mean the reference path was measured. "
             f"Build it: cmake -S runtime -B runtime/build && "
             f"cmake --build runtime/build")
     hands = Hands(ContainerBackend(reader), reader.config, verbose=verbose)
@@ -1363,7 +1363,7 @@ def section_4(reader, verbose):
         # compare the runtime against. On a quantised one it is a
         # MEASUREMENT of what the quantisation cost -- an i4 container
         # at the packed default group loses this frame outright -- and
-        # the section's actual question, whether the C++ reader and
+        # the section's actual question, whether the reference reader and
         # this file's reader agree, is still asked and still gated:
         # both read the same container, so a count that differs
         # between them is a bug in one of the two readers, not a
@@ -1375,7 +1375,7 @@ def section_4(reader, verbose):
               f"hands on this frame (conv weights are {_QUANT['dtype']})")
         check(len(got.get("hands", [])) == len(ref),
               f"the runtime found {len(got.get('hands', []))} hands and "
-              f"this file's front end found {len(ref)}: the C++ reader "
+              f"this file's front end found {len(ref)}: the reference reader "
               f"and this file's reader disagree, which is a bug in one "
               f"of them rather than a property of the {_QUANT['dtype']} "
               f"weights they both read")
@@ -1765,7 +1765,7 @@ def main():
         fn(reader, args.verbose)
     if _QUANT["dtype"] is None:
         print("OK: the container holds this checkpoint, in this arrangement, the "
-              "front end is the one the numbers were recorded from, the C++ "
+              "front end is the one the numbers were recorded from, the reference "
               "runtime reproduces all four stages of it, and the array path "
               "dispatches against a design set checked in both directions -- "
               "slower than the host and a different answer, both measured and both "
@@ -1778,7 +1778,7 @@ def main():
               f"the checkpoint's own floats -- those numbers above are the cost "
               f"of the quantisation, and a container that found no hand said so "
               f"where it happened. What still gated, and held: section 4, the "
-              f"C++ runtime against this file's own front end on this same "
+              f"reference runtime against this file's own front end on this same "
               f"container, and section 5, the array path against the host path "
               f"on the design set's container.")
 

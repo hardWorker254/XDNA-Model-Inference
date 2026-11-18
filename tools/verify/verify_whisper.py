@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# NpuEmbeddings -- word error rate of the C++ transcription path against a
+# NpuEmbeddings -- word error rate of the reference transcription path against a
 # human reference transcript.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -119,7 +119,7 @@ def run_ours(exe, name, audio, args) -> tuple[str, float, dict]:
         capture_output=True, text=True, timeout=3600)
     dt = time.monotonic() - t0
     if p.returncode != 0:
-        raise SystemExit(f"the C++ side refused {audio}:\n{p.stderr.strip()[-800:]}")
+        raise SystemExit(f"the reference side refused {audio}:\n{p.stderr.strip()[-800:]}")
     return json.loads(p.stdout)["text"], dt, json.loads(p.stdout)
 
 
@@ -155,7 +155,7 @@ def run_hf(ckpt: Path, audio: Path, n_mels: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Word error rate of the C++ Whisper path against a human "
+        description="Word error rate of the reference Whisper path against a human "
                     "transcript, with transformers' WER on the same audio for "
                     "scale.")
     ap.add_argument("--npue", default=str(REPO / "models" / "whisper-tiny.npue"))

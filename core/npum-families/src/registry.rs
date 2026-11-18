@@ -2,7 +2,7 @@
 //!
 //! # The refusal, and what it says
 //!
-//! The C++ runtime's refusal named the OTHER binary and printed the roster:
+//! The reference runtime's refusal named the OTHER binary and printed the roster:
 //!
 //! ```text
 //! models/whisper-base.npue is `whisper_encdec_gelu`, which npuaudio runs,

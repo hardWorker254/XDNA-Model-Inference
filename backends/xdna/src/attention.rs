@@ -7,7 +7,7 @@
 //! or the other way round. The two are separate decisions because the flag
 //! names them separately, and this file is the array's half of both.
 //!
-//! It is the C++ runtime's `NpuAttention`, and it is the same object: two
+//! It is the reference runtime's `NpuAttention`, and it is the same object: two
 //! instruction streams of the projections' OWN set -- `attn_qk` and
 //! `attn_av` -- and the panels they multiply by are ACTIVATIONS, not
 //! weights. A weight panel is staged once and reused; these are rebuilt for
@@ -378,7 +378,7 @@ pub fn run<T: Transport>(
     // wrong width.
     //
     // So a run that has fewer sequences than the tier PADS: it computes the
-    // tier's worth and throws the padding away. The C++'s encoder does the
+    // tier's worth and throws the padding away. The reference's encoder does the
     // same -- its batch IS the tier's -- and the dispatch count is the
     // number that says what the array did, so a run that computed fewer
     // sequences would be a run that dispatched a different number of times.
@@ -592,7 +592,7 @@ fn build_v_panel(
 /// The panel, in the MMAC's byte order.
 ///
 /// The same order the container's own panels are stored in, and the same
-/// one the C++'s `tile_b_panel` produces: `[K,N] -> [K/tile_k][N/tile_n]
+/// one the reference's `tile_b_panel` produces: `[K,N] -> [K/tile_k][N/tile_n]
 /// [tile_k/mac_s][tile_n/mac_t][s][t]`.
 fn tile(panel: &[f32], k: usize, n: usize, attn: &Attention) -> Result<Vec<u8>, ArrayError> {
     let mut bytes = vec![0u8; panel.len() * 2];
@@ -613,7 +613,7 @@ fn tile(panel: &[f32], k: usize, n: usize, attn: &Attention) -> Result<Vec<u8>, 
 
 /// The softmax over one score row, on the host.
 ///
-/// THE C++'s `NpuAttention::host_softmax`, and not the host path's own
+/// THE reference's `NpuAttention::host_softmax`, and not the host path's own
 /// softmax: the attention's is a plain loop over the row, while the host
 /// path's is an eight-lane one, and the two sum the exponentials in
 /// different orders. The row here is the PADDED one -- every column of it,

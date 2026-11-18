@@ -17,7 +17,7 @@
 #
 # WHY THIS IS WRITTEN TWICE
 # -------------------------
-# The exporter is Python and the runtime's parser is C++
+# The exporter is Python and the runtime's parser is reference
 # (runtime/include/common/npu_ops_flag.hpp), and neither can include the other.
 # Each file points at the other. The failure mode of the duplication is a
 # refusal by name on both sides -- an unknown code throws and lists the valid

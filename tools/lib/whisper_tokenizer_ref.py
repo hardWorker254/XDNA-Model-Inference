@@ -1,11 +1,11 @@
-# NpuEmbeddings -- pure-Python reference for the C++ Whisper tokenizer.
+# NpuEmbeddings -- pure-Python reference for the reference Whisper tokenizer.
 # SPDX-License-Identifier: Apache-2.0
 #
 # THIS FILE IS THE EXECUTABLE SPEC for runtime/src/tokenizers/whisper.cpp, in
 # the same relationship tools/lib/xlmr_tokenizer_ref.py has to the XLM-R tokenizer.
 # It consumes the BLOB out of a packed .npue, not vocab.json/merges.txt, so it
-# exercises the exact bytes the C++ reader will see. A divergence between this
-# and the C++ is a wrong transcript, not a wrong number: text either matches or
+# exercises the exact bytes the reference reader will see. A divergence between this
+# and the reference is a wrong transcript, not a wrong number: text either matches or
 # it does not, so the gate is byte-exact token ids and byte-exact text.
 #
 # WHY decode IS THE DIRECTION THAT MATTERS: an STT container receives ids from
@@ -65,7 +65,7 @@ from whisper_bpe import TableReader, VocabMerges, bytes_to_unicode  # noqa: E402
 # first and then splitting is wrong, because the byte-level alphabet is not the
 # original alphabet -- 'Ģ' (U+0122) is a letter and '²' (U+00B2) is not, so
 # "Привет" comes out as five pieces instead of one and every id after the first
-# diverges. This is why the C++ must not be tempted to fold the two steps
+# diverges. This is why the reference must not be tempted to fold the two steps
 # together either.
 GPT2_PATTERN = (r"'s|'t|'re|'ve|'m|'ll|'d"
                 r"| ?\p{L}+"
@@ -81,7 +81,7 @@ def _compile():
     except ImportError:
         raise SystemExit(
             "this reference needs the `regex` module (pip install regex): "
-            "Python's re has no \\p{L}. The C++ side uses std::regex, which "
+            "Python's re has no \\p{L}. The reference side uses std::regex, which "
             "does, so the two must be tested against the same pattern.")
     return regex.compile(GPT2_PATTERN)
 

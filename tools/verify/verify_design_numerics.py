@@ -6,7 +6,7 @@
 # claims to. This feeds random matrices through the exported instruction
 # streams -- the same A/B/C buffers and the same instruction slots the runtime
 # uses -- and compares C with a float32 numpy reference. It is the verdict on
-# P4 that does not need the C++ encoder to exist first.
+# P4 that does not need the reference encoder to exist first.
 #
 # One process holds one hw_context at a time, so the device budget is the same
 # one Design spends: this must not be a second resident design set.

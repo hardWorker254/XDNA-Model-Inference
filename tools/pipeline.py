@@ -77,7 +77,7 @@ TOOLSET = [
      "the .npue: spec, bit-exact round trip, stale layout, goldens",
      ("numpy", "container", "reference")),
     ("verify_pack_parity", "verify/verify_pack_parity.py",
-     "the Python and C++ packers agree byte for byte",
+     "the Python and reference packers agree byte for byte",
      ("numpy", "checkpoint", "g++")),
     ("verify_i8_scheme", "verify/verify_i8_scheme.py",
      "the int8 scheme against itself, and seven injected faults",
@@ -86,25 +86,25 @@ TOOLSET = [
      "the runtime's int8 host kernels, AVX2 vs scalar, byte for byte",
      ("g++",)),
     ("verify_i4_scheme", "verify/verify_i4_scheme.py",
-     "the int4 scheme, ten injected faults, and the C++ decode byte for byte",
+     "the int4 scheme, ten injected faults, and the reference decode byte for byte",
      ("numpy", "g++")),
     ("verify_design_numerics", "verify/verify_design_numerics.py",
      "does a design set COMPUTE what it claims to (needs the NPU)",
      ("numpy", "npu", "designs")),
     # The registry gate. It pins what all 40 (code x architecture) cells say --
     # the registry's own shape, all four GENERATED documents against it, the
-    # C++ table against the Python one -- and then runs every cell against the
+    # reference table against the Python one -- and then runs every cell against the
     # binary, so a cell that says `honours` and does not dispatch fails it.
     # The needs are the union of those two halves: the documents need no
     # device, the 40 runs need the built binary, a container and a design set.
     ("verify_npu_op_matrix", "verify/verify_npu_op_matrix.py",
-     "every code against every architecture: registry, docs, C++ table, binary",
+     "every code against every architecture: registry, docs, reference table, binary",
      ("npu", "runtime", "container", "designs")),
     ("verify_whisper_tokenizer", "verify/verify_whisper_tokenizer.py",
-     "the Whisper tokenizer three ways: C++, reference, HuggingFace",
+     "the Whisper tokenizer three ways: reference, reference, HuggingFace",
      ("numpy", "transformers")),
     ("verify_whisper_features", "verify/verify_whisper_features.py",
-     "the C++ audio front end against WhisperFeatureExtractor",
+     "the reference audio front end against WhisperFeatureExtractor",
      ("numpy", "torch", "transformers")),
     ("verify_whisper_model", "verify/verify_whisper_model.py",
      "the Whisper NPU stacks against transformers, step by step",
@@ -153,7 +153,7 @@ TOOLSET = [
      "the arch=5 gate: pool + attention + pre-LN + head, both schemes",
      ("numpy", "torch", "transformers", "container", "checkpoint")),
     ("verify_vit_image", "verify/verify_vit_image.py",
-     "the C++ image front end against PIL, per resample code",
+     "the reference image front end against PIL, per resample code",
      ("numpy", "pillow", "g++", "container")),
     ("verify_vit_model", "verify/verify_vit_model.py",
      "the host-only arch=5 half: geometry, the head's stride, the int8 kernels",
@@ -171,14 +171,14 @@ TOOLSET = [
      ("numpy", "onnx", "onnxruntime", "pillow", "hands_models")),
     # The arch=8 gate, and the same three questions in the same order: the packed
     # op list against ORT, the anchor table against an independent derivation of
-    # the same pyramid, and the C++ runtime against the numbers recorded from the
+    # the same pyramid, and the reference runtime against the numbers recorded from the
     # zoo. It needs the BUILT BINARY -- where arch=7's section 4 can re-implement
     # the front end in numpy and compare, arch=8's third section runs the real
     # thing, because the residual that section measures (a resampler's) is only
     # measurable against the real resampler. So it sits in the `container` tier
     # and its environment list says what it needs.
     ("verify_mppose", "verify/verify_mppose.py",
-     "the arch=8 gate: two networks against ORT, the anchors, and the C++ "
+     "the arch=8 gate: two networks against ORT, the anchors, and the reference "
      "runtime against the zoo",
      ("numpy", "onnx", "onnxruntime", "pillow", "mppose_models", "runtime")),
     ("verify_cli_flags", "verify/verify_cli_flags.py",
@@ -230,8 +230,8 @@ ENVIRONMENTS = [
      "pip install openai"),
     ("aie.iron", "the exporters: MLIR-AIE, dot-source its env script first",
      ". C:\\dev\\mlir-aie\\iron_env.ps1   (or: source iron_env.sh)"),
-    ("g++", "the two gates that compile C++ to compare it byte for byte",
-     "apt install g++   (or: any C++17 compiler)"),
+    ("g++", "the two gates that compile reference to compare it byte for byte",
+     "apt install g++   (or: any reference17 compiler)"),
     ("git", "parity_exporters.py, which resolves its reference from history",
      "apt install git"),
 ]
@@ -308,10 +308,10 @@ MAP = [
 ]
 
 # Which gates need what, so `gates --only` can promise an honest subset: the
-# ones below run with nothing but this interpreter and a C++ compiler.
+# ones below run with nothing but this interpreter and a compiler.
 GATE_TIERS = {
     # "cheap" is the promise this tier makes: nothing but this interpreter and a
-    # C++ compiler, no checkpoint and no NPU. verify_vit_image and
+    # compiler, no checkpoint and no NPU. verify_vit_image and
     # verify_vit_model earn their place here because they are the only gates on
     # the image path that need neither -- they read a container, but not a
     # design set and not a device. verify_i4_scheme compiles its own probe from
@@ -351,7 +351,7 @@ GATE_TIERS = {
     # verify_npu_op_matrix is here rather than in "cheap" for the same reason
     # verify_design_numerics is: it runs every registry cell against the BINARY,
     # so it needs the build and the device, and its other claims (the registry's
-    # shape, all four generated documents, the C++ table) are the ones that keep
+    # shape, all four generated documents, the reference table) are the ones that keep
     # NPU_OPS*.md and NPU_MODELS*.md from drifting from the code. A gate that
     # pins what every cell says about every architecture and is not in the list
     # that gets run is a gate that is only run by hand, which is not a gate.
@@ -423,7 +423,7 @@ def _have(kind):
         return shutil.which("git") is not None, "install git"
     if kind == "g++":
         return any(shutil.which(c) for c in ("g++", "clang++", "cl")), \
-            "install a C++17 compiler"
+            "install a reference17 compiler"
     if kind == "hands_models":
         # The arch=7 pair, both float files, and the photograph the gate's
         # geometry numbers were recorded on. Named separately from "container"

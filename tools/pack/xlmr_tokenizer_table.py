@@ -10,10 +10,10 @@
 # file, one digest, nothing read from the model directory at run time, and no
 # Unicode or regex logic on the hot path that could drift from the packer's.
 #
-# That blob used to be built by C++ only (`runtime/src/tokenizers/
+# That blob used to be built by the reference implementation only (`runtime/src/tokenizers/
 # xlmr_tokenizer_gen.cpp` in the pre-port tree), which left the Python packer
 # with no way to produce one: it refused gte packouts with "generate it first
-# with the C++ packer". This is the same builder in Python, so a gte container
+# with the reference packer". This is the same builder in Python, so a gte container
 # is buildable from a checkpoint and this tree alone.
 #
 # THE SPECIFICATION IT IS CHECKED AGAINST
@@ -101,7 +101,7 @@ def _str16(text: str) -> bytes:
 def generate(tokenizer_json: Path) -> bytes:
     """Build the XLMRTOK1 blob for one tokenizer.json.
 
-    Every guard here is the C++ generator's guard, in the same order and
+    Every guard here is the reference generator's guard, in the same order and
     against the same field, so the two can be compared line by line.
     """
     tokenizer_json = Path(tokenizer_json)

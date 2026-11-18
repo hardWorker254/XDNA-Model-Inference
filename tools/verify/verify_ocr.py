@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Verify an arch=9 PaddleOCR container and the C++ runtime built from it.
+"""Verify an arch=9 PaddleOCR container and the reference runtime built from it.
 
 WHAT THIS FILE IS, AND WHAT IT IS NOT
 -------------------------------------
 Two checkpoints in one container -- a text detector and a text recogniser --
-and a C++ runtime that runs both and reads a line of text off a photograph.
+and a reference runtime that runs both and reads a line of text off a photograph.
 This file checks that the container holds those two checkpoints in that
 arrangement, that the runtime walks their graphs the way the graphs say, and
 that the whole thing answers the question the checkpoints were trained to
@@ -566,7 +566,7 @@ def section_4(reader, verbose):
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description="verify an arch=9 PaddleOCR container and the C++ runtime "
+        description="verify an arch=9 PaddleOCR container and the reference runtime "
                     "built from it")
     ap.add_argument("--container", default=None,
                     help="the .npue to check (default: models/paddleocr-onnx.npue)")

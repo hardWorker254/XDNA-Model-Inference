@@ -2,7 +2,7 @@
 //!
 //! # This is the CLI's contract, and it is a long one
 //!
-//! The C++'s runtime prints a block before every run: which container, which
+//! The reference's runtime prints a block before every run: which container, which
 //! shapes, which design set, which generation, which toolchain built it,
 //! where each operation runs, and -- after the work -- where the time went.
 //! The golden transcripts hold that block, so it is a contract and not a
@@ -17,29 +17,29 @@
 //! * the design set's `design.json` gives the streams, the tiers, the rows,
 //!   the sequence length, the generation and the datapath;
 //! * the design set's `toolchain.json` gives the toolchain's versions;
-//! * the operation rows are the C++'s own: the code, the long name, and
+//! * the operation rows are the reference's own: the code, the long name, and
 //!   where the operation runs.
 //!
 //! Two lines are NOT reproducible, and both are declared rather than faked:
 //!
-//! * **the buffer alignment.** The C++ prints the alignment of a buffer's
+//! * **the buffer alignment.** The reference prints the alignment of a buffer's
 //!   ADDRESS, and the oracle's own runs disagree with each other -- 4096,
 //!   8192, 16384 and 2097152 bytes for the same command, because the
 //!   allocator decides. The harness normalises it;
-//! * **the runtime's own name in the banner.** The C++ says "C++ runtime"
-//!   and this one says "Rust runtime", because a runtime that says "C++" is
+//! * **the runtime's own name in the banner.** The reference says "reference runtime"
+//!   and this one says "Rust runtime", because a runtime that says "reference" is
 //!   lying about what it is. The harness normalises the word.
 //!
 //! # The time split
 //!
-//! The rows are the C++'s, in the C++'s order, with the C++'s widths. The
+//! The rows are the reference's, in the reference's order, with the reference's widths. The
 //! array's own rows -- the upload, the dispatch, the download -- are zero,
 //! because this runtime measures the array's time as one number and does
 //! not split it into the three; the host rows carry the measurements this
 //! runtime actually made.
 //!
 //! AND THE ARRAY'S TIME IS IN THE "gemm + epilogue" ROW, which is where
-//! the C++'s puts it: the C++'s `t.conv` holds the projections' conversion
+//! the reference's puts it: the reference's `t.conv` holds the projections' conversion
 //! and the elementwise passes' conversion alike, and both are the array's
 //! time. A host row that reported the array's time would be a row that
 //! lies about where the work happened.
@@ -365,7 +365,7 @@ fn read_design_from(
 /// Print the status block for a container, and hand back what was read.
 ///
 /// The block comes BEFORE any refusal the work itself would give. The
-/// C++ prints its banner first and refuses after, and a reader who has
+/// reference prints its banner first and refuses after, and a reader who has
 /// seen the banner knows WHICH container the refusal is about -- a
 /// refusal on its own says "something is wrong" and a banner says "this
 /// container, this design, this device".
@@ -529,7 +529,7 @@ pub fn print_block(
 
 /// The vocabulary's size, on its own line.
 ///
-/// NOT part of the status block: the C++ prints it after the block and
+/// NOT part of the status block: the reference prints it after the block and
 /// after the prefix refusal, because the tokenizer is loaded at that
 /// point and not before. A refusal that comes before the tokenizer is
 /// loaded has no vocabulary to report.
@@ -558,7 +558,7 @@ fn where_host(code: &str, long_name: &str, note: &str) {
 /// One operation's row: the code, the long name, and where it runs.
 ///
 /// The array's line names the design and the generation it was built for,
-/// and it is the C++'s line word for word: the design's name (or its kind,
+/// and it is the reference's line word for word: the design's name (or its kind,
 /// when the design has no name), the architecture number, and the device.
 ///
 /// The GPU's line names the device and says that the pass is the GPU's
@@ -585,7 +585,7 @@ fn where_op(code: &str, long_name: &str, place: Option<&OpWhere>, note: &str) {
 /// What the GPU did, when it did something.
 ///
 /// The row is the GPU's own, and it is printed only when there is one: a
-/// host run has no GPU row, and the block's shape is the C++'s.
+/// host run has no GPU row, and the block's shape is the reference's.
 #[derive(Debug, Clone)]
 pub struct Gpu {
     /// The device's name.
@@ -596,7 +596,7 @@ pub struct Gpu {
 
 /// The time split, printed after the work.
 ///
-/// The rows are the C++'s, in the C++'s order and the C++'s widths, and the
+/// The rows are the reference's, in the reference's order and the reference's widths, and the
 /// array's own rows are zero -- the host path dispatches nothing.
 pub fn print_time_split(
     timings: &Timings,
@@ -612,13 +612,13 @@ pub fn print_time_split(
         wall_s * ms
     );
     let row = |name: &str, value: f64| {
-        // The C++'s format: "    %-22s %8.1f ms  %5.1f%%". The two spaces
-        // before the percentage are the C++'s, and the percentage's own width
+        // The reference's format: "    %-22s %8.1f ms  %5.1f%%". The two spaces
+        // before the percentage are the reference's, and the percentage's own width
         // is %5.1f -- so a value of 96.0 prints with one space and a value
         // of 0.0 with two.
         //
         // THE VALUE IS IN MILLISECONDS, and the timings carry seconds: the
-        // C++'s block prints milliseconds, and a block that prints "0.0 ms"
+        // reference's block prints milliseconds, and a block that prints "0.0 ms"
         // for a third of a second is a block nobody can read.
         println!(
             "    {name:<22} {value:>8.1} ms  {pct:>5.1}%",

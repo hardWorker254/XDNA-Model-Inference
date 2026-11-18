@@ -21,10 +21,10 @@
 //!
 //! # The refusals are the CONTRACT, and they are word for word
 //!
-//! Every refusal below is transcribed from the C++ runtime's, and the
+//! Every refusal below is transcribed from the reference runtime's, and the
 //! golden transcripts check them. That is deliberate: a refusal is the text
 //! a reader sees when something is wrong, and it is the ONE place where a
-//! wording change is felt rather than merely observed. The C++ runtime said
+//! wording change is felt rather than merely observed. The reference runtime said
 //! things there that this one keeps saying:
 //!
 //! * an unrecognised option says WHY it is refused rather than ignored --
@@ -109,7 +109,7 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
     // The removed flags are refused HERE, before anything is opened and
     // before the model is even resolved.
     //
-    // The C++ runtime refuses them in the subcommand's own gate, which is
+    // The reference runtime refuses them in the subcommand's own gate, which is
     // the same place in the sequence: the gate that forwards the flags the
     // runtime reads is also the gate that refuses the ones it does not. A
     // flag that silently disappears is the failure the gate exists to
@@ -177,7 +177,7 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
     // The generation is checked against the names this build knows, and it
     // is checked HERE -- before any design is looked for.
     //
-    // The C++ runtime did not check it: `--dev npu3` was carried into the
+    // The reference runtime did not check it: `--dev npu3` was carried into the
     // design search and came back as a refusal that named the generation it
     // did not recognise. That is a refusal that happens to be right, and it
     // is right for the wrong reason -- the answer depends on there being no
@@ -225,7 +225,7 @@ pub fn run(binary: &'static str) -> ExitCode {
 
 /// Where the models and the design sets are.
 ///
-/// `--root` wins, and the default search is the C++ runtime's: the
+/// `--root` wins, and the default search is the reference runtime's: the
 /// executable's own directory first, and only then upwards.
 fn resolve_root(args: &Args, argv: &[String]) -> PathBuf {
     if let Some(root) = args.value("--root") {
@@ -233,7 +233,7 @@ fn resolve_root(args: &Args, argv: &[String]) -> PathBuf {
     }
     // The flag table records `--root` as taking a value, and the parser
     // stored it -- but the flag form (`--root` after the verb) is read from
-    // the argument vector as well, because the C++ runtime read it that way
+    // the argument vector as well, because the reference runtime read it that way
     // and a command line that worked there must work here.
     let mut i = 0;
     while i + 1 < argv.len() {

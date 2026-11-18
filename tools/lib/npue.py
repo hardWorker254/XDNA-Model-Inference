@@ -1,7 +1,7 @@
 # NpuEmbeddings -- the .npue runtime weight container.
 #
 # Spec lives in docs/04-model/README.md; this is the implementation, and it is
-# the reference for the C++ loader in M7. numpy only, so it runs in the iron env.
+# the reference for the reference loader in M7. numpy only, so it runs in the iron env.
 #
 # Layout of the file:
 #   [0:64]                   FileHeader, exactly 64 bytes, little-endian
@@ -344,7 +344,7 @@ def from_bf16_bits(bits):
 #
 # An I8 operand is three tensors, not one: the panel, its per-output-channel
 # weight scale and its per-INPUT-channel SmoothQuant divisor. tools/lib/gemm_i8.py
-# writes all three; the C++ loader reads them by these exact names
+# writes all three; the reference loader reads them by these exact names
 # (runtime/src/encoders/bert_encoder.cpp builds `name + ".wscale"`), so they
 # are named HERE, once, and both sides spell them the same way.
 #
@@ -427,7 +427,7 @@ def fold_i4(t, gscale, group):
     i.e. the same int8 panel an int8 container would carry, up to the int4
     error that is the point of the format.
 
-    rint is round-half-to-EVEN, and the C++ unpack uses nearbyint under the
+    rint is round-half-to-EVEN, and the reference unpack uses nearbyint under the
     default FE_TONEAREST rounding mode, which is the same rule: the two sides
     must produce byte-identical panels or a gate comparing them measures the
     tie-break, not the packing.
@@ -1089,7 +1089,7 @@ class Reader:
                  not its own arithmetic.
         i4       `q[n,k] * wscale[n] * gscale[g(k),n]`, left to right, with
                  `g = ceil(K / conv_int4_group)` and the same left-to-right
-                 order the C++ reader uses -- `(v * s) * r` and `v * (s * r)`
+                 order the reference reader uses -- `(v * s) * r` and `v * (s * r)`
                  are different float32 numbers, and a checker that quietly
                  swapped them would report a reader bug on weights where two
                  readers agree exactly.
@@ -1190,7 +1190,7 @@ class Reader:
 
     def tensor(self, name):
         """The logical tensor: de-tiled and widened to fp32. For verification
-        and for the Python encoder -- the C++ runtime uses panel() instead.
+        and for the Python encoder -- the reference runtime uses panel() instead.
 
         An I8 or I4 operand comes back DEQUANTISED (see `dequant_int8`): the
         panel alone is not a weight, and a caller that got the raw int8 would

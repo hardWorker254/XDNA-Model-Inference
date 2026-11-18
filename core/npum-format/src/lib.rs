@@ -124,7 +124,7 @@ impl Container {
     /// deliberate simplification for the moment -- a real mapping needs
     /// platform-specific code, and this crate's first job is to be READABLE
     /// and to pin the format down. The alternative -- copying -- is what the
-    /// C++ runtime avoided by never loading the payload at all, and the
+    /// reference runtime avoided by never loading the payload at all, and the
     /// memmap is where this crate goes next.
     pub fn open(path: &Path) -> Result<Self> {
         let path_str = path.display().to_string();

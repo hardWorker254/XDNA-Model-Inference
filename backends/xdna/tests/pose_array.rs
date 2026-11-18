@@ -11,7 +11,7 @@
 //!
 //! # WHAT IT IS NOT
 //!
-//! It is NOT a parity check against the C++ runtime: that is what the
+//! It is NOT a parity check against the reference runtime: that is what the
 //! golden transcripts are for, and this crate cannot see them. What it
 //! checks is the property the flag exists to make true -- **the array's
 //! numbers are the host's numbers, to the width of bf16** -- and it checks

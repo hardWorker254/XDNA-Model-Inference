@@ -15,10 +15,10 @@
 //!
 //! # The model id, and the backend
 //!
-//! The C++'s server hardcodes `"backend":"amd-xdna2-npu"` in all four of
+//! The reference's server hardcodes `"backend":"amd-xdna2-npu"` in all four of
 //! its backends -- on a machine whose own status block says `device npu1`.
 //! This one reports the device it found. And the model id says `-cpu` when
-//! the compute happened on the host, because the C++'s own convention says
+//! the compute happened on the host, because the reference's own convention says
 //! so: "the model id is what a client sees, and naming a host-only server
 //! after the array is exactly the silent mislabel".
 
@@ -220,7 +220,7 @@ pub fn serve(
         npum_families::Family::MpPose => {
             // NOT "not ported": the block IS ported and `npuimage mppose`
             // prints it. The reason there is no server here is the oracle's
-            // own -- arch 8 has no endpoint in C++ either -- and saying
+            // own -- arch 8 has no endpoint in the reference implementation either -- and saying
             // otherwise would name a gap that does not exist while hiding the
             // one that does.
             eprintln!(
@@ -233,7 +233,7 @@ pub fn serve(
         }
         npum_families::Family::Ocr => {
             // The oracle's refusal, in the oracle's words: arch 9 has no
-            // endpoint in C++ either, and saying "not ported" would name a
+            // endpoint in the reference implementation either, and saying "not ported" would name a
             // gap that does not exist -- the CLI reads text -- while hiding
             // the one that does: there is no endpoint to land on.
             eprintln!(
@@ -274,7 +274,7 @@ pub fn serve(
         crate::status::print_tokenizer(encoder.vocab_size());
     }
     if let Some(transcriber) = speech {
-        // The speech family's own line, and its own word: the C++'s server
+        // The speech family's own line, and its own word: the reference's server
         // says "ids" here and the embed server says "tokens", because a
         // Whisper's vocabulary is a BPE's entries and a BERT's is a word
         // piece's.
@@ -315,7 +315,7 @@ pub fn serve(
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
-        // The stop path: the C++'s handler sets a flag, the accept loop
+        // The stop path: the reference's handler sets a flag, the accept loop
         // notices it, and the message goes to stderr on the way out.
         let mut terminate =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -455,7 +455,7 @@ fn build_state(
 
     // The model id: the container's stem, and -- for the TEXT family only
     // -- where the compute happened. The other families' ids are the bare
-    // stem, because that is what the C++'s servers use for them.
+    // stem, because that is what the reference's servers use for them.
     let host_only = container.config_str("gemm_layout").unwrap_or("host") == "host";
     state.model_id = match family {
         npum_families::Family::Embed => format!(

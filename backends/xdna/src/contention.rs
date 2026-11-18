@@ -82,7 +82,7 @@ pub struct ContentionReport {
 pub struct ContextBudget {
     /// How many concurrent contexts the device allows; 0 when unknown.
     pub limit: usize,
-    /// Where the number came from, in the C++'s words.
+    /// Where the number came from, in the reference's words.
     pub source: String,
 }
 
@@ -106,7 +106,7 @@ pub fn context_budget() -> ContextBudget {
         return ContextBudget {
             limit: 6,
             // The WORDS are the oracle's: this line is printed before a run
-            // and compared byte for byte against the C++ runtime's.
+            // and compared byte for byte against the reference runtime's.
             source: "measured on NPU1 (six concurrent hw_contexts; XRT exposes no \
                      usable-count query)"
                 .to_string(),

@@ -17,7 +17,7 @@ authors.workspace = true
 #
 # The cdylib exists because the plan's open decision #1 was answered: the
 # format has ONE writer, and it is this crate. A Python writer would leave two
-# writers of one binary layout, which is the exact failure mode the C++ mirror
+# writers of one binary layout, which is the exact failure mode the reference mirror
 # of tools/pack/pack_npue.py was: correctly-sized weights in the wrong order,
 # which no size check catches.
 crate-type = ["rlib", "cdylib"]

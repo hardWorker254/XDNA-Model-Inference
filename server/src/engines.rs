@@ -13,7 +13,7 @@
 /// tokens into another request's cache would answer with the other
 /// request's words.
 ///
-/// The work is the CPU backend's and the numbers are the C++'s numbers: the
+/// The work is the CPU backend's and the numbers are the reference's numbers: the
 /// same container through the same arithmetic gives the same bytes.
 pub struct Transcriber {
     encoder: npum_cpu::whisper::Encoder,
@@ -308,7 +308,7 @@ enum EmbedModel {
 /// The embedding endpoint's engine.
 ///
 /// The tokenizer and the model, and the sequence length they run at.
-/// By default the arithmetic is the host's (CPU backend bytes, the C++
+/// By default the arithmetic is the host's (CPU backend bytes, the reference
 /// reference). When Vulkan ops are selected, the chosen operations run on
 /// the GPU through the same `Ops` seam.
 #[derive(Clone)]

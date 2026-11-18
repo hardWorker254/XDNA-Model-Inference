@@ -2,19 +2,19 @@
 //!
 //! # The bodies are 1:1, and they are built as STRINGS
 //!
-//! The C++'s server builds its bodies by hand, and the bytes it produces
+//! The reference's server builds its bodies by hand, and the bytes it produces
 //! are the contract: `{"id": 0, "name": "tench, Tinca tinca"}` has a space
 //! after every colon, and a serialiser would not produce that. So the
-//! bodies here are built by hand too, and the JSON-escaping is the C++'s:
+//! bodies here are built by hand too, and the JSON-escaping is the reference's:
 //! `"`, `\\`, the three control characters, and `\\uXXXX` for the rest of
 //! the control range.
 //!
 //! # What is NOT copied
 //!
-//! The C++'s server hardcodes `"backend":"amd-xdna2-npu"` in all four of its
+//! The reference's server hardcodes `"backend":"amd-xdna2-npu"` in all four of its
 //! backends, on a machine whose own status block says `device npu1`. This
 //! one reports the device it found -- `amd-xdna1-npu` here -- and the model
-//! id says `-cpu` when the compute happened on the host, because the C++'s
+//! id says `-cpu` when the compute happened on the host, because the reference's
 //! own convention (in its Gemma path) says exactly that: "the model id is
 //! what a client sees, and naming a host-only server after the array is
 //! exactly the silent mislabel". Both are declared divergences, and both
@@ -101,7 +101,7 @@ pub fn router(state: ServerState) -> Router {
         .with_state(state)
 }
 
-/// A JSON answer, as the C++'s server sends it.
+/// A JSON answer, as the reference's server sends it.
 fn json(status: StatusCode, body: String) -> Response {
     (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
@@ -117,7 +117,7 @@ fn not_found(state: &ServerState, path: &str) -> Response {
     )
 }
 
-/// The C++'s JSON escaping.
+/// The reference's JSON escaping.
 ///
 /// `"`, `\\`, the three named control characters, and `\\uXXXX` for the
 /// rest of the control range. Everything else is passed through.
@@ -139,7 +139,7 @@ pub fn json_escape(text: &str) -> String {
 
 /// `%.7g`: seven significant digits, C's rules.
 ///
-/// The C++'s HTTP endpoint prints its vectors with `%.7g`, and the golden
+/// The reference's HTTP endpoint prints its vectors with `%.7g`, and the golden
 /// holds those bytes. A Rust `{}` would print the shortest round-trip
 /// representation, which is a different number of digits and a different
 /// string -- and the golden is the contract.
@@ -329,7 +329,7 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
 ///
 /// # THE ORDER OF THE REFUSALS
 ///
-/// The C++'s order: the media type, then the multipart parse, then the
+/// The reference's order: the media type, then the multipart parse, then the
 /// image part, then the `top_k`. A client that sent a JSON body gets the
 /// media type's refusal and not a complaint about a missing 'image' part.
 async fn classify(
@@ -720,7 +720,7 @@ async fn pose(
 ///
 /// # THE ORDER OF THE REFUSALS
 ///
-/// The C++'s order, because the order is a contract too: the media type
+/// The reference's order, because the order is a contract too: the media type
 /// first (a body that is not multipart is not this endpoint's request at
 /// all), then the multipart parse, then the POLICY -- the model, the
 /// temperature, the prompt, the timings -- and only then the audio. A
@@ -987,7 +987,7 @@ pub fn transcript_json(t: &npum_cpu::whisper_session::Transcript, verbose: bool)
     out
 }
 
-/// An error body, in the C++'s shape.
+/// An error body, in the reference's shape.
 fn error_body(message: &str, kind: &str) -> String {
     format!(
         "{{\"error\":{{\"message\":\"{}\",\"type\":\"{kind}\"}}}}",
@@ -997,7 +997,7 @@ fn error_body(message: &str, kind: &str) -> String {
 
 /// The base64 of a vector's bytes.
 ///
-/// The C++'s own alphabet, with the padding, and no line breaks: the
+/// The reference's own alphabet, with the padding, and no line breaks: the
 /// endpoint's `encoding_format: "base64"` carries the float32 BYTES, and
 /// that is the only way a client can get the exact numbers.
 pub fn base64(bytes: &[u8]) -> String {

@@ -71,7 +71,7 @@ def section_spellings():
         bad += fail("runtime/src/design.cpp no longer spells kDesignPrefix and "
                     "kDesignRole as literals, so this gate cannot compare them. "
                     "That is either a rename this file must follow or a change "
-                    "that removed the C++ side's copy.")
+                    "that removed the reference side's copy.")
     else:
         if m1.group(1) != py_prefix:
             bad += fail(f"the design prefix differs: npue.py says {py_prefix!r}, "

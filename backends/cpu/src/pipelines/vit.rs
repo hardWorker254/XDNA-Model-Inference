@@ -77,7 +77,7 @@ impl Geometry {
     /// Read the geometry out of a container.
     ///
     /// Every key is REQUIRED except the ones with a measured default: a
-    /// container that does not carry the geometry is refused by the C++'s
+    /// container that does not carry the geometry is refused by the reference's
     /// reader, and a default here would be a classifier that answers about
     /// a model nobody chose.
     pub fn read(container: &Container, path: &Path) -> Option<Geometry> {
@@ -370,7 +370,7 @@ impl Vit {
     ///
     /// One `d x num_labels` matvec on the host. The labels are the FAST
     /// axis of the weight, and the accumulation is in DOUBLE -- the same
-    /// arithmetic as the C++'s `head_matvec`.
+    /// arithmetic as the reference's `head_matvec`.
     pub fn classify(&self, cls_row: &[f32]) -> Vec<f32> {
         let g = &self.geometry;
         let d = g.hidden as usize;
@@ -436,7 +436,7 @@ pub fn predict(logits: &[f32], labels: &[String]) -> Result<Prediction, String> 
 
 /// The prediction, as the JSON object.
 ///
-/// The C++'s shape, in the C++'s order: the image, the label, its name,
+/// The reference's shape, in the reference's order: the image, the label, its name,
 /// the probability, the runners-up (when more than one was asked for),
 /// the three timings and the two dispatch counts.
 ///
@@ -506,7 +506,7 @@ pub fn prediction_json(
     out
 }
 
-/// The JSON escaping the C++'s server uses.
+/// The JSON escaping the reference's server uses.
 ///
 /// `"`, `\\`, the three named control characters, and `\\uXXXX` for the rest
 /// of the control range.

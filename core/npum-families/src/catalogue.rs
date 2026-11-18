@@ -18,7 +18,7 @@
 //! stays in the tree so that the data is reviewable as data, and the table
 //! ships so that the answer costs no parsing.
 //!
-//! The table was extracted from the C++ runtime's own catalogue when the
+//! The table was extracted from the reference runtime's own catalogue when the
 //! runtime moved, and the extraction was checked row for row against the
 //! oracle's `list` output and against its refusal for an unknown model.
 //!
@@ -68,7 +68,7 @@ include!("catalogue_data.rs");
 
 /// The catalogue, in its own order.
 ///
-/// The order is the order the C++ runtime's table had, and it is the order
+/// The order is the order the reference runtime's table had, and it is the order
 /// a reader sees in `list` and in the refusal for an unknown model. It is
 /// NOT alphabetical: it groups the embedders, then the speech models, then
 /// the classifier, which is the order a reader who is looking for "the

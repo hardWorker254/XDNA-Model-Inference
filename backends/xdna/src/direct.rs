@@ -2,9 +2,9 @@
 //!
 //! # What this buys
 //!
-//! The XRT transport needs a C++ shim, a C++ toolchain at build time, and --
+//! The XRT transport needs a reference shim, a reference toolchain at build time, and --
 //! this is the part that shaped the whole project -- a Python installation:
-//! XRT ships its Python bindings in `/opt/xilinx/xrt/python`, and the C++
+//! XRT ships its Python bindings in `/opt/xilinx/xrt/python`, and the reference
 //! runtime found the device through them. A runtime that cannot start without
 //! Python is a runtime that has a Python dependency, and this project is
 //! trying to have none.
@@ -137,7 +137,7 @@ const BO_TYPE_CMD: u32 = 4;
 ///
 /// The heap is the pool the driver's own allocations come from -- the
 /// command buffers the context keeps, and the device memory the user asks
-/// for. Sixty-four megabytes is what the C++ runtime's transport used, and
+/// for. Sixty-four megabytes is what the reference runtime's transport used, and
 /// it is more than the array path needs.
 const DEVICE_HEAP_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -161,7 +161,7 @@ const ERT_CU: u32 = 3;
 ///
 /// The AIE2 compute unit takes an opcode as the first word of its register
 /// map, and 3 is the one that starts the DPU. XRT's caller passes the same
-/// number, and the C++ runtime went through XRT, so this is the number the
+/// number, and the reference runtime went through XRT, so this is the number the
 /// board has always been given.
 const CU_OPCODE_RUN: u64 = 3;
 
@@ -1362,7 +1362,7 @@ fn errno_text(errno: i32) -> String {
 /// Read the generation from the device.
 ///
 /// The driver answers `GET_INFO` with the AIE's version: the AIE1 family
-/// is XDNA1, and the AIE2P family is XDNA2. The C++ runtime could not ask
+/// is XDNA1, and the AIE2P family is XDNA2. The reference runtime could not ask
 /// -- it read the environment -- which is why this is here.
 ///
 /// The npu2's number is not verifiable on an npu1: what the board says is

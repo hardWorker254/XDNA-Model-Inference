@@ -58,7 +58,7 @@
 # similarity bound is the one that means something. max|d| is still printed,
 # because a change in its SHAPE localises a bug that 1-cos hides.
 #
-# Env: numpy, torch, transformers, ffmpeg, a C++ toolchain and XRT. The binary
+# Env: numpy, torch, transformers, ffmpeg, a reference toolchain and XRT. The binary
 # is built if --exe is not given.
 #
 # Usage:
@@ -154,7 +154,7 @@ def build_exe(path: Path) -> Path | None:
     cmd += ["-L", str(xrt / "lib"), "-lxrt_coreutil", "-o", str(path)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("building the C++ stacks failed:\n" + r.stderr)
+        print("building the reference stacks failed:\n" + r.stderr)
         return None
     return path
 
@@ -259,9 +259,9 @@ def suppress(logits, gen, first):
     """transformers' two suppression processors, on the reference side.
 
     `suppress_tokens` at every step, `begin_suppress_tokens` at the first
-    generated step only. The C++ side applies the same two lists (the packer
+    generated step only. The reference side applies the same two lists (the packer
     carries them out of generation_config.json), so the reference has to apply
-    them too -- comparing the C++'s post-policy logits with transformers' RAW
+    them too -- comparing the reference's post-policy logits with transformers' RAW
     logits would report a 1.0 difference on a stack that is correct, and would
     hide a real one behind it.
     """
@@ -363,7 +363,7 @@ def classify_divergence(exe, npue, art, wav, prompt, got_g, gen_ids,
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Hold the C++ Whisper NPU stacks against transformers.")
+        description="Hold the reference Whisper NPU stacks against transformers.")
     ap.add_argument("--npue", default=str(REPO / "models" / "whisper-tiny.npue"))
     # runtime/artifacts/<model>/artifacts_npu<N>, where every model's sets live.
     # The default used to be runtime/<model>/artifacts_npu<N>, the
@@ -563,7 +563,7 @@ def main() -> int:
                       greedy=prompt, max_new=args.greedy_steps,
                       conv=conv_default)
         if got["rc"] != 0:
-            print(f"  FAIL {name}: the C++ side refused\n{got['err'].strip()}")
+            print(f"  FAIL {name}: the reference side refused\n{got['err'].strip()}")
             bad += 1
             continue
         samples, _ = read_wav_python(p)
@@ -603,7 +603,7 @@ def main() -> int:
         for i, w in enumerate(want_steps):
             g = got["steps"].get(i)
             if g is None:
-                print(f"       FAIL step {i}: the C++ side printed nothing")
+                print(f"       FAIL step {i}: the reference side printed nothing")
                 bad += 1
                 continue
             d_h = one_minus_cos(g["hidden"], w["hidden"])

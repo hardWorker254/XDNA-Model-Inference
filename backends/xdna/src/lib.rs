@@ -2,13 +2,13 @@
 //!
 //! # Two transports, one API
 //!
-//! * **`xrt`** (feature `xrt`, the default): a small C shim over XRT's C++
+//! * **`xrt`** (feature `xrt`, the default): a small C shim over XRT's reference
 //!   API, compiled by `build.rs`. This is what the project has always used.
 //!
 //! * **`direct`** (feature `direct`): ioctls of the `amdxdna` driver on
-//!   `/dev/accel/accel0`. No XRT, no C++ at all, and -- the part that
+//!   `/dev/accel/accel0`. No XRT, no reference at all, and -- the part that
 //!   matters for a runtime that is being rewritten in Rust -- no Python.
-//!   The C++ runtime needed `PYTHONPATH=/opt/xilinx/xrt/python`, which meant
+//!   The reference runtime needed `PYTHONPATH=/opt/xilinx/xrt/python`, which meant
 //!   the runtime required Python to run. That is not a fact about the
 //!   hardware; it is a fact about XRT's packaging, and this backend does not
 //!   have to inherit it.

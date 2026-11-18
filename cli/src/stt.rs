@@ -155,7 +155,7 @@ pub fn read_design(dir: &Path, decoder: bool) -> Option<Design> {
 
 /// Which `--npu-ops` code a stream belongs to.
 ///
-/// The same mapping the C++'s `code_for_stream` makes: the attention's two
+/// The same mapping the reference's `code_for_stream` makes: the attention's two
 /// streams are one code, the mel bank's one, the transform's one, and
 /// everything else is a GEMM.
 fn code_for_stream(op: &str) -> &'static str {
@@ -176,7 +176,7 @@ fn code_for_stream(op: &str) -> &'static str {
 
 /// The block, printed to the stderr.
 ///
-/// The rows are the C++'s, in the C++'s order, with the C++'s widths: a
+/// The rows are the reference's, in the reference's order, with the reference's widths: a
 /// row is a name, a place and a reason, and the reason is what makes the
 /// row worth reading.
 pub fn print_block(
@@ -302,7 +302,7 @@ pub fn print_schedule(
     options: &npum_cpu::whisper_session::Options,
     language_given: bool,
 ) {
-    // The wording is the C++'s, and the C++'s line names what the C++'s
+    // The wording is the reference's, and the reference's line names what the reference's
     // setup did: it opened the device, loaded two design sets and staged the
     // weights on it. This runtime reads the design sets and the weights and
     // runs the arithmetic on the host, so the numbers are the host's.
@@ -358,7 +358,7 @@ pub fn check_context_budget(args: &crate::flags::Args) -> bool {
 
 /// The options one request runs with, from the command line.
 ///
-/// The defaults are the C++'s: English, transcribe, 30 s windows with a 5 s
+/// The defaults are the reference's: English, transcribe, 30 s windows with a 5 s
 /// stride on each side.
 pub fn options_from(args: &crate::flags::Args) -> npum_cpu::whisper_session::Options {
     let default = npum_cpu::whisper_session::Options::default();
@@ -405,7 +405,7 @@ pub fn find_designs(root: &Path, model_name: &str) -> Option<PathBuf> {
 
 /// Transcribe one file, and print the answers.
 ///
-/// The order of the stderr is the C++'s: the context budget BEFORE
+/// The order of the stderr is the reference's: the context budget BEFORE
 /// anything is built, the block before the work, and the chunks and the
 /// time after it.
 pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> i32 {

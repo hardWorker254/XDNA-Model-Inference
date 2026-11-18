@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# NpuEmbeddings -- hold the C++ image front end against PIL.
+# NpuEmbeddings -- hold the reference image front end against PIL.
 # SPDX-License-Identifier: Apache-2.0
 #
 # WHAT IS BEING CHECKED, AND AGAINST WHAT
@@ -34,7 +34,7 @@
 #            a mean would hide both a systematic half-LSB bias and a handful of
 #            badly wrong pixels.
 #   pixels   (x/255 - mean)/std per channel, against the same expression on
-#            numpy. Gated at 0 ULP, which is why the C++ divides by 255 instead
+#            numpy. Gated at 0 ULP, which is why the reference divides by 255 instead
 #            of multiplying by its reciprocal.
 #   patches  the im2col, against tools/lib/vit_int8.im2col_patches -- the Python
 #            half of the pair that verify_vit.py section 1 holds against HF's
@@ -65,7 +65,7 @@
 # wrong" and "the last bit of the accumulator is different" are different bugs
 # and only one of them has a large max.
 #
-# Env: numpy, pillow, a C++ toolchain with libpng and libjpeg headers. No NPU,
+# Env: numpy, pillow, a reference toolchain with libpng and libjpeg headers. No NPU,
 # no XRT. The probe needs a packed container for its geometry.
 #
 # Usage:
@@ -147,7 +147,7 @@ def build_exe(path):
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("building the C++ image front end failed:\n" + r.stderr[-3000:])
+        print("building the reference image front end failed:\n" + r.stderr[-3000:])
         return None
     return path
 
@@ -435,7 +435,7 @@ def check_pixels_and_patches(exe, npue, corpus, image_size, patch, mean, std,
             report(False, f"{case}: front end", f"-> refused: {got['refused'][:120]}")
             continue
 
-        # normalise: the same expression, from the C++ side's OWN resized raster,
+        # normalise: the same expression, from the reference side's OWN resized raster,
         # so this cannot inherit the resize's last bit and blame it here.
         mine = got["resize"].astype(np.float32) / np.float32(255.0)
         m = np.asarray(mean, np.float32).reshape(3, 1, 1)
@@ -522,7 +522,7 @@ def check_refusals(exe, npue, corpus, image_size, tmp):
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Hold the C++ image front end against PIL.")
+        description="Hold the reference image front end against PIL.")
     ap.add_argument("--npue", default=str(REPO / "models" /
                                           "vit-base-patch16-224.npue"),
                     help="a packed arch=5 container, for its geometry")
@@ -542,7 +542,7 @@ def main() -> int:
     ap.add_argument("--keep-images", action="store_true")
     args = ap.parse_args()
 
-    print("image front end: C++ against PIL, on the same bytes\n")
+    print("image front end: reference against PIL, on the same bytes\n")
     npue = Path(args.npue)
     if not npue.exists():
         print(f"FAIL -- {npue} does not exist. Pack one with\n"

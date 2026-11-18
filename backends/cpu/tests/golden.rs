@@ -2,12 +2,12 @@
 //!
 //! # What this test is
 //!
-//! The golden transcripts in `tools/parity/golden` were recorded from the C++
+//! The golden transcripts in `tools/parity/golden` were recorded from the reference
 //! binaries. This test runs the same container through the Rust's CPU backend
 //! and compares the vector against the golden's, element by element.
 //!
 //! The comparison is on SEVEN SIGNIFICANT DIGITS, because that is what the
-//! golden holds: the C++'s HTTP endpoint prints `%.7g`. Seven digits is not
+//! golden holds: the reference's HTTP endpoint prints `%.7g`. Seven digits is not
 //! bit-exactness, and the difference matters -- see below.
 //!
 //! # What it is NOT
@@ -17,7 +17,7 @@
 //!
 //! * the AVX2 path against the AVX-512 path, on the same input, comparing
 //!   bytes -- in `kernels.rs`'s own tests, where both paths exist;
-//! * the C++'s own `encoding_format: "base64"`, which carries the float32
+//! * the reference's own `encoding_format: "base64"`, which carries the float32
 //!   BYTES rather than a decimal rendering of them.
 //!
 //! A seven-digit comparison catches a wrong arithmetic -- a missing FMA, a
@@ -59,7 +59,7 @@ fn golden_vector() -> Option<Vec<f64>> {
 /// The sequence length the oracle's design set was built for.
 ///
 /// It is 64, and it is the DESIGN's number and not the container's: the
-/// container's `max_seq_len` is 256, and the C++ runtime truncates and
+/// container's `max_seq_len` is 256, and the reference runtime truncates and
 /// refuses at the design's width.
 const SEQ: usize = 64;
 

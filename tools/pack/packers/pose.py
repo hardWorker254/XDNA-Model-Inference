@@ -76,7 +76,7 @@ from onnx import numpy_helper
 from tools.lib import conv_quant                                        # noqa: E402
 from tools.lib.npue import ARCH_YOLOV8_POSE_C2F_SILU_DFL, Writer  # noqa: E402
 
-# Kept as literals and compared against the C++ header by
+# Kept as literals and compared against the reference header by
 # tools/verify/verify_pose_geometry.py, because the two must agree and a test
 # that reads both is the only thing that can say they do.
 ARCH_STRING = "yolov8_pose_c2f_silu_dfl"
@@ -979,7 +979,7 @@ def emit_ops(t):
        belong to" has no answer that does not involve guessing.
 
     2. CHANNEL SPLITS BECOME SLICES. One slice node per half; see the note in
-       emit_ops' Split branch and in the C++ header.
+       emit_ops' Split branch and in the reference header.
 
     3. THE OPERAND IS AN INDEX INTO THE EMITTED LIST, not an ONNX tensor name.
        Node 0's operand is -1, which is the image. Both ends of that convention
@@ -1431,7 +1431,7 @@ def npu_panels(t, conv_of, weights, device):
         #
         # The failure is silent in every direction that exists. tile_b accepts it
         # (the padded shape tiles), the layout_hash matches (both sides derive it
-        # from the same constants, and it does not describe the DATA), the C++
+        # from the same constants, and it does not describe the DATA), the reference
         # reader hands the bytes to the device unchanged, and the array multiplies
         # a transposed weight -- so `--npu-ops conv` returns a network that
         # finds 300 people in a photograph with three, with the stem convolution
@@ -1501,7 +1501,7 @@ def pack_pose(onnx_path, out_path, device=None, npu=False, dry_run=False,
     The runtime reads the two triples and normalises by them, so writing them is
     what makes the front end a property of the CONTAINER rather than of this
     file -- a later packer with a different front end changes two numbers here
-    instead of a function in C++.
+    instead of a function in the reference implementation.
     """
     model = onnx.load(str(onnx_path))
     t = trace(model)

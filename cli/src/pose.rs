@@ -1,6 +1,6 @@
 //! The pose family's status block, its summary and its node dump.
 //!
-//! # The block is the C++'s, row for row
+//! # The block is the reference's, row for row
 //!
 //! `npuimage pose` printed a block before every run, and the golden
 //! transcripts hold it, so the block is a contract and not a greeting. Every
@@ -19,7 +19,7 @@
 //!   runtime cannot measure torch. It is quoted as the constant it is, and
 //!   the ratio next to it is this run's network time over that constant.
 //!
-//! # The dump is the C++'s format, byte for byte
+//! # The dump is the reference's format, byte for byte
 //!
 //! 64 KiB of header, then every node's fp32 NCHW in graph order, with the
 //! header rewritten once the node count is known. `tools/verify/diff_pose_dump.py`
@@ -375,7 +375,7 @@ fn edge_pair(edge: &str) -> Option<(usize, usize)> {
     Some((a, b))
 }
 
-/// Write the node dump, in the C++'s format.
+/// Write the node dump, in the reference's format.
 ///
 /// The header area is reserved and rewritten at the end: the tensors are
 /// transient, so the writer sees each one once and cannot go back to count

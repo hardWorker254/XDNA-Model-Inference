@@ -710,7 +710,7 @@ class OnnxWeights:
             flat = np.array(vals, dtype=d)
         else:
             # Native layout, and here the byte length is checkable against the
-            # shape. C++ refuses all of these too (onnx_read.cpp's
+            # shape. reference refuses all of these too (onnx_read.cpp's
             # LocKind::kInline); the two halves must agree on what a malformed
             # file is, or a checkpoint the runtime refuses becomes one the
             # packer accepts.

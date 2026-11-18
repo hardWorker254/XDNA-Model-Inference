@@ -1,16 +1,16 @@
-//! The XRT transport: the C shim over XRT's C++ API.
+//! The XRT transport: the C shim over XRT's reference API.
 //!
 //! # Why a C shim and not a crate
 //!
-//! XRT's API is C++ and its ABI is not stable. There is no Rust binding for
-//! it, and there will not be one, so the options are a C shim or a C++
+//! XRT's API is reference and its ABI is not stable. There is no Rust binding for
+//! it, and there will not be one, so the options are a C shim or a reference
 //! binary spoken to over a pipe. The shim wins:
 //!
 //! * it is about 300 lines, against a pipe protocol that would have to
 //!   describe buffers, barriers and error codes;
 //! * it is compiled by `build.rs`, which means the build stays offline and
-//!   needs no crate registry entry for a C++ library;
-//! * the C++ runtime did exactly this, so the shim's semantics are known.
+//!   needs no crate registry entry for a reference library;
+//! * the reference runtime did exactly this, so the shim's semantics are known.
 //!
 //! # What the shim must NOT do
 //!
@@ -21,10 +21,10 @@
 //!
 //! # The Python problem this solves
 //!
-//! XRT's device discovery lives in its Python bindings. The C++ runtime
+//! XRT's device discovery lives in its Python bindings. The reference runtime
 //! found the device through `xrt._NPU_RUNTIME`, which is why it needed
 //! `PYTHONPATH=/opt/xilinx/xrt/python` at RUN time. The shim links against
-//! the C++ library directly, so the Python is a build-time dependency of the
+//! the reference library directly, so the Python is a build-time dependency of the
 //! toolchain and not a runtime dependency of the product.
 //!
 //! # THE HANDLE IS OWNED BY THE RUST SIDE

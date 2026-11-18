@@ -42,7 +42,7 @@ tracing-subscriber.workspace = true
 #
 # The XRT transport is the default: it is what this project has always
 # used, and what a machine with XRT installed has. The direct transport is
-# the `amdxdna` driver's ioctls -- no XRT, no C++, and no Python -- and a
+# the `amdxdna` driver's ioctls -- no XRT, no reference, and no Python -- and a
 # build with both speaks the direct one.
 default = ["xrt"]
 xrt = ["npum-xdna/xrt"]

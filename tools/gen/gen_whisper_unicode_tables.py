@@ -1,4 +1,4 @@
-# NpuEmbeddings -- generate the Unicode tables the C++ Whisper tokenizer needs.
+# NpuEmbeddings -- generate the Unicode tables the reference Whisper tokenizer needs.
 # SPDX-License-Identifier: Apache-2.0
 #
 # WHY THIS EXISTS
@@ -35,7 +35,7 @@
 #
 # is_space is str.isspace() and NOT a hand-written set, because that is what the
 # `regex` module's Unicode \s resolves to (verified by
-# tools/verify/verify_whisper_tokenizer.py, which holds the C++ against the reference
+# tools/verify/verify_whisper_tokenizer.py, which holds the reference against the reference
 # over a corpus that includes \x85, \xa0 and U+3000).
 #
 # Env: any Python 3 (no NPU, no torch, no `regex`).

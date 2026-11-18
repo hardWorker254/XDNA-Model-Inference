@@ -23,7 +23,7 @@ without it is a mystery file.
 THE TWO DIRECTIONS
 -------------------
 
-`record` runs the ORACLE -- the C++ binaries -- and writes the goldens.
+`record` runs the baseline/reference binaries and writes the goldens.
 `compare` runs the CANDIDATE -- the Rust binaries -- and diffs.
 
 They are the same machinery with a different binary directory, and that is
@@ -153,7 +153,7 @@ def register_paths() -> None:
     * the fixtures -- the same files on both sides, at different absolute
       paths;
     * the candidate's repository -- where the Rust binary lives;
-    * the oracle's repository -- where the C++ binary lives;
+    * the reference repository -- where the baseline binary lives;
     * the fixture root -- the `--root` both sides are given.
 
     The oracle's tree and the candidate's tree both become `<ROOT>`,
@@ -184,7 +184,7 @@ def has_design_set(root: Path, model: str) -> bool:
     A design set is a directory holding a `design.json` AND the compiled
     program beside it: an `xclbin` and the instruction binaries. The
     `design.json` alone would be enough to fool a reader that only checks
-    for the file's existence, and the C++ runtime's own `has_design` checks
+    for the file's existence, and the reference baseline's own checks may only
     only for the file -- which is how a directory with a design.json and no
     program passes the first gate and fails at the second one.
 
@@ -215,7 +215,7 @@ def has_design_set(root: Path, model: str) -> bool:
 def missing_designs(case: case_table.Case, root: Path) -> list[str]:
     """The models whose path needs a design set the root does not hold.
 
-    The C++ runtime asks for a design set before it runs the embedding, the
+    The reference baseline asks for a design set before it runs the embedding, the
     classification and the transcription paths, and it asks even for a
     container whose operands are row-major host-side values and whose every
     operation would run on the CPU. The check is unconditional.
@@ -238,7 +238,7 @@ def divergences() -> dict[str, str]:
     The format is one case id and its reason per line, separated by a
     colon:
 
-        sub/embed: the C++ runtime needs a compiled design set; the Rust
+        sub/embed: the reference baseline needs a compiled design set; this
                    runtime runs a host-layout container on the CPU.
 
     A reason that is not there is a reason that does not exist.
@@ -313,7 +313,7 @@ def network_allowed() -> bool:
     reproduced. The cases that need it are tagged `network` and are
     skipped unless `NPUE_PARITY_NETWORK=1` is set.
 
-    The reason is not only reproducibility: the C++ runtime's `add` path
+    The reason is not only reproducibility: the reference baseline's `add` path
     fetches over libcurl and, on this machine, it ABORTS inside glibc
     ("invalid stdio handle") rather than returning an error. A case that
     crashes its own oracle is not a case that can pin a behaviour.
@@ -500,7 +500,7 @@ def run_case(bin_dir: Path, case: case_table.Case, root: Path) -> Transcript:
         return Transcript(
             case=case,
             skipped=(
-                f"the C++ runtime needs a COMPILED design set for this path, "
+                f"the reference baseline needs a COMPILED design set for this path, "
                 f"and there is none for {', '.join(without_design)}: a design "
                 f"set is the output of MLIR-AIE, not a download"
             ),
@@ -634,7 +634,7 @@ def compare_case(bin_dir: Path, case: case_table.Case, root: Path) -> Comparison
                 ok=False,
                 skipped=True,
                 detail=(
-                    f"the C++ runtime needs a COMPILED design set for this path, "
+                    f"the reference baseline needs a COMPILED design set for this path, "
                     f"and there is none for {', '.join(without_design)}: a design "
                     f"set is the output of MLIR-AIE, not a download"
                 ),

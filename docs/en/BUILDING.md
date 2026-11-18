@@ -1,6 +1,6 @@
 # Building (Rust tree)
 
-This document describes how to build and validate the Rust runtime in this worktree.
+This document describes how to build and validate the runtime in this repository.
 
 ## Supported scenarios
 
@@ -46,14 +46,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Formatting/lint baselines are being tightened; run them for changes you touch and fix regressions introduced by your edits. Prefer not to reformat unrelated files in the same change unless you are intentionally normalizing the tree.
+Formatting/lint baselines may evolve; run checks for the code you touch and fix regressions introduced by your edits. Prefer not to reformat unrelated files in the same change unless you are intentionally normalizing the tree.
 
 ## Validation
 
 - **Rust tests:** `cargo test --workspace` (or `--release` as appropriate).
-- **Parity with C++ oracle:** `python3 tools/parity/run.py compare --candidate ./target/release` (requires recorded goldens and installed models/fixtures for non-skipped cases). See [PARITY.md](PARITY.md).
+- **Parity checks:** `python3 tools/parity/run.py compare --candidate ./target/release` (requires recorded goldens and installed models/fixtures for non-skipped cases). See [PARITY.md](PARITY.md).
 - **No-XRT gate:** `python3 tools/verify/verify_no_xrt.py` (when the script and relevant build context are available).
-
-## Repositories / worktree
-
-This tree may be a `git worktree` of the oracle repository. Oracle binaries, plans, and some tools/docs may live in the sibling/oracle tree; use absolute paths to oracle artifacts when comparing.

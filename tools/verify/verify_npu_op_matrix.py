@@ -15,7 +15,7 @@
 #   2b. the model tables' cells agree with the architecture tables', except for
 #      the gated FFNs, which is the ONE difference the model table exists to
 #      record -- so a difference appearing there is a bug, not news;
-#   3. the runtime's C++ table (runtime/include/common/npu_ops_flag.hpp) carries
+#   3. the runtime's reference table (runtime/include/common/npu_ops_flag.hpp) carries
 #      the same nine codes with the same design directory and the same long
 #      name, in the same order. This is the duplication the two files' headers
 #      both apologise for; the apology is only worth anything if something checks
@@ -274,7 +274,7 @@ UNRUNNABLE: dict[str, str] = {
 # refusal, and `on_array` is therefore on the REFUSED side with everything else.
 ACCEPTS = (npu_ops.HONOURS,)
 
-# The C++ table's rows. `{...}` literals, three strings each, and the source
+# The reference table's rows. `{...}` literals, three strings each, and the source
 # comments contain braces too, so the pattern is deliberately narrow: three
 # double-quoted runs with no brace or quote inside.
 CPP_ROW = re.compile(r'\{"([a-z0-9]+)",\s*"([a-z0-9]*)",\s*"([^"]+)"\}')
@@ -466,7 +466,7 @@ def main() -> int:
         for line in rc.stdout.splitlines():
             print("  " + line)
 
-    # --- 3. the runtime's C++ table says the same thing ---------------------
+    # --- 3. the runtime's reference table says the same thing ---------------------
     cpp = cpp_table()
     mine = [(c, d, n) for c, (d, n) in npu_ops.OPS.items()]
     if cpp != mine:
@@ -562,7 +562,7 @@ def main() -> int:
     # against what the binary actually does -- printed
     #
     #     ran   no cells (nothing to run against)
-    #     PASS -- the registry, all four generated documents, the C++ table and
+    #     PASS -- the registry, all four generated documents, the reference table and
     #            the runtime all say the same thing about every cell that could be run
     #
     # "Every cell that COULD be run" was zero, and it read exactly like the
@@ -585,9 +585,9 @@ def main() -> int:
 
     if bad:
         print(f"FAIL -- {bad} disagreement(s) between the registry, the "
-              f"generated document, the C++ table and what the runtime does")
+              f"generated document, the reference table and what the runtime does")
         return 1
-    print(f"PASS -- the registry, all four generated documents, the C++ table and "
+    print(f"PASS -- the registry, all four generated documents, the reference table and "
           f"the runtime all say the same thing, and {ran} cell(s) were checked "
           f"against {NAME}" + (f"; {skipped} architecture row(s) were not"
                                    if skipped else ""))

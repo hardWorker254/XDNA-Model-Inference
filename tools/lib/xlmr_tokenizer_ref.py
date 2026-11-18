@@ -1,11 +1,11 @@
 # NpuEmbeddings -- pure-Python reference encoder for the XLM-R SentencePiece
-# Unigram tokenizer, reading the XLMRTOK1 blob that the C++ generator
+# Unigram tokenizer, reading the XLMRTOK1 blob that the reference generator
 # (runtime/src/tokenizers/xlmr_tokenizer_gen.cpp) writes.
 # SPDX-License-Identifier: Apache-2.0
 #
-# THIS FILE IS THE EXECUTABLE SPEC for the future C++ port (T52 step 2).
+# THIS FILE IS THE EXECUTABLE SPEC for the future reference implementation (T52 step 2).
 # It consumes the *blob*, not tokenizer.json, so it exercises the exact
-# bytes the C++ tokenizer will read, and tools/verify_tokenizer_xlmr.py
+# bytes the reference tokenizer will read, and tools/verify_tokenizer_xlmr.py
 # holds it byte-exact against HuggingFace over a multilingual adversarial
 # corpus. Every semantic choice below was confirmed against the live
 # `tokenizers` 0.22.2 backend, not inferred from documentation; where
@@ -36,7 +36,7 @@
 #      <unk> ids are fused into one (fuse_unk, confirmed live).
 #   5. Post-processor: <s> ids </s>.
 #
-# KNOWN LIMITATION (deliberate, shared with the future C++ port): the
+# KNOWN LIMITATION (deliberate, shared with the future reference implementation): the
 # added-tokens splitter is NOT implemented, so an input containing a
 # literal special-token string ("<s>", "<mask>", ...) will be tokenized
 # through the Unigram model instead of being extracted verbatim. The
@@ -44,7 +44,7 @@
 # embedding server inputs are plain text, never templated.
 #
 # Env: any Python 3, stdlib only (struct + unicodedata).
-# Usage (CLI, mirrors what the C++ CLI will do):
+# Usage (CLI, mirrors what the reference CLI will do):
 #   python tools\xlmr_tokenizer_ref.py <table.bin> <texts.txt>
 #     -- one text per line in, one space-separated id line out per text.
 

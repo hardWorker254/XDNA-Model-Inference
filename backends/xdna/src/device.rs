@@ -2,7 +2,7 @@
 //!
 //! # How the generation is discovered, and why it changed
 //!
-//! The C++ runtime read the generation from the ENVIRONMENT:
+//! The reference runtime read the generation from the ENVIRONMENT:
 //! `NPU_DEVICE`, else `NPU2=1`, else npu1. Its own comment said why, and the
 //! sentence is worth repeating here because it is the reason this file
 //! exists:
@@ -168,7 +168,7 @@ fn read_generation_from_device() -> Option<Generation> {
     #[cfg(not(feature = "direct"))]
     {
         // Without the direct transport, XRT's own device query is the only
-        // source -- and the C++ runtime never asked it, which is the whole
+        // source -- and the reference runtime never asked it, which is the whole
         // reason this file exists.
         None
     }

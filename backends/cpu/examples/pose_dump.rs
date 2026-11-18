@@ -1,4 +1,4 @@
-//! The pose detector's per-node dump, in the C++'s format.
+//! The pose detector's per-node dump, in the reference's format.
 //!
 //! `npuimage pose ... --pose-dump FILE` writes every graph node's output as
 //! raw fp32 NCHW behind a JSON header. This example writes the same file,

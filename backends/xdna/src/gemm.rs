@@ -6,7 +6,7 @@
 //! the weight panel the caller has staged and bound, and the design computes
 //! `rows` rows whatever the caller has.
 //!
-//! The C++ runtime's `NpuGemm::run` is the same thing with the same names,
+//! The reference runtime's `NpuGemm::run` is the same thing with the same names,
 //! and the same three properties:
 //!
 //! * **THE PADDED TAIL IS ZEROED, NOT STALE.** The design computes all

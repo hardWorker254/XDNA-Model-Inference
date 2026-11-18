@@ -25,7 +25,7 @@ rather than discovered later:
   ``PoseResult.pose_scores``. Anything that reads only ``pose_landmarks`` -- the
   drawing code, the counting code -- works unchanged.
 
-The numbers themselves are the C++ runtime's, not Python's: this module runs
+The numbers themselves are the reference runtime's, not Python's: this module runs
 ``npuimage pose`` (or POSTs to ``npuimage serve``, which answers
 ``/v1/pose`` for a pose container) and parses
 the JSON that ``npue::pose::result_json`` writes. There is no second
@@ -453,7 +453,7 @@ def _image_bytes(image: Any) -> tuple[bytes, str]:
 class _Server:
     """A ``npuimage serve`` child, started lazily and stopped on close().
 
-    A thread is not used and requests are not overlapped: the C++ server serves
+    A thread is not used and requests are not overlapped: the reference server serves
     one request at a time by design (one Session, one pool), so a client that
     issued concurrent requests would queue anyway. Saying so is better than
     exposing a knob that appears to work.

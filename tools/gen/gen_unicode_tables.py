@@ -32,9 +32,9 @@
 # which lowercases to the final form at the end of a word. That cannot live
 # in a per-codepoint table, so it is emitted as a constant.
 #
-# THIS REPLACES three C++ generators -- gen_tokenizer_tables.py,
+# THIS REPLACES three reference generators -- gen_tokenizer_tables.py,
 # gen_xlmr_unicode_tables.py and gen_whisper_unicode_tables.py -- and their
-# three baked-in headers, 6 034 lines of C++ that the runtime carried and
+# three baked-in headers, 6 034 lines of reference that the runtime carried and
 # the packer also carried, and that could therefore disagree.
 #
 # Env: any Python 3 (no NPU, no torch).

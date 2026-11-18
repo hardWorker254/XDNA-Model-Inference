@@ -3,7 +3,7 @@
 //!
 //! # TWO TRANSPORTS, ONE API
 //!
-//! The array can be reached two ways: through XRT's C++ library (`xrt`) or
+//! The array can be reached two ways: through XRT's reference library (`xrt`) or
 //! through the `amdxdna` driver's ioctls (`direct`). They are different
 //! transports to the same board, and everything above this file -- the
 //! designs, the packing, the op kernels, the families -- is written against
@@ -60,7 +60,7 @@ impl TransportError {
 /// difference is not cosmetic: the instruction stream is read by the device's
 /// instruction fetch and wants to be CACHED, while the data is written by the
 /// host and read by the device and wants to be HOST-VISIBLE with a device
-/// address of its own. The C++ runtime made the same distinction, with the
+/// address of its own. The reference runtime made the same distinction, with the
 /// same two modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferFlags {
@@ -129,7 +129,7 @@ pub trait Transport: Sized {
     /// The hardware context for one xclbin.
     ///
     /// The xclbin is handed over as BYTES: a design set that lives inside a
-    /// container has no file to point at, and the C++ runtime solved the same
+    /// container has no file to point at, and the reference runtime solved the same
     /// problem by handing the blob to XRT.
     fn open_context(&mut self, xclbin: &[u8]) -> Result<(), TransportError>;
 

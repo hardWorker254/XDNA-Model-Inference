@@ -181,9 +181,9 @@ pub trait ArrayEltwise {
     /// A separate method and not the family's `softmax`, because the
     /// dispatch count means ONE thing: the number of times the FAMILY
     /// asked the array to do something. The attention's own softmax is the
-    /// attention's business -- the C++'s encoder counts the attention's
+    /// attention's business -- the reference's encoder counts the attention's
     /// two GEMMs and not the softmax between them -- and counting it here
-    /// would make this runtime's number disagree with the C++'s on a run
+    /// would make this runtime's number disagree with the reference's on a run
     /// that did exactly the same work.
     ///
     /// The default forwards to `softmax`, and an implementation that has

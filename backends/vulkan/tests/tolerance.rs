@@ -10,7 +10,7 @@
 //! # Why every row width here is a multiple of eight
 //!
 //! `npum_cpu::kernels::softmax_row` and `layernorm_row` read eight lanes at a
-//! time and REFUSE a row that is not a multiple of eight (the C++ did the
+//! time and REFUSE a row that is not a multiple of eight (the reference did the
 //! same). The GPU has no such constraint, but the gate compares against the
 //! host, so the cases are shaped so the host will answer.
 //!
