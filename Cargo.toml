@@ -40,7 +40,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/Brishen/npu-embeddings"
+repository = "https://github.com/hardWorker254/XDNA-Model-Inference.git"
 authors = ["NpuEmbeddings contributors"]
 
 [workspace.dependencies]

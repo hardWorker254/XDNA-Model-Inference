@@ -71,6 +71,7 @@
 //! detector whose probability map is off by a quantization step.
 
 use crate::kernels;
+use crate::parallel;
 use npum_format::Container;
 use npum_model::array::{ArrayRef, ConvSpec};
 use serde_json::Value;
@@ -1696,6 +1697,39 @@ fn shape_str(shape: &[i64]) -> String {
     )
 }
 
+/// The convolution scratch, split out of `Network` for one walk.
+///
+/// Keeping it separate lets `step` borrow the WEIGHTS by reference while a
+/// convolution mutates the im2col/GEMM buffers. Previously the borrow checker
+/// forced a full clone of the weight vector and of the `[K, N]` table on
+/// every convolution -- megabytes copied per layer of every image. The
+/// arithmetic is untouched; only the borrows change.
+struct ConvScratch {
+    a: Vec<f32>,
+    c: Vec<f32>,
+    cost: Cost,
+    threads: usize,
+}
+
+impl ConvScratch {
+    /// Merge the convolution timings back into the network's public cost.
+    fn merge_cost(&self, cost: &mut Cost) {
+        cost.convs_host += self.cost.convs_host;
+        cost.convs_array += self.cost.convs_array;
+        cost.dwconvs_host += self.cost.dwconvs_host;
+        cost.transposed_convs += self.cost.transposed_convs;
+        cost.t_host += self.cost.t_host;
+        cost.t_array += self.cost.t_array;
+        cost.t_dwconv += self.cost.t_dwconv;
+        cost.t_im2col += self.cost.t_im2col;
+        cost.t_gemm += self.cost.t_gemm;
+        cost.t_transpose += self.cost.t_transpose;
+        cost.t_transposed += self.cost.t_transposed;
+        cost.t_elementwise += self.cost.t_elementwise;
+        cost.elementwise_ops += self.cost.elementwise_ops;
+    }
+}
+
 /// One packed graph, ready to walk.
 pub struct Network {
     /// The graph's ops.
@@ -1810,10 +1844,19 @@ impl Network {
         let mut body: Vec<Tensor> = vec![Tensor::default(); self.graph.len() + 1];
         body[0] = input.clone();
         on_node(-1, &body[0]);
+        // Take the reusable convolution scratch out of the network for the
+        // whole walk. The buffers go back at the end, so the NEXT image keeps
+        // the allocations; only the borrows differ from the old code.
+        let mut scratch = ConvScratch {
+            a: std::mem::take(&mut self.a),
+            c: std::mem::take(&mut self.c),
+            cost: Cost::default(),
+            threads: self.threads,
+        };
         for i in 0..self.graph.len() {
             let l = self.graph[i].clone();
             let nl = format!("node {i}");
-            let out = self.step(&body, i, &l, &nl, array.as_deref_mut())?;
+            let out = self.step(&body, i, &l, &nl, array.as_deref_mut(), &mut scratch)?;
             // THE CHECK, AND WHY IT IS HERE.
             //
             // Every op's output extent was resolved at PACK time and recorded
@@ -1837,6 +1880,9 @@ impl Network {
             body[i + 1] = out;
             on_node(i as i64, &body[i + 1]);
         }
+        self.a = std::mem::take(&mut scratch.a);
+        self.c = std::mem::take(&mut scratch.c);
+        scratch.merge_cost(&mut self.cost);
         Ok(body)
     }
 
@@ -1848,6 +1894,7 @@ impl Network {
         l: &Layer,
         nl: &str,
         array: ArrayRef<'_, '_>,
+        scratch: &mut ConvScratch,
     ) -> Result<Tensor, Refusal> {
         // The operands. -1 is the image, and every other index is an EARLIER
         // op's output -- the graph is evaluated in order, which the reader
@@ -1866,20 +1913,23 @@ impl Network {
         };
         match l.op {
             Op::Conv => {
-                let w = self.conv_of(l, nl)?.clone();
+                // BORROW the weight and the transposed table: the old
+                // `.clone()` copied both on every single convolution. With
+                // the scratch split out of `self`, the immutable borrow of
+                // `self.convs`/`self.wmat` and the mutable scratch coexist.
+                let w = self.conv_of(l, nl)?;
+                let inp = operand(0)?;
                 if w.depthwise() {
-                    let inp = operand(0)?;
-                    self.dwconv(inp, l, &w, nl)
+                    self.dwconv(inp, l, w, nl, scratch)
                 } else {
-                    let inp = operand(0)?;
-                    let table = self.wmat[l.conv as usize].clone();
-                    self.conv(inp, l, &w, table, nl, array)
+                    let table = self.wmat[l.conv as usize].as_deref();
+                    self.conv(inp, l, w, table, nl, array, scratch)
                 }
             }
             Op::ConvTranspose => {
-                let w = self.conv_of(l, nl)?.clone();
+                let w = self.conv_of(l, nl)?;
                 let inp = operand(0)?;
-                self.convtranspose(inp, l, &w, nl)
+                self.convtranspose(inp, l, w, nl, scratch)
             }
             Op::Relu | Op::Sigmoid | Op::HardSwish | Op::HardSigmoid => {
                 // A STANDALONE activation. The container records its
@@ -2021,13 +2071,14 @@ impl Network {
     // -- the dense convolution ------------------------------------------------
 
     fn conv(
-        &mut self,
+        &self,
         input: &Tensor,
         l: &Layer,
         w: &ConvW,
-        table: Option<Vec<f32>>,
+        table: Option<&[f32]>,
         nl: &str,
         array: ArrayRef<'_, '_>,
+        scratch: &mut ConvScratch,
     ) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
             return Err(format!(
@@ -2080,7 +2131,7 @@ impl Network {
         let n = w.cout;
 
         let t0 = std::time::Instant::now();
-        self.a = im2col(
+        im2col(
             &input.d,
             w.cin,
             h,
@@ -2093,10 +2144,11 @@ impl Network {
             l.stride[1],
             l.pad[2],
             l.pad[3],
-            self.threads,
+            scratch.threads,
+            &mut scratch.a,
         );
-        debug_assert_eq!(self.a.len(), (oh * ow * k) as usize);
-        self.cost.t_im2col += t0.elapsed().as_secs_f64();
+        debug_assert_eq!(scratch.a.len(), (oh * ow * k) as usize);
+        scratch.cost.t_im2col += t0.elapsed().as_secs_f64();
 
         // THE BIAS, OR A ROW OF ZEROS IN ITS PLACE. `gemm_nt` adds bias[n] to
         // every output column, so a null bias is a null dereference and not a
@@ -2107,7 +2159,7 @@ impl Network {
             None => vec![0.0f32; n as usize],
         };
         let t1 = std::time::Instant::now();
-        self.c = vec![0.0f32; (m * n) as usize];
+        scratch.c.resize((m * n) as usize, 0.0);
         // THE ARRAY, OR THE HOST.
         //
         // This is the SEAM, and it is one branch in one place. The im2col
@@ -2125,44 +2177,44 @@ impl Network {
                 array
                     .conv(
                         &l.w,
-                        &self.a,
+                        &scratch.a,
                         m as usize,
                         k as usize,
                         n as usize,
-                        &mut self.c,
+                        &mut scratch.c,
                     )
                     .map_err(|e| format!("{nl}: {e}"))?;
-                self.cost.t_array += t.elapsed().as_secs_f64();
-                self.cost.convs_array += 1;
+                scratch.cost.t_array += t.elapsed().as_secs_f64();
+                scratch.cost.convs_array += 1;
             }
             None => {
                 // OVER ROWS, like the oracle: a row's reduction is over `k` in
                 // order, so which thread computes a row changes the thread and not
                 // the number.
                 kernels::gemm_nt_rows(
-                    &self.a,
+                    &scratch.a,
                     m as usize,
-                    &wkn,
+                    wkn,
                     k as usize,
                     n as usize,
                     &bias,
-                    &mut self.c,
-                    self.threads,
+                    &mut scratch.c,
+                    scratch.threads,
                 );
-                self.cost.t_gemm += t1.elapsed().as_secs_f64();
-                self.cost.convs_host += 1;
+                scratch.cost.t_gemm += t1.elapsed().as_secs_f64();
+                scratch.cost.convs_host += 1;
             }
         }
         let t2 = std::time::Instant::now();
-        transpose_mn_to_nchw(&self.c, m, n, &mut out.d, self.threads);
-        self.cost.t_transpose += t2.elapsed().as_secs_f64();
+        transpose_mn_to_nchw(&scratch.c, m, n, &mut out.d, scratch.threads);
+        scratch.cost.t_transpose += t2.elapsed().as_secs_f64();
         if !on_array {
             // The host's share of a dense convolution is the GEMM AND the
             // transpose back to NCHW, and it is measured HERE so that the
             // transpose is in it. An array run has no host share of the
             // multiplication: the transpose is the host's, and the GEMM is
             // the array's.
-            self.cost.t_host += t1.elapsed().as_secs_f64();
+            scratch.cost.t_host += t1.elapsed().as_secs_f64();
         }
         // The activation is a SEPARATE PASS, and the reason is arithmetic: the
         // host convolution's epilogue computes the OTHER architectures'
@@ -2170,18 +2222,19 @@ impl Network {
         // parameter that an enum cannot hold.
         let t3 = std::time::Instant::now();
         apply_act(&mut out, l);
-        self.cost.t_elementwise += t3.elapsed().as_secs_f64();
+        scratch.cost.t_elementwise += t3.elapsed().as_secs_f64();
         Ok(out)
     }
 
     // -- the depthwise convolution --------------------------------------------
 
     fn dwconv(
-        &mut self,
+        &self,
         input: &Tensor,
         l: &Layer,
         w: &ConvW,
         nl: &str,
+        scratch: &mut ConvScratch,
     ) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
             return Err(format!(
@@ -2220,61 +2273,55 @@ impl Network {
         let plane_in = (h * width) as usize;
         let plane_out = (oh * ow) as usize;
         let cout = w.cout as usize;
-        let threads = self.threads.min(cout.max(1));
+        let threads = scratch.threads.min(cout.max(1));
         let work = (w.cout * oh * ow) as i64;
-        if threads <= 1 || work < kernels::PAR_MIN_ITEMS {
+        let Some(chunk) = parallel::chunk_rows(cout, work, threads) else {
             self.dwconv_serial(input, l, w, &mut out, oh, ow, h, width, pt, pl);
-            self.cost.t_dwconv += t0.elapsed().as_secs_f64();
-            self.cost.dwconvs_host += 1;
+            scratch.cost.t_dwconv += t0.elapsed().as_secs_f64();
+            scratch.cost.dwconvs_host += 1;
             return Ok(out);
-        }
-        let chunk = cout.div_ceil(threads);
+        };
         let ins: Vec<&[f32]> = input.d.chunks(plane_in.max(1)).collect();
         let mut outs: Vec<&mut [f32]> = out.d.chunks_mut(plane_out.max(1)).collect();
-        let groups: Vec<&mut [&mut [f32]]> = outs.chunks_mut(chunk.max(1)).collect();
-        std::thread::scope(|s| {
-            for (gi, group) in groups.into_iter().enumerate() {
-                let base = gi * chunk;
-                let inputs = &ins[base..base + group.len()];
-                s.spawn(move || {
-                    for (i, dst) in group.iter_mut().enumerate() {
-                        let co = base + i;
-                        let wf = &w.w[((co as i64) * kh * kw) as usize..][..(kh * kw) as usize];
-                        let src = inputs[i];
-                        let b = w.b.as_ref().map(|v| v[co]).unwrap_or(0.0);
-                        for y in 0..oh {
-                            for x in 0..ow {
-                                // FUSED, and the object file says so: the
-                                // oracle's dwconv is `vfmadd231ss`. A plain
-                                // `acc += a * b` here would round twice where
-                                // the oracle rounds once.
-                                let mut acc = b;
-                                for i in 0..kh {
-                                    let sy = y * l.stride[0] + i - pt;
-                                    if sy < 0 || sy >= h {
-                                        continue;
-                                    }
-                                    for j in 0..kw {
-                                        let sx = x * l.stride[1] + j - pl;
-                                        if sx < 0 || sx >= width {
-                                            continue;
-                                        }
-                                        acc = wf[(i * kw + j) as usize]
-                                            .mul_add(src[(sy * width + sx) as usize], acc);
-                                    }
+        parallel::for_each_chunk_mut(&mut outs, chunk.max(1), |gi, group| {
+            let base = gi * chunk;
+            let inputs = &ins[base..base + group.len()];
+            for (i, dst) in group.iter_mut().enumerate() {
+                let co = base + i;
+                let wf = &w.w[((co as i64) * kh * kw) as usize..][..(kh * kw) as usize];
+                let src = inputs[i];
+                let b = w.b.as_ref().map(|v| v[co]).unwrap_or(0.0);
+                for y in 0..oh {
+                    for x in 0..ow {
+                        // FUSED, and the object file says so: the
+                        // oracle's dwconv is `vfmadd231ss`. A plain
+                        // `acc += a * b` here would round twice where
+                        // the oracle rounds once.
+                        let mut acc = b;
+                        for i in 0..kh {
+                            let sy = y * l.stride[0] + i - pt;
+                            if sy < 0 || sy >= h {
+                                continue;
+                            }
+                            for j in 0..kw {
+                                let sx = x * l.stride[1] + j - pl;
+                                if sx < 0 || sx >= width {
+                                    continue;
                                 }
-                                dst[(y * ow + x) as usize] = match l.act {
-                                    Some(act) => act1(act, l.alpha, l.beta, acc),
-                                    None => acc,
-                                };
+                                acc = wf[(i * kw + j) as usize]
+                                    .mul_add(src[(sy * width + sx) as usize], acc);
                             }
                         }
+                        dst[(y * ow + x) as usize] = match l.act {
+                            Some(act) => act1(act, l.alpha, l.beta, acc),
+                            None => acc,
+                        };
                     }
-                });
+                }
             }
         });
-        self.cost.t_dwconv += t0.elapsed().as_secs_f64();
-        self.cost.dwconvs_host += 1;
+        scratch.cost.t_dwconv += t0.elapsed().as_secs_f64();
+        scratch.cost.dwconvs_host += 1;
         Ok(out)
     }
 
@@ -2336,11 +2383,12 @@ impl Network {
     // -- the transposed convolution -------------------------------------------
 
     fn convtranspose(
-        &mut self,
+        &self,
         input: &Tensor,
         l: &Layer,
         w: &ConvW,
         nl: &str,
+        scratch: &mut ConvScratch,
     ) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
             return Err(format!(
@@ -2411,8 +2459,8 @@ impl Network {
                 }
             }
         }
-        self.cost.t_transposed += t0.elapsed().as_secs_f64();
-        self.cost.transposed_convs += 1;
+        scratch.cost.t_transposed += t0.elapsed().as_secs_f64();
+        scratch.cost.transposed_convs += 1;
         Ok(out)
     }
 
@@ -3235,7 +3283,8 @@ fn im2col(
     pb: i64,
     pr: i64,
     threads: usize,
-) -> Vec<f32> {
+    a: &mut Vec<f32>,
+) {
     // THE OUTPUT EXTENT, and the FOUR pad terms are what make it.
     //
     // The v5 detector spells two of its stem convolutions SAME_UPPER, which
@@ -3247,17 +3296,21 @@ fn im2col(
     let m = oh * ow;
     let k = c * kh * kw;
     if m <= 0 || k <= 0 {
-        return Vec::new();
+        a.clear();
+        return;
     }
-    let mut a = vec![0.0f32; (m * k) as usize];
+    // The caller owns the buffer and reuses it across convolutions. Resize
+    // grows it to the largest shape; clearing first zeroes the out-of-window
+    // columns that the gather below leaves untouched.
+    let len = (m * k) as usize;
+    a.resize(len, 0.0);
+    a.fill(0.0);
     // OVER OUTPUT ROWS, like the oracle: a row's im2col reads the source and
     // writes its own run of A, and no row reads another's. The split crosses
     // no reduction, so the threads are free.
     let row_floats = (ow * k) as usize;
-    let workers = (threads as i64).clamp(1, oh.max(1));
-    let rows_per = (oh + workers - 1) / workers;
-    if m * k < kernels::PAR_MIN_ITEMS || workers <= 1 {
-        // Too small to be worth a thread: the barrier costs more than the
+    let Some(rows_per) = parallel::chunk_rows(oh as usize, m * k, threads as usize) else {
+        // Too small to be worth a worker: the barrier costs more than the
         // gather.
         for y in 0..oh {
             for x in 0..ow {
@@ -3280,40 +3333,34 @@ fn im2col(
                 }
             }
         }
-        return a;
-    }
-    let chunks: Vec<&mut [f32]> = a.chunks_mut((rows_per as usize) * row_floats).collect();
-    std::thread::scope(|s| {
-        for (ci, chunk) in chunks.into_iter().enumerate() {
-            let first = ci as i64 * rows_per;
-            let rows = (chunk.len() / row_floats) as i64;
-            s.spawn(move || {
-                for y in first..first + rows {
-                    for x in 0..ow {
-                        let row = &mut chunk[(((y - first) * ow + x) as usize) * k as usize..]
-                            [..k as usize];
-                        for i in 0..kh {
-                            let sy = y * sh + i - ph;
-                            if sy < 0 || sy >= h {
-                                continue;
-                            }
-                            for j in 0..kw {
-                                let sx = x * sw + j - pw;
-                                if sx < 0 || sx >= width {
-                                    continue;
-                                }
-                                for ch in 0..c {
-                                    row[((ch * kh + i) * kw + j) as usize] =
-                                        src[((ch * h + sy) * width + sx) as usize];
-                                }
-                            }
+        return;
+    };
+    parallel::for_each_chunk_mut(&mut a[..], rows_per * row_floats, |ci, chunk| {
+        let first = ci as i64 * rows_per as i64;
+        let rows = (chunk.len() / row_floats) as i64;
+        for y in first..first + rows {
+            for x in 0..ow {
+                let row =
+                    &mut chunk[(((y - first) * ow + x) as usize) * k as usize..][..k as usize];
+                for i in 0..kh {
+                    let sy = y * sh + i - ph;
+                    if sy < 0 || sy >= h {
+                        continue;
+                    }
+                    for j in 0..kw {
+                        let sx = x * sw + j - pw;
+                        if sx < 0 || sx >= width {
+                            continue;
+                        }
+                        for ch in 0..c {
+                            row[((ch * kh + i) * kw + j) as usize] =
+                                src[((ch * h + sy) * width + sx) as usize];
                         }
                     }
                 }
-            });
+            }
         }
     });
-    a
 }
 
 /// The `[M, N]` to NCHW transpose.
@@ -3326,9 +3373,8 @@ fn im2col(
 /// no other, so the split crosses no reduction.
 fn transpose_mn_to_nchw(src: &[f32], m: i64, n: i64, dst: &mut [f32], threads: usize) {
     const TILE: i64 = 32;
-    let workers = (threads as i64).clamp(1, n.max(1));
-    if m * n < kernels::PAR_MIN_ITEMS || workers <= 1 {
-        // Too small to be worth a thread.
+    let Some(per) = parallel::chunk_rows(n as usize, m * n, threads) else {
+        // Too small to be worth a worker.
         let mut m0 = 0i64;
         while m0 < m {
             let m1 = (m0 + TILE).min(m);
@@ -3341,26 +3387,20 @@ fn transpose_mn_to_nchw(src: &[f32], m: i64, n: i64, dst: &mut [f32], threads: u
             m0 = m1;
         }
         return;
-    }
+    };
     let mut channels: Vec<&mut [f32]> = dst.chunks_mut((m as usize).max(1)).collect();
-    let per = (n + workers - 1) / workers;
-    let groups: Vec<&mut [&mut [f32]]> = channels.chunks_mut((per as usize).max(1)).collect();
-    std::thread::scope(|s| {
-        for (gi, group) in groups.into_iter().enumerate() {
-            let base = gi as i64 * per;
-            s.spawn(move || {
-                for (i, d) in group.iter_mut().enumerate() {
-                    let ch = base + i as i64;
-                    let mut m0 = 0i64;
-                    while m0 < m {
-                        let m1 = (m0 + TILE).min(m);
-                        for mm in m0..m1 {
-                            d[mm as usize] = src[(mm * n + ch) as usize];
-                        }
-                        m0 = m1;
-                    }
+    parallel::for_each_chunk_mut(&mut channels, per.max(1), |gi, group| {
+        let base = gi as i64 * per as i64;
+        for (i, d) in group.iter_mut().enumerate() {
+            let ch = base + i as i64;
+            let mut m0 = 0i64;
+            while m0 < m {
+                let m1 = (m0 + TILE).min(m);
+                for mm in m0..m1 {
+                    d[mm as usize] = src[(mm * n + ch) as usize];
                 }
-            });
+                m0 = m1;
+            }
         }
     });
 }

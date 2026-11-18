@@ -12,6 +12,7 @@ authors.workspace = true
 libm = "0.2"
 npum-format.workspace = true
 npum-model.workspace = true
+rayon = "1.10"
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -19,3 +20,10 @@ tracing.workspace = true
 [dev-dependencies]
 npum-tokenizers.workspace = true
 serde_json.workspace = true
+
+# A dependency-free benchmark harness: `cargo bench -p npum-cpu --bench gemm`.
+# It prints the time and GFLOP/s of the hot GEMM shapes so a kernel change can
+# be measured on the target machine instead of guessed at.
+[[bench]]
+name = "gemm"
+harness = false

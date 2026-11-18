@@ -628,9 +628,11 @@ fn crop_pad(
     let mut out = like(side, side);
     for y in 0..ch {
         for x in 0..cw {
-            let s = px(&sub, y, x).to_vec();
+            // Copy straight into the destination: the old `to_vec()` built a
+            // three-byte heap buffer for EVERY pixel of every palm crop.
+            let s = px(&sub, y, x);
             let d = px_mut(&mut out, y + top, x + left);
-            d.copy_from_slice(&s);
+            d.copy_from_slice(s);
         }
     }
     // THE RETURNED BOX IS THE CLIPPED ONE, UNMOVED BY THE PADDING. The first
@@ -725,20 +727,26 @@ pub fn decode_palm(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut keep: Vec<i64> = Vec::new();
-    while !order.is_empty() && (keep.len() as i64) < g.top_k {
-        let i = order[0];
+    // `order.remove(0)` shifted the whole tail on every survivor and `rest`
+    // was a fresh allocation each time. A read cursor and one reused buffer
+    // produce the same order -- the sort above is still the stable one -- and
+    // remove both costs.
+    let mut rest: Vec<i64> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < order.len() && (keep.len() as i64) < g.top_k {
+        let i = order[cursor];
+        cursor += 1;
         if sc[i as usize] < g.score_threshold {
             break;
         }
         keep.push(i);
-        order.remove(0);
-        if order.is_empty() {
+        if cursor >= order.len() {
             break;
         }
         let bi = &bx[(i * 4) as usize..][..4];
         let ai = (bi[2] - bi[0]) * (bi[3] - bi[1]);
-        let mut rest: Vec<i64> = Vec::with_capacity(order.len());
-        for j in order {
+        rest.clear();
+        for &j in &order[cursor..] {
             let bj = &bx[(j * 4) as usize..][..4];
             let ix = 0.0f64.max(bi[2].min(bj[2]) - bi[0].max(bj[0]));
             let iy = 0.0f64.max(bi[3].min(bj[3]) - bi[1].max(bj[1]));
@@ -754,7 +762,12 @@ pub fn decode_palm(
                 rest.push(j);
             }
         }
-        order = rest;
+        // Replace the order entirely with the survivors: draining only the
+        // consumed prefix would leave the SUPPRESSED candidates at the front
+        // of the next iteration.
+        order.clear();
+        order.extend_from_slice(&rest);
+        cursor = 0;
     }
 
     let mut out = Vec::with_capacity(keep.len());

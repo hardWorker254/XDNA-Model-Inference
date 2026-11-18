@@ -86,14 +86,44 @@ pub fn tile_b(
     mac_t: Option<usize>,
     order: TileOrder,
 ) -> Result<Vec<u8>, TilingError> {
+    let mut out = vec![0u8; b.len()];
+    tile_b_into(&mut out, b, k, n, tile_k, tile_n, elem, mac_s, mac_t, order)?;
+    Ok(out)
+}
+
+/// Pre-tile a [K, N] operand into a provided buffer.
+///
+/// This is [`tile_b`], but it writes into `out` instead of allocating it.
+/// `out` must be exactly `k * n * elem` bytes long: the tiled panel is a
+/// permutation of the same bytes, so the caller that reuses the buffer across
+/// calls pays the write and not the allocation.
+pub fn tile_b_into(
+    out: &mut [u8],
+    b: &[u8],
+    k: usize,
+    n: usize,
+    tile_k: usize,
+    tile_n: usize,
+    elem: usize,
+    mac_s: Option<usize>,
+    mac_t: Option<usize>,
+    order: TileOrder,
+) -> Result<(), TilingError> {
     if elem == 0 {
         return Err(refuse("the element size is zero"));
     }
-    if b.len() != k * n * elem {
+    let bytes = k * n * elem;
+    if b.len() != bytes {
         return Err(refuse(format!(
             "a [{k},{n}] operand of {elem}-byte elements is {} bytes, and the buffer is {}",
-            k * n * elem,
+            bytes,
             b.len()
+        )));
+    }
+    if out.len() != bytes {
+        return Err(refuse(format!(
+            "the output holds {} bytes, and a [{k},{n}] tiled panel needs {bytes}",
+            out.len()
         )));
     }
     if k % tile_k != 0 || n % tile_n != 0 {
@@ -119,23 +149,67 @@ pub fn tile_b(
 
     let kb = k / tile_k;
     let nb = n / tile_n;
-    let mut out = Vec::with_capacity(b.len());
 
-    // THE TILES, IN THE ORDER THE DESIGN WALKS THEM.
+    // THE ELEMENT SIZE IS NEARLY ALWAYS ONE OF THREE CONSTANTS.
     //
-    // The inner loop is the (s, t) order: within one tile, the element at
-    // (kk, nn) sits at (kk * s + si, nn * t + ti) -- the sub-tile's own
-    // order, which is what the DMA streams.
-    let emit_tile = |kb_i: usize, nb_i: usize, out: &mut Vec<u8>| {
+    // bf16 (elem == 2) is the array's operand and the hot case: the attention
+    // rebuilds both panels for every head. Passing a LITERAL lets the emitter
+    // fold the size into its address arithmetic (a shift, not a multiply) and
+    // make each coalesced copy a fixed-width load/store. The fallback keeps
+    // every other element size working, with the same bytes.
+    match elem {
+        1 => emit_tiles(out, b, n, tile_k, tile_n, kb, nb, s, t, 1, order),
+        2 => emit_tiles(out, b, n, tile_k, tile_n, kb, nb, s, t, 2, order),
+        4 => emit_tiles(out, b, n, tile_k, tile_n, kb, nb, s, t, 4, order),
+        _ => emit_tiles(out, b, n, tile_k, tile_n, kb, nb, s, t, elem, order),
+    }
+    Ok(())
+}
+
+/// The emit loops, shared by the specializations above.
+///
+/// Marked `#[inline(always)]` so that the literal element size in each caller
+/// is folded into the address math before the loops are code-generated.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn emit_tiles(
+    out: &mut [u8],
+    b: &[u8],
+    n: usize,
+    tile_k: usize,
+    tile_n: usize,
+    kb: usize,
+    nb: usize,
+    s: usize,
+    t: usize,
+    elem: usize,
+    order: TileOrder,
+) {
+    // THE t ELEMENTS OF A SUB-TILE ROW ARE ONE CONTIGUOUS SOURCE RUN.
+    //
+    // The sub-tile's own order is (si, ti): within a fixed (kk, nn, si) the
+    // `ti` elements are consecutive COLUMNS of one source row, hence
+    // consecutive bytes of the source. Emitting them as one `t * elem` copy
+    // replaces `t` indexed `elem`-byte copies -- four times fewer copies and
+    // bounds checks for npu1's bf16 sub-tile (t=4), and one 64-bit load/store
+    // per run for bf16. Neither the output order nor a byte changes: this is
+    // the same sequence of source bytes, only fetched in larger pieces.
+    let run = t * elem;
+    let row_stride = n * elem;
+    let mut write = 0usize;
+
+    let mut emit_tile = |kb_i: usize, nb_i: usize| {
         for kk in 0..(tile_k / s) {
+            // Byte offset of the first `si` row of this sub-tile row. Hoisted
+            // out of both inner loops, as is the column base below: what was
+            // a multiply and two adds per element is now one add per run.
+            let row_base = (kb_i * tile_k + kk * s) * row_stride;
             for nn in 0..(tile_n / t) {
+                let col_base = (nb_i * tile_n + nn * t) * elem;
                 for si in 0..s {
-                    for ti in 0..t {
-                        let src_row = kb_i * tile_k + kk * s + si;
-                        let src_col = nb_i * tile_n + nn * t + ti;
-                        let src = (src_row * n + src_col) * elem;
-                        out.extend_from_slice(&b[src..src + elem]);
-                    }
+                    let src = row_base + si * row_stride + col_base;
+                    out[write..write + run].copy_from_slice(&b[src..src + run]);
+                    write += run;
                 }
             }
         }
@@ -144,19 +218,18 @@ pub fn tile_b(
         TileOrder::Kn => {
             for kb_i in 0..kb {
                 for nb_i in 0..nb {
-                    emit_tile(kb_i, nb_i, &mut out);
+                    emit_tile(kb_i, nb_i);
                 }
             }
         }
         TileOrder::Nk => {
             for nb_i in 0..nb {
                 for kb_i in 0..kb {
-                    emit_tile(kb_i, nb_i, &mut out);
+                    emit_tile(kb_i, nb_i);
                 }
             }
         }
     }
-    Ok(out)
 }
 
 /// Un-tile a panel: the exact inverse of [`tile_b`].

@@ -379,7 +379,10 @@ KIND_REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
                   "chunk rather than once per layer, and every dispatch fills "
                   "the design's whole 12288-row capacity -- 100.59 s for 15 "
                   "texts against 1.36 s for `gemm,attn`, both re-measured "
-                  "with this change."),
+                  "with this change. Those numbers are the SHIPPED "
+                  "artifacts: a target export now sizes the design to one "
+                  "attention chunk (256 rows here), so the cost has to be "
+                  "re-measured after a re-export."),
         "conv": (ABSENT, "names Whisper's conv1/conv2 -- " + _NO_AUDIO + "."),
         "attn": (HONOURS,
                  "qk() and av() in BertEncoder::run dispatch on the set's own "
@@ -562,8 +565,10 @@ KIND_REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
                   "NpuAttention then calls the softmax once per head per "
                   "chunk -- 144 extra dispatches -- and each dispatch fills "
                   "the design's whole 12288-row capacity whatever the caller "
-                  "needed. The cell honours the flag; the combination honours "
-                  "it slowly."),
+                  "needed -- on the shipped artifacts. A target export now "
+                  "sizes the design to one attention chunk (256 rows here), so "
+                  "that capacity cost is no longer what the exporter builds. "
+                  "The cell honours the flag; the combination honours it slowly."),
         "conv": (HONOURS,
                  "the patch embedding IS a convolution, Conv2d(3, d, "
                  "kernel=16, stride=16), and `conv` is the code that decides "
@@ -1038,8 +1043,11 @@ MODEL_REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
                   "39.13 s. The cause is one line long -- "
                   "NpuAttention calls the softmax per head per chunk while "
                   "every call fills the design's whole 12288-row capacity -- "
-                  "and it is the reason this flag should be wanted for "
-                  "correctness on the array rather than for speed."),
+                  "on the shipped artifacts. Target exports now size that "
+                  "design to one attention chunk (256 rows here), so the "
+                  "figure is the artifacts', not the exporter's. It is the "
+                  "reason this flag should be wanted for correctness on the "
+                  "array rather than for speed."),
         "attn": (HONOURS,
                  "attention() dispatches on the enc set's own attn_qk/attn_av "
                  "streams, but it CANNOT reach Whisper's NpuAttention by "

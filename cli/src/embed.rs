@@ -31,6 +31,12 @@ use npum_tokenizers::wordpiece::WordPiece;
 use npum_tokenizers::xlmr::XlmrTokenizer;
 use std::path::{Path, PathBuf};
 
+/// The reference encodes in tiers of at most sixteen sequences, and the NPU
+/// designs were built for the same. Chunking the CLI's inputs this way lets
+/// one forward pass amortise its dispatch, conversion and kernel-launch cost
+/// over several texts instead of paying it once per text.
+const BATCH: usize = 16;
+
 /// A tokenizer for the embed/text family (WordPiece or XLM-R Unigram).
 pub enum EmbedTokenizer {
     WordPiece(WordPiece),
@@ -58,11 +64,101 @@ impl EmbedTokenizer {
 }
 
 /// The result of a refusal, and the message that goes with it.
+#[derive(Debug)]
 pub struct Refusal {
     /// The exit code.
     pub code: i32,
     /// The message, without a trailing newline.
     pub message: String,
+}
+
+/// Tokenise every text up front, at the design's sequence length.
+///
+/// Padding to `seq` is deliberate: a text that does not fit is either refused
+/// here or cut here, exactly as before, so `--allow-truncation` and the
+/// per-input refusal message keep their meaning. The returned per-text
+/// lengths (the count of unmasked tokens) let a batch shrink its sequence
+/// length later without ever dropping a real token.
+fn tokenize_all(
+    tokenizer: &EmbedTokenizer,
+    texts: &[String],
+    prefix: Option<&str>,
+    seq: usize,
+    allow_truncation: bool,
+) -> Result<(Vec<u32>, Vec<u32>, Vec<usize>), Refusal> {
+    let mut ids = Vec::with_capacity(texts.len() * seq);
+    let mut mask = Vec::with_capacity(texts.len() * seq);
+    let mut lengths = Vec::with_capacity(texts.len());
+    for (index, text) in texts.iter().enumerate() {
+        let raw = match prefix {
+            Some(p) => format!("{p}{text}"),
+            None => text.clone(),
+        };
+        let (encoding, truncated) = tokenizer.encode_padded(&raw, seq).map_err(|e| Refusal {
+            code: crate::EXIT_REFUSED,
+            message: e.to_string(),
+        })?;
+        if truncated && !allow_truncation {
+            let n_tokens = encoding.ids.len().min(seq) + 2;
+            return Err(Refusal {
+                code: crate::EXIT_REFUSED,
+                message: format!(
+                    "input {index} is {n_tokens} tokens, but this runtime is running at sequence length {seq}. Split the text into shorter pieces, or run a design exported for a longer sequence (tools/export/export_gemm_rtp.py --seq N). Passing --allow-truncation cuts it at {seq} tokens instead and DISCARDS the rest."
+                ),
+            });
+        }
+        lengths.push(encoding.mask.iter().filter(|&&m| m > 0).count());
+        ids.extend_from_slice(&encoding.ids);
+        mask.extend_from_slice(&encoding.mask);
+    }
+    Ok((ids, mask, lengths))
+}
+
+/// The sequence length one batch actually needs.
+///
+/// When the score width follows the sequence (host and GPU softmax, no array
+/// design fixing it) the trailing all-padding columns can be dropped: every
+/// real token keeps its original position, and the columns dropped were
+/// masked out, so the vectors are unchanged. The win is largest for short
+/// texts against a long design window -- attention is quadratic in `seq`.
+///
+/// `fix_width` is true when an array design fixes the score width (array
+/// attention's `n_kv` or an array softmax's columns); then the full design
+/// `seq` is kept and batching alone amortises the per-forward overhead.
+fn batch_seq(design_seq: usize, lengths: &[usize], fix_width: bool) -> usize {
+    if fix_width {
+        return design_seq;
+    }
+    lengths
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1)
+        .min(design_seq)
+}
+
+/// Pack one chunk's rows into flat `ids`/`mask` at `eff_seq`.
+///
+/// Each text was padded to `design_seq` with padding at the tail, so taking
+/// the first `eff_seq` entries keeps every real token (`eff_seq` is at least
+/// the longest text in the chunk) and drops only padding.
+fn pack_batch(
+    ids: &[u32],
+    mask: &[u32],
+    design_seq: usize,
+    begin: usize,
+    batch: usize,
+    eff_seq: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut out_ids = Vec::with_capacity(batch * eff_seq);
+    let mut out_mask = Vec::with_capacity(batch * eff_seq);
+    for i in 0..batch {
+        let base = (begin + i) * design_seq;
+        out_ids.extend_from_slice(&ids[base..base + eff_seq]);
+        out_mask.extend_from_slice(&mask[base..base + eff_seq]);
+    }
+    (out_ids, out_mask)
 }
 
 /// Encode the texts and write the vectors.
@@ -130,36 +226,26 @@ pub fn run(
 
         crate::status::print_tokenizer(tokenizer.vocab_size());
         println!("  input      {} texts", texts.len());
+        let (all_ids, all_mask, lengths) =
+            tokenize_all(&tokenizer, texts, prefix, seq, allow_truncation)?;
         let started = std::time::Instant::now();
         let mut timings = npum_cpu::gte::Timings::default();
         let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
-        for (index, text) in texts.iter().enumerate() {
-            let raw = match prefix {
-                Some(p) => format!("{p}{text}"),
-                None => text.clone(),
-            };
-            let (encoding, truncated) =
-                tokenizer.encode_padded(&raw, seq).map_err(|e| Refusal {
-                    code: crate::EXIT_REFUSED,
-                    message: e.to_string(),
-                })?;
-            if truncated && !allow_truncation {
-                let n_tokens = encoding.ids.len().min(seq) + 2;
-                return Err(Refusal {
-                    code: crate::EXIT_REFUSED,
-                    message: format!(
-                        "input {index} is {n_tokens} tokens, but this runtime is running at sequence length {seq}. Split the text into shorter pieces, or run a design exported for a longer sequence (tools/export/export_gemm_rtp.py --seq N). Passing --allow-truncation cuts it at {seq} tokens instead and DISCARDS the rest."
-                    ),
-                });
-            }
+        // GTE's forward pass has no array dispatch, so its score width follows
+        // the sequence and trailing padding can be dropped per batch.
+        let mut offset = 0usize;
+        while offset < texts.len() {
+            let batch = (texts.len() - offset).min(BATCH);
+            let eff_seq = batch_seq(seq, &lengths[offset..offset + batch], false);
+            let (ids, mask) = pack_batch(&all_ids, &all_mask, seq, offset, batch, eff_seq);
             let chunk = model
                 .embed_timed_with(
                     ops.as_mut(),
                     &mut timings,
-                    &encoding.ids,
-                    &encoding.mask,
-                    1,
-                    seq,
+                    &ids,
+                    &mask,
+                    batch,
+                    eff_seq,
                     array.as_deref_mut(),
                     eltwise.as_deref_mut(),
                 )
@@ -168,6 +254,7 @@ pub fn run(
                     message: e.to_string(),
                 })?;
             vectors.extend_from_slice(&chunk);
+            offset += batch;
         }
         let elapsed = started.elapsed().as_secs_f64();
         println!(
@@ -273,43 +360,44 @@ pub fn run(
     // reason for it: the tokenizer is loaded here and not before.
     crate::status::print_tokenizer(tokenizer.vocab_size());
     println!("  input      {} texts", texts.len());
+    let (all_ids, all_mask, lengths) =
+        tokenize_all(&tokenizer, texts, prefix, seq, allow_truncation)?;
     let started = std::time::Instant::now();
     let mut timings = npum_cpu::bert::Timings::default();
     let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
-    for (index, text) in texts.iter().enumerate() {
-        let raw = match prefix {
-            Some(p) => format!("{p}{text}"),
-            None => text.clone(),
-        };
-        let (encoding, truncated) = tokenizer.encode_padded(&raw, seq).map_err(|e| Refusal {
-            code: crate::EXIT_REFUSED,
-            message: e.to_string(),
-        })?;
-        if truncated && !allow_truncation {
-            let n_tokens = encoding.ids.len().min(seq) + 2;
-            return Err(Refusal {
-                code: crate::EXIT_REFUSED,
-                message: format!(
-                    "input {index} is {n_tokens} tokens, but this runtime is running at sequence length {seq}. Split the text into shorter pieces, or run a design exported for a longer sequence (tools/export/export_gemm_rtp.py --seq N). Passing --allow-truncation cuts it at {seq} tokens instead and DISCARDS the rest."
-                ),
-            });
-        }
-        let chunk = model
-            .embed_timed(
-                &mut timings,
-                &encoding.ids,
-                &encoding.mask,
-                1,
-                seq,
+    // One workspace and one outgoing buffer for the whole run. The wrapper
+    // `embed_timed` builds both fresh for every batch, which is a dozen large
+    // scratch allocations per batch when there are thousands of texts.
+    let mut workspace = npum_cpu::bert::BertWorkspace::new();
+    let mut chunk = Vec::new();
+    // An array design fixes the score width (array attention's `n_kv` or an
+    // array softmax's columns), so those runs keep the full design `seq` and
+    // rely on batching alone. Host and GPU runs shrink `seq` per batch.
+    let fix_width = array.is_some() || eltwise.is_some();
+    let mut offset = 0usize;
+    while offset < texts.len() {
+        let batch = (texts.len() - offset).min(BATCH);
+        let eff_seq = batch_seq(seq, &lengths[offset..offset + batch], fix_width);
+        let (ids, mask) = pack_batch(&all_ids, &all_mask, seq, offset, batch, eff_seq);
+        model
+            .embed_timed_with_into(
                 ops.as_mut(),
+                &mut timings,
+                &ids,
+                &mask,
+                batch,
+                eff_seq,
                 array.as_deref_mut(),
                 eltwise.as_deref_mut(),
+                &mut workspace,
+                &mut chunk,
             )
             .map_err(|e| Refusal {
                 code: crate::EXIT_REFUSED,
                 message: e.to_string(),
             })?;
-        vectors.extend_from_slice(&chunk);
+        vectors.extend_from_slice(&chunk[..batch * hidden]);
+        offset += batch;
     }
     let elapsed = started.elapsed().as_secs_f64();
     println!(
@@ -1186,4 +1274,69 @@ pub fn tokenize_command(args: &Args, root: &Path) -> crate::families::Outcome {
         }
         0
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokenizer() -> EmbedTokenizer {
+        let vocab = "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\nworld\npre\n";
+        EmbedTokenizer::WordPiece(WordPiece::from_lines(vocab).unwrap())
+    }
+
+    #[test]
+    fn batch_seq_shrinks_to_the_longest_text_or_keeps_the_design_width() {
+        // Host/GPU: the score width follows the sequence, so trailing padding
+        // can go. The longest text wins; an empty chunk still needs one row.
+        assert_eq!(batch_seq(64, &[3, 5, 2], false), 5);
+        assert_eq!(batch_seq(64, &[], false), 1);
+        // A text that filled the design window keeps it (the truncated case).
+        assert_eq!(batch_seq(64, &[64, 1], false), 64);
+        // An array design fixes the width: full sequence, no shrinking.
+        assert_eq!(batch_seq(64, &[3, 5, 2], true), 64);
+    }
+
+    #[test]
+    fn pack_batch_drops_only_padding_and_offsets_each_text() {
+        // Three texts of design_seq 6, packed at eff_seq 4 (chunk = texts 1..3).
+        let ids: Vec<u32> = (0..18).collect();
+        let mask: Vec<u32> = (0..18).map(|i| if i % 6 < 4 { 1 } else { 0 }).collect();
+        let (out_ids, out_mask) = pack_batch(&ids, &mask, 6, 1, 2, 4);
+        assert_eq!(out_ids, vec![6, 7, 8, 9, 12, 13, 14, 15]);
+        assert_eq!(out_mask, vec![1, 1, 1, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn tokenize_all_flattens_and_counts_real_tokens() {
+        let tok = tokenizer();
+        let texts = vec!["hello".to_string(), "hello world".to_string()];
+        let (ids, mask, lengths) =
+            tokenize_all(&tok, &texts, None, 6, false).expect("the texts encode");
+        assert_eq!(ids.len(), 12);
+        assert_eq!(mask.len(), 12);
+        assert_eq!(lengths, vec![3, 4]);
+        // [CLS], hello, [SEP], then padding for the shorter text.
+        assert_eq!(&ids[..6], &[2, 4, 3, 0, 0, 0]);
+        assert_eq!(&mask[..6], &[1, 1, 1, 0, 0, 0]);
+
+        // A prefix is folded into the text before tokenising.
+        let (_, _, prefixed) = tokenize_all(&tok, &texts, Some("pre "), 6, false).unwrap();
+        assert_eq!(prefixed, vec![4, 5]);
+    }
+
+    #[test]
+    fn tokenize_all_refuses_a_truncated_text_with_its_index() {
+        let tok = tokenizer();
+        // design_seq 4 leaves room for two word pieces, so a three-piece text
+        // is cut (the shorter first text still fits).
+        let texts = vec!["hello".to_string(), "hello world pre".to_string()];
+        let err = tokenize_all(&tok, &texts, None, 4, false).unwrap_err();
+        assert_eq!(err.code, crate::EXIT_REFUSED);
+        assert!(err.message.starts_with("input 1 is "), "{}", err.message);
+
+        // With truncation allowed the same input encodes to the design width.
+        let (ids, _, _) = tokenize_all(&tok, &texts, None, 4, true).unwrap();
+        assert_eq!(ids.len(), 8);
+    }
 }

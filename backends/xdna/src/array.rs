@@ -16,14 +16,22 @@
 //! down here, because a hard-coded group id that disagrees with the design
 //! is a dispatch that fails on a board it should have worked on.
 //!
-//! # THE DATA BUFFERS ARE ZEROED
+//! # THE DATA BUFFERS ARE ZEROED -- EXCEPT THE ONES THAT ARE FILLED FIRST
 //!
 //! A fresh buffer holds whatever the driver gave it. The C buffer is read
 //! back after a dispatch, and a region the design did not write would then
 //! read as stale bytes -- which looks exactly like "the design did not
-//! compute this tile". Zeroing costs one pass over the buffer and makes
-//! "the element is still zero" mean what it says. The Python design harness
-//! does the same thing, for the same reason.
+//! compute this tile". So the design's own buffers are zeroed, as in the
+//! Python design harness, for the same reason.
+//!
+//! The extra ping-pong slots are different. An A slot is written in full
+//! before a dispatch reads it, and a C slot is read back only over the rows
+//! the dispatch wrote; nothing observes the driver's initial bytes. Those
+//! slots are allocated WITHOUT a zero-fill and without a sync -- see
+//! [`ArrayDesign::add_slot_uninit`]. A caller that binds such a slot before
+//! filling it has a bug, and the protocols that use them (the GEMM batch, the
+//! convolution's chunk pipeline, the attention's panels) fill every slot
+//! before its first dispatch.
 
 use std::fmt;
 use std::path::Path;
@@ -62,6 +70,20 @@ impl From<TransportError> for ArrayError {
     fn from(error: TransportError) -> Self {
         ArrayError::Transport(error)
     }
+}
+
+/// One tensor's bytes in a container, borrowed rather than copied.
+///
+/// The container owns the whole file; every blob the design needs is a slice
+/// of it. `load` only writes the bytes into buffers, so the slices only have
+/// to live for that call -- the container is still open when it is made.
+fn container_bytes<'a>(
+    file: &'a Container,
+    key: &str,
+    container: &Path,
+) -> Result<&'a [u8], ArrayError> {
+    file.tensor_bytes(key)
+        .map_err(|e| ArrayError::Design(format!("{container:?} has no {key}: {e}")))
 }
 
 /// A design set, loaded onto the board.
@@ -114,7 +136,13 @@ impl<T: Transport> ArrayDesign<T> {
             })?;
             blobs.push(bytes);
         }
-        Self::load(transport, info, xclbin, blobs, dir.display().to_string())
+        Self::load(
+            transport,
+            info,
+            &xclbin,
+            blobs.iter().map(Vec::as_slice),
+            dir.display().to_string(),
+        )
     }
 
     /// Load a design set out of a container.
@@ -137,22 +165,25 @@ impl<T: Transport> ArrayDesign<T> {
         let file = Container::open(container)
             .map_err(|e| ArrayError::Design(format!("cannot open {}: {e}", container.display())))?;
         let prefix = format!("design/{set}");
-        let read = |name: &str| -> Result<Vec<u8>, ArrayError> {
-            let key = format!("{prefix}/{name}");
-            file.tensor_bytes(&key)
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| ArrayError::Design(format!("{container:?} has no {key}: {e}")))
-        };
-        let manifest = read("design.json")?;
-        let info: DesignInfo = serde_json::from_slice(&manifest).map_err(|e| {
+        // THE BLOBS ARE SLICES OF THE CONTAINER, NOT HOST COPIES.
+        //
+        // `load` only writes them into buffers before it returns; it never
+        // keeps the bytes. The container stays open until that call is done,
+        // so a `to_vec` per stream would be a copy of a large xclbin and of
+        // every instruction stream for nothing.
+        let key = format!("{prefix}/design.json");
+        let manifest = container_bytes(&file, &key, container)?;
+        let info: DesignInfo = serde_json::from_slice(manifest).map_err(|e| {
             ArrayError::Design(format!(
                 "cannot parse the container's {prefix}/design.json: {e}"
             ))
         })?;
-        let xclbin = read("final.xclbin")?;
+        let key = format!("{prefix}/final.xclbin");
+        let xclbin = container_bytes(&file, &key, container)?;
         let mut blobs = Vec::new();
         for stream in info.streams_in_slot_order() {
-            blobs.push(read(&stream.file)?);
+            let key = format!("{prefix}/{}", stream.file);
+            blobs.push(container_bytes(&file, &key, container)?);
         }
         Self::load(
             transport,
@@ -167,11 +198,11 @@ impl<T: Transport> ArrayDesign<T> {
     ///
     /// Two constructors and one body, so the buffer-object dance that follows
     /// cannot be got right in one spelling and wrong in the other.
-    fn load(
+    fn load<'a>(
         transport: T,
         info: DesignInfo,
-        xclbin: Vec<u8>,
-        instr_blobs: Vec<Vec<u8>>,
+        xclbin: &[u8],
+        instr_blobs: impl IntoIterator<Item = &'a [u8]>,
         label: String,
     ) -> Result<Self, ArrayError> {
         if info.buffers.len() < 2 {
@@ -181,7 +212,7 @@ impl<T: Transport> ArrayDesign<T> {
         }
 
         let mut transport = transport;
-        transport.open_context(&xclbin)?;
+        transport.open_context(xclbin)?;
 
         // THE KERNEL BY NAME, AND THE NAME IS THE MANIFEST'S.
         //
@@ -197,7 +228,7 @@ impl<T: Transport> ArrayDesign<T> {
         for bytes in instr_blobs {
             let group = transport.group_id(GROUP_INSTRUCTION)?;
             let buffer = transport.alloc(bytes.len() as u64, BufferFlags::Cacheable, group)?;
-            T::write(&buffer, &bytes, 0)?;
+            T::write(&buffer, bytes, 0)?;
             T::sync_to_device(&buffer, bytes.len() as u64, 0)?;
             instr_words.push((bytes.len() / 4) as u32);
             instr.push(buffer);
@@ -266,6 +297,21 @@ impl<T: Transport> ArrayDesign<T> {
         Ok(())
     }
 
+    /// The slot the data buffer `index` is currently bound to.
+    ///
+    /// A dispatch captures all its bindings at `start_dispatch`, so a caller
+    /// that pipelines GEMMs needs to remember which C slot a submitted run
+    /// wrote into: the binding is rebound to the NEXT dispatch's slot before
+    /// this one's output is read back. Reading the binding at submit time is
+    /// how that slot is remembered without the caller having to thread it
+    /// through every layer.
+    pub fn bound(&self, index: usize) -> Result<usize, ArrayError> {
+        self.bound
+            .get(index)
+            .copied()
+            .ok_or_else(|| ArrayError::Design(format!("{}: no data buffer {index}", self.label)))
+    }
+
     /// Put `data` into the data buffer `index` and make it visible to the
     /// device.
     ///
@@ -295,6 +341,34 @@ impl<T: Transport> ArrayDesign<T> {
         Ok(slot)
     }
 
+    /// Allocate an empty slot WITHOUT zeroing or synchronising it.
+    ///
+    /// For a slot whose whole used range is written with
+    /// [`Self::write_bound`] / [`Self::write_bound_unsynced`] before the first
+    /// dispatch reads it. The attention's K and V panels are staged this way:
+    /// both ping-pong halves are filled before their first QK^T/softmax.V,
+    /// so a zero pass over each panel at load would be work thrown away.
+    ///
+    /// Binding an uninitialised slot and dispatching against it is a bug: the
+    /// driver does not promise that freshly allocated memory is zero.
+    pub fn stage_uninit(&mut self, index: usize, bytes: u64) -> Result<usize, ArrayError> {
+        let capacity =
+            self.info.buffers.get(index).copied().ok_or_else(|| {
+                ArrayError::Design(format!("{}: no data buffer {index}", self.label))
+            })?;
+        if bytes > capacity {
+            return Err(ArrayError::Design(format!(
+                "{}: {bytes} bytes for data buffer {index}, and the design allows {capacity}",
+                self.label
+            )));
+        }
+        let group = self.transport.group_id(GROUP_DATA + index as i32)?;
+        let buffer = self.transport.alloc(bytes, BufferFlags::HostOnly, group)?;
+        let slot = self.slots[index].len();
+        self.slots[index].push(buffer);
+        Ok(slot)
+    }
+
     /// Write into the BOUND slot of a data buffer and make it visible to
     /// the device.
     ///
@@ -302,6 +376,18 @@ impl<T: Transport> ArrayDesign<T> {
     /// design's own A buffer, every time, and a slot per operand would leave
     /// the design's memory budget one operand short per dispatch.
     pub fn write_bound(&mut self, index: usize, data: &[u8]) -> Result<(), ArrayError> {
+        self.write_bound_unsynced(index, data)?;
+        self.sync_to_device_bound(index, data.len() as u64)
+    }
+
+    /// Write into the BOUND slot of a data buffer without synchronising it to
+    /// the device.
+    ///
+    /// The caller is responsible for making the write visible with
+    /// [`Self::sync_to_device_bound`] before the device reads it. Splitting the
+    /// write from the sync lets a caller overlap host-side work with the
+    /// transfer when the transport can do so.
+    pub fn write_bound_unsynced(&mut self, index: usize, data: &[u8]) -> Result<(), ArrayError> {
         let capacity =
             self.info.buffers.get(index).copied().ok_or_else(|| {
                 ArrayError::Design(format!("{}: no data buffer {index}", self.label))
@@ -316,8 +402,66 @@ impl<T: Transport> ArrayDesign<T> {
         let slot = self.bound[index];
         let buffer = &self.slots[index][slot];
         T::write(buffer, data, 0)?;
-        T::sync_to_device(buffer, data.len() as u64, 0)?;
         Ok(())
+    }
+
+    /// Make the BOUND slot of a data buffer's contents visible to the device.
+    pub fn sync_to_device_bound(&self, index: usize, bytes: u64) -> Result<(), ArrayError> {
+        let buffer = &self.slots[index][self.bound[index]];
+        let capacity = T::size(buffer);
+        if bytes > capacity {
+            return Err(ArrayError::Design(format!(
+                "{}: sync_to_device {bytes} bytes of data buffer {index}, and the design allows {capacity}",
+                self.label
+            )));
+        }
+        T::sync_to_device(buffer, bytes, 0)?;
+        Ok(())
+    }
+
+    /// Allocate an additional empty slot for a data buffer and return its slot
+    /// index.
+    ///
+    /// The slot is zeroed and synchronised to the device, so it is safe to bind
+    /// immediately. Extra slots enable ping-pong buffering: one slot can be in
+    /// use by an in-flight dispatch while another is prepared for the next one.
+    pub fn add_slot(&mut self, index: usize) -> Result<usize, ArrayError> {
+        let slot = self.add_slot_uninit(index)?;
+        // The design's own slot was zeroed at load for a reason: a region the
+        // device does not write reads back as stale bytes. Keep that promise
+        // for a caller that uses the general API and binds the slot before
+        // filling it. The pipelined callers use `add_slot_uninit` instead.
+        let capacity = self.info.buffers[index];
+        let zeros = vec![0u8; capacity as usize];
+        T::write(&self.slots[index][slot], &zeros, 0)?;
+        T::sync_to_device(&self.slots[index][slot], capacity, 0)?;
+        Ok(slot)
+    }
+
+    /// Allocate an extra slot WITHOUT zeroing or synchronising it.
+    ///
+    /// This is the slot for a protocol that guarantees a full write before
+    /// the device reads it (A) and before the host reads it back (C). The GEMM
+    /// batch and the convolution's chunk pipeline use it for their ping-pong
+    /// pairs: every A slot is written in full with `write_bound`, and every C
+    /// slot is read back only over the rows the device wrote. A zero pass
+    /// over the whole capacity of those slots is work nothing ever observes.
+    ///
+    /// The driver does not promise that fresh memory is zero. Do not bind an
+    /// uninitialised slot to a dispatch that may read or read back a region
+    /// the protocol has not written.
+    pub fn add_slot_uninit(&mut self, index: usize) -> Result<usize, ArrayError> {
+        let capacity =
+            self.info.buffers.get(index).copied().ok_or_else(|| {
+                ArrayError::Design(format!("{}: no data buffer {index}", self.label))
+            })?;
+        let group = self.transport.group_id(GROUP_DATA + index as i32)?;
+        let buffer = self
+            .transport
+            .alloc(capacity, BufferFlags::HostOnly, group)?;
+        let slot = self.slots[index].len();
+        self.slots[index].push(buffer);
+        Ok(slot)
     }
 
     /// Run the instruction stream in `slot` and wait for it.
@@ -326,6 +470,17 @@ impl<T: Transport> ArrayDesign<T> {
     /// may have written half an output, and half an output read back is a
     /// plausible tensor.
     pub fn dispatch(&mut self, slot: usize) -> Result<(), ArrayError> {
+        let run = self.start_dispatch(slot)?;
+        Self::wait_dispatch(run)
+    }
+
+    /// Start the instruction stream in `slot` without waiting for it.
+    ///
+    /// The returned [`Run`] must be waited on with [`Self::wait_dispatch`]
+    /// before any buffer written by the dispatch is read or reused for another
+    /// dispatch. The data-buffer bindings at the time of this call are the ones
+    /// the dispatch uses.
+    pub fn start_dispatch(&mut self, slot: usize) -> Result<crate::transport::Run, ArrayError> {
         let instr = self.instr.get(slot).ok_or_else(|| {
             ArrayError::Design(format!("{}: no instruction slot {slot}", self.label))
         })?;
@@ -337,6 +492,11 @@ impl<T: Transport> ArrayDesign<T> {
             .collect();
         let words = self.instr_words[slot];
         let run = self.transport.start(instr, words, &args)?;
+        Ok(run)
+    }
+
+    /// Wait for a previously started dispatch to finish.
+    pub fn wait_dispatch(run: crate::transport::Run) -> Result<(), ArrayError> {
         T::wait(&run)?;
         Ok(())
     }
@@ -357,6 +517,40 @@ impl<T: Transport> ArrayDesign<T> {
             )));
         }
         T::sync_from_device(buffer, out.len() as u64, 0)?;
+        T::read(buffer, out, 0)?;
+        Ok(())
+    }
+
+    /// Make the device's writes to the BOUND slot of a data buffer visible to
+    /// the host, without copying them out.
+    pub fn sync_from_device_bound(&self, index: usize, bytes: u64) -> Result<(), ArrayError> {
+        let buffer = &self.slots[index][self.bound[index]];
+        let capacity = T::size(buffer);
+        if bytes > capacity {
+            return Err(ArrayError::Design(format!(
+                "{}: sync_from_device {bytes} bytes of data buffer {index}, and the design allows {capacity}",
+                self.label
+            )));
+        }
+        T::sync_from_device(buffer, bytes, 0)?;
+        Ok(())
+    }
+
+    /// Read from the BOUND slot of a data buffer without synchronising it from
+    /// the device first.
+    ///
+    /// The caller must have made the device's writes visible with
+    /// [`Self::sync_from_device_bound`] (or [`Self::read`]) before calling this.
+    pub fn read_bound_unsynced(&self, index: usize, out: &mut [u8]) -> Result<(), ArrayError> {
+        let buffer = &self.slots[index][self.bound[index]];
+        let capacity = T::size(buffer);
+        if out.len() as u64 > capacity {
+            return Err(ArrayError::Design(format!(
+                "{}: {} bytes out of data buffer {index}, and the design allows {capacity}",
+                self.label,
+                out.len()
+            )));
+        }
         T::read(buffer, out, 0)?;
         Ok(())
     }

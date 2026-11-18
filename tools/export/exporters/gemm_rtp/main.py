@@ -389,11 +389,13 @@ def main() -> int:
         type=int,
         default=None,
         help=(
-            "row capacity of the softmax design built by --npu-ops softm. "
-            "Default: batch*12*seq, which is an embedder's attention. A Whisper "
-            "dispatch is one QUERY CHUNK, so a stt target passes batch*seq: every "
-            "dispatch fills and drains the whole buffer, and a design 12x wider "
-            "than the work syncs 37 MB to move 1.5 MB of scores."
+            "row capacity of the softmax design built by softm. A target passes "
+            "the rows of ONE attention dispatch: batch*seq for stt, and the attn "
+            "streams' M (seq rounded up to m*rows) for an embedder. Every "
+            "dispatch fills and drains the whole buffer, so a design 12x wider "
+            "than the work syncs 12x the traffic. A standalone softmax over all "
+            "batch*heads rows is chunked by the runtime instead. Without a "
+            "target, the historic batch*12*seq default applies."
         ),
     )
 

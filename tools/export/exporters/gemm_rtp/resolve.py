@@ -9,6 +9,7 @@ import argparse
 import copy
 from dataclasses import dataclass
 
+from ..eltwise.consts import SM_ROWS_PER_CALL
 from ..common.consts import (
     AIE_ROWS,
     ARCH_DEVICES,
@@ -421,8 +422,31 @@ def resolve_args(args: argparse.Namespace) -> list[ResolvedArch]:
             ns.sm_cols = n_kv
             ns.sm_variant = "wide"
             # One attention dispatch is one QUERY CHUNK, so the softmax design
-            # needs the chunk and not the model's batch*heads*seq.
-            ns.sm_rows = int(ns.batch) * int(ns.seq)
+            # needs the chunk and not the model's batch*heads*seq. This is true
+            # of Whisper and of every transformer that calls NpuAttention; the
+            # two differ only in what one chunk is. Whisper walks one long
+            # sequence in tiers of `seq` rows, so a chunk is batch*seq. An
+            # embedder calls attention once per SEQUENCE of the batch, so its
+            # chunk is the attn streams' M -- `seq` rounded up to m*rows, the
+            # same number build.py gives attn_qk/attn_av. The old default of
+            # batch*heads*seq made a per-head call fill a design twelve times
+            # its size: measured at 100.59 s against 1.36 s for the same run
+            # without the array's softmax. Chunk-sized capacity puts that work
+            # back in the rows the caller actually has; a standalone softmax
+            # over batch*heads*seq rows is split by run_chunked instead, so it
+            # does the same arithmetic in more, smaller dispatches.
+            if args.sm_rows is not None:
+                ns.sm_rows = args.sm_rows
+            elif kind == "stt":
+                ns.sm_rows = int(ns.batch) * int(ns.seq)
+            else:
+                rows_per_chunk = int(ns.m) * int(ns.rows)
+                chunk = -(-int(ns.seq) // rows_per_chunk) * rows_per_chunk
+                # The wide kernel splits its rows over the design's cores;
+                # round UP to that block so an override of tile_m/rows cannot
+                # hand it a capacity it refuses to build.
+                block = SM_ROWS_PER_CALL * 4 * int(ns.elt_cols or 1)
+                ns.sm_rows = -(-chunk // block) * block
         ns.ln_cols = _pick(args.ln_cols, model_spec.get("layer_norm_cols"),
                            model_spec.get("hidden"), defaults.get("hidden"),
                            FALLBACK_HIDDEN)

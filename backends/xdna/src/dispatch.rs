@@ -11,6 +11,25 @@
 //! dispatch function, each one says which transport it needs, and each one
 //! refuses with a message that says what is missing rather than panicking.
 //!
+//! # WHERE THE REAL EXECUTION LIVES
+//!
+//! None of these functions is on a running model's path. Do not look here for
+//! the code that dispatches a BERT projection or a detector convolution:
+//!
+//! * projections (and the attention's two GEMMs) run through
+//!   [`crate::array_gemms::ArrayGemms`], using the trait seam in
+//!   `npum_model::array::ArrayGemm` / `ArrayText`;
+//! * dense convolutions run through [`crate::array_convs::ArrayConvs`] and
+//!   [`crate::conv`];
+//! * the elementwise designs live in [`crate::eltwise`].
+//!
+//! All of them dispatch through [`crate::array::ArrayDesign`], which is the
+//! only place that allocates, binds and starts buffers. This module is the
+//! OLD layer: it describes the operations the trait knows about, not the
+//! operations the array set actually runs. Filling these stubs in would
+//! duplicate the array path and give the runtime two answers to the same
+//! question; the right change here is to keep them honest refusals.
+//!
 //! # The transport boundary
 //!
 //! Everything below this line is transport-agnostic. `xrt.rs` and

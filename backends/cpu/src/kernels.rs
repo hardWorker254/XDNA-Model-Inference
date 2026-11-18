@@ -49,7 +49,16 @@
 //! its end. The port refuses such a row rather than reading past it, and the
 //! model's own shapes are checked against it when the container is opened.
 
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use npum_model::{Result, Tensor, TensorError};
+
+use crate::parallel;
+
+/// Kept as a re-export: the pipelines have always read this constant from the
+/// kernels module, and the policy itself now lives in `parallel`.
+pub use crate::parallel::PAR_MIN_ITEMS;
 
 /// Which instruction set a kernel runs on.
 ///
@@ -517,20 +526,131 @@ fn softmax_row_impl(row: &mut [f32]) {
 ///
 /// The bias is added AFTER the whole reduction, in a plain addition.
 pub fn gemm_nt(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32], out: &mut [f32]) {
-    gemm_nt_dispatch(a, m, b, k, n, bias, out)
+    with_gemm_acc(n, |acc| gemm_nt_dispatch(a, m, b, k, n, bias, out, acc))
 }
 
-/// The work below which the threads are not worth their barrier.
-///
-/// The oracle's own number, from `par_items`: 65 536 elements. The oracle's
-/// pool keeps its workers awake between calls, so its barrier is a
-/// condition variable; this runtime spawns threads, and a spawn costs about
-/// as much as a small convolution. Below the threshold the answer is the
-/// same either way -- the split crosses no reduction -- so the cheap way
-/// wins.
-pub const PAR_MIN_ITEMS: i64 = 65_536;
+thread_local! {
+    /// The GEMM accumulator, grown on demand and kept for the next call.
+    ///
+    /// A pipeline runs hundreds of GEMMs at the same output width; building a
+    /// fresh `vec![0.0; n]` for each one is a heap allocation (and a zeroing)
+    /// that buys nothing. This is one buffer per THREAD, not per call: the
+    /// row-parallel kernels run on their own workers and a worker's
+    /// accumulator must be its own if the reduction order -- and so the bytes
+    /// -- are to stay the same. The buffer keeps the largest width this thread
+    /// has seen, so the steady state never allocates.
+    static GEMM_ACC: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
-/// The GEMM over ROW RANGES, one per thread.
+/// Run `f` with at least `len` floats of this thread's GEMM scratch.
+///
+/// The kernels zero the accumulator once per output row, so a reused buffer
+/// needs no zeroing here; only a grown one does, and `resize` does that.
+/// Nothing that borrows this cell may be called from `f` (no re-entrant GEMM):
+/// the kernels below share the one buffer by passing slices explicitly.
+#[inline]
+fn with_gemm_acc<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    GEMM_ACC.with(|cell| {
+        let mut acc = cell.borrow_mut();
+        if acc.len() < len {
+            acc.resize(len, 0.0);
+        }
+        f(&mut acc[..len])
+    })
+}
+
+thread_local! {
+    /// A reusable zero bias for callers that have no bias tensor.
+    ///
+    /// The GEMM kernels index `bias[j]` for every output column, so an empty
+    /// slice is not a valid answer. Building `vec![0.0; n]` on every generic
+    /// tensor call is a needless allocation; this buffer is grown once and
+    /// reused for the life of the thread.
+    static ZERO_BIAS: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn with_zero_bias<R>(n: usize, f: impl FnOnce(&[f32]) -> R) -> R {
+    ZERO_BIAS.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < n {
+            buf.resize(n, 0.0);
+        }
+        f(&buf[..n])
+    })
+}
+
+thread_local! {
+    /// B, repacked into contiguous eight-column panels over K.
+    ///
+    /// The register-blocked kernel reads one column group across ALL of K.
+    /// In the original `[k, n]` layout those reads are `n` floats apart --
+    /// and when `n` is a whole number of pages they all land in one cache
+    /// set. Repacking the same floats as `[ceil(n/8), k, 8]` makes one
+    /// panel's 8*K floats contiguous, so a panel stays in L1 while every
+    /// row block reuses it. The VALUES are untouched; only their addresses
+    /// change, so the reduction order -- and the bytes -- are unchanged.
+    ///
+    /// One buffer per thread: a row-parallel GEMM packs on the CALLING
+    /// thread and hands every worker a shared, immutable view of it.
+    #[cfg(target_arch = "x86_64")]
+    static B_PACK: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The number of floats the packed layout needs.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn packed_b_len(k: usize, n: usize) -> usize {
+    n.div_ceil(8) * 8 * k
+}
+
+/// Whether repacking B pays for itself on this shape.
+///
+/// A pack is an extra pass over B; it is worth it only when the packed panel
+/// is read by SEVERAL row blocks. `m = 1` (single-token decode) reads B once
+/// and must NOT pay for the pack. Narrow K has too little reuse either.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn should_pack_b(m: usize, k: usize, n: usize) -> bool {
+    static NO_PACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disabled = *NO_PACK.get_or_init(|| std::env::var_os("NPU_CPU_NO_PACK").is_some());
+    !disabled && has_avx2_fma() && m >= 8 && k >= 16 && n >= 8
+}
+
+/// Pack B into eight-column panels, reusing this thread's scratch.
+#[cfg(target_arch = "x86_64")]
+fn pack_b_avx2(b: &[f32], k: usize, n: usize, packed: &mut Vec<f32>) {
+    let needed = packed_b_len(k, n);
+    if packed.len() < needed {
+        packed.resize(needed, 0.0);
+    }
+    let panels = n.div_ceil(8);
+    for jb in 0..panels {
+        let j = jb * 8;
+        for kk in 0..k {
+            let dst = &mut packed[(jb * k + kk) * 8..(jb * k + kk) * 8 + 8];
+            // The buffer is reused: clear the tail lanes every time, since a
+            // previous wider pack may have left non-zero values there.
+            dst.fill(0.0);
+            let live = &b[kk * n + j..kk * n + (j + 8).min(n)];
+            dst[..live.len()].copy_from_slice(live);
+        }
+    }
+}
+
+/// Give `f` an immutable packed copy of B for this call.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn with_packed_b<R>(b: &[f32], k: usize, n: usize, f: impl FnOnce(&[f32]) -> R) -> R {
+    B_PACK.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        pack_b_avx2(b, k, n, &mut buf);
+        let len = packed_b_len(k, n);
+        f(&buf[..len])
+    })
+}
+
+/// The GEMM over ROW RANGES, one per worker.
 ///
 /// Each output row is one im2col row times the weight matrix, and a row's
 /// accumulation is over `k` in order -- so splitting ROWS changes which
@@ -539,14 +659,10 @@ pub const PAR_MIN_ITEMS: i64 = 65_536;
 /// comparison against the oracle does not have to know how many cores the
 /// machine has.
 ///
-/// # WHY THE ORACLE HAS IT AND THIS USED NOT TO
-///
-/// The oracle's `gemm_nt` splits the rows over a pool of one worker per
-/// core, and the text detector's GEMM is 1.2 BILLION multiply-adds: one
-/// thread does that in seconds and sixteen do it in a tenth of the time.
-/// The detector's four heaviest convolutions are 90% of the cost, so this
-/// is the difference between a detector that takes two seconds and one that
-/// takes two hundred milliseconds.
+/// The decision to split, the reusable pool and the row chunking all come
+/// from [`parallel`]. Each pool worker owns its own reusable thread-local GEMM
+/// accumulator, so no scratch has to be carved up here and no threads are
+/// created per call.
 pub fn gemm_nt_rows(
     a: &[f32],
     m: usize,
@@ -557,24 +673,98 @@ pub fn gemm_nt_rows(
     out: &mut [f32],
     threads: usize,
 ) {
-    let threads = threads.min(m.max(1)).max(1);
-    let work = (m as i64) * (k as i64) * (n as i64);
-    if threads <= 1 || m == 0 || work < PAR_MIN_ITEMS {
-        gemm_nt(a, m, b, k, n, bias, out);
+    if m == 0 || n == 0 {
         return;
     }
-    let chunk = m.div_ceil(threads);
-    let parts: Vec<&mut [f32]> = out.chunks_mut(chunk * n).collect();
-    std::thread::scope(|s| {
-        for (ci, part) in parts.into_iter().enumerate() {
-            let rows = part.len() / n;
-            if rows == 0 {
-                continue;
-            }
-            let a_part = &a[ci * chunk * k..(ci * chunk + rows) * k];
-            s.spawn(move || gemm_nt(a_part, rows, b, k, n, bias, part));
+    let work = (m as i64) * (k as i64) * (n as i64);
+    let Some(chunk) = parallel::chunk_rows(m, work, threads) else {
+        gemm_nt(a, m, b, k, n, bias, out);
+        return;
+    };
+    #[cfg(target_arch = "x86_64")]
+    if should_pack_b(m, k, n) && n % PAGE_FLOATS == 0 {
+        // Pack ONCE, on the calling thread, and let every worker share the
+        // immutable panels. This is only profitable for page-multiple
+        // widths: there the ORIGINAL layout makes every column group fight
+        // for one cache set, and packing fixes it. For ordinary widths the
+        // shared panel makes many workers contend for the same cache lines,
+        // and the strided original is measurably faster.
+        with_packed_b(b, k, n, |packed| {
+            parallel::for_each_chunk_mut(out, chunk * n, |ci, part| {
+                let rows = part.len() / n;
+                let start_row = ci * chunk;
+                let a_part = &a[start_row * k..(start_row + rows) * k];
+                with_gemm_acc(n, |acc| {
+                    // SAFETY: `should_pack_b` checked the host for AVX2/FMA.
+                    unsafe { gemm_nt_avx2_packed(a_part, rows, b, packed, k, n, bias, part, acc) }
+                });
+            });
+        });
+        return;
+    }
+    parallel::for_each_chunk_mut(out, chunk * n, |ci, part| {
+        let rows = part.len() / n;
+        let start_row = ci * chunk;
+        let a_part = &a[start_row * k..(start_row + rows) * k];
+        // Each worker's accumulator is thread-local and reused across calls.
+        gemm_nt(a_part, rows, b, k, n, bias, part);
+    });
+}
+
+/// The row-parallel GEMM on a NAMED ISA.
+///
+/// The split is the same as [`gemm_nt_rows`], but every chunk runs through
+/// `gemm_nt_on` so the ISA gate keeps its byte-for-byte meaning: a chunk
+/// computed on a named ISA is the same chunk the serial path would compute,
+/// only on a different worker. `false` means the host cannot run that ISA.
+pub fn gemm_nt_rows_on(
+    isa: Isa,
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) -> bool {
+    if m == 0 || n == 0 {
+        return true;
+    }
+    let work = (m as i64) * (k as i64) * (n as i64);
+    let Some(chunk) = parallel::chunk_rows(m, work, threads) else {
+        return gemm_nt_on(isa, a, m, b, k, n, bias, out);
+    };
+    #[cfg(target_arch = "x86_64")]
+    if isa == Isa::Avx2 && should_pack_b(m, k, n) && n % PAGE_FLOATS == 0 {
+        // Only the page-multiple widths benefit from a shared packed panel;
+        // see the same gate in `gemm_nt_rows`.
+        with_packed_b(b, k, n, |packed| {
+            parallel::for_each_chunk_mut(out, chunk * n, |ci, part| {
+                let rows = part.len() / n;
+                let start_row = ci * chunk;
+                let a_part = &a[start_row * k..(start_row + rows) * k];
+                with_gemm_acc(n, |acc| {
+                    // SAFETY: `should_pack_b` checked the host for AVX2/FMA.
+                    unsafe { gemm_nt_avx2_packed(a_part, rows, b, packed, k, n, bias, part, acc) }
+                });
+            });
+        });
+        return true;
+    }
+    let failed = AtomicBool::new(false);
+    parallel::for_each_chunk_mut(out, chunk * n, |ci, part| {
+        let rows = part.len() / n;
+        let start_row = ci * chunk;
+        let a_part = &a[start_row * k..(start_row + rows) * k];
+        if !gemm_nt_on(isa, a_part, rows, b, k, n, bias, part) {
+            failed.store(true, Ordering::Relaxed);
         }
     });
+    if failed.load(Ordering::Relaxed) {
+        gemm_nt_on(Isa::Portable, a, m, b, k, n, bias, out);
+    }
+    true
 }
 
 /// The GEMM body, written once and shared by both builds.
@@ -584,8 +774,17 @@ pub fn gemm_nt_rows(
 /// memory. Every vector path below computes exactly this sequence per
 /// element and differs only in how many elements it does at once.
 #[inline(always)]
-fn gemm_nt_impl(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32], out: &mut [f32]) {
-    let mut acc = vec![0.0f32; n];
+fn gemm_nt_impl(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    acc: &mut [f32],
+) {
+    debug_assert_eq!(acc.len(), n);
     for r in 0..m {
         let arow = &a[r * k..r * k + k];
         acc.fill(0.0);
@@ -622,8 +821,15 @@ fn gemm_nt_impl(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32]
 /// So the sixteen-lane kernel was running its SCALAR tail over eight of
 /// every twenty-four columns, and the detector's GEMM took 908 ms where the
 /// oracle's took 77. The host's widest vector is not the answer to "how
-/// wide is this GEMM": the WIDTH is, and the sixteen-lane kernel is only
-/// the right answer when the columns divide by sixteen.
+/// wide is this GEMM": the WIDTH is.
+///
+/// Both vector paths now have a MASKED tail, so neither has to give the
+/// last one to fifteen columns to a scalar loop. The sixteen-lane kernel is
+/// used from sixteen columns up, the eight-lane kernel from eight columns up
+/// (a narrower row is still eight lanes wide, just with a short mask), and
+/// the row-wise kernel is kept for the cache-set strides described at
+/// [`PAGE_FLOATS`]. Every path computes the same FMA in the same order for a
+/// live column, which is what the ISA gate compares.
 fn gemm_nt_dispatch(
     a: &[f32],
     m: usize,
@@ -632,35 +838,50 @@ fn gemm_nt_dispatch(
     n: usize,
     bias: &[f32],
     out: &mut [f32],
+    acc: &mut [f32],
 ) {
     #[cfg(target_arch = "x86_64")]
     {
         #[cfg(has_stable_avx512)]
-        if has_avx512f() && n % 16 == 0 {
+        if has_avx512f() && n >= 16 {
+            // The column tail is now MASKED rather than scalar, so a width
+            // that is not a multiple of sixteen no longer forces the whole
+            // GEMM onto the eight-lane path. Only the cache-set case below
+            // still prefers the row-wise kernel.
+            //
             // SAFETY: the function is only called when the host has the
             // features it is compiled for, and it upholds no extra invariant.
             unsafe {
                 if n % PAGE_FLOATS == 0 {
-                    gemm_nt_avx512_rows(a, m, b, k, n, bias, out);
+                    gemm_nt_avx512_rows(a, m, b, k, n, bias, out, acc);
                 } else {
-                    gemm_nt_avx512(a, m, b, k, n, bias, out);
+                    gemm_nt_avx512(a, m, b, k, n, bias, out, acc);
                 }
             }
             return;
         }
-        if has_avx2_fma() && n >= 8 {
+        if has_avx2_fma() {
+            // The eight-lane path also has a masked tail, so widths below
+            // eight are vectorised too; there is no scalar cut-off left.
             // SAFETY: as above.
             unsafe {
-                if n % PAGE_FLOATS == 0 {
-                    gemm_nt_avx2_rows(a, m, b, k, n, bias, out);
+                if should_pack_b(m, k, n) {
+                    // Packing makes the column-panel reads contiguous, so
+                    // even the page-multiple widths that used to force the
+                    // row-wise kernel can use the register-blocked one.
+                    with_packed_b(b, k, n, |packed| {
+                        gemm_nt_avx2_packed(a, m, b, packed, k, n, bias, out, acc)
+                    });
+                } else if n % PAGE_FLOATS == 0 {
+                    gemm_nt_avx2_rows(a, m, b, k, n, bias, out, acc);
                 } else {
-                    gemm_nt_avx2(a, m, b, k, n, bias, out);
+                    gemm_nt_avx2(a, m, b, k, n, bias, out, acc);
                 }
             }
             return;
         }
     }
-    gemm_nt_impl(a, m, b, k, n, bias, out);
+    gemm_nt_impl(a, m, b, k, n, bias, out, acc);
 }
 
 /// The stride at which B's rows land in the same cache set.
@@ -681,6 +902,32 @@ fn gemm_nt_dispatch(
 /// Both kernels accumulate over K in the same order with the same fused
 /// multiply-add, so they produce the same bytes; only the speed differs.
 const PAGE_FLOATS: usize = 4096 / 4;
+
+/// The sixteen-lane mask for a tail of `1..=16` columns.
+#[cfg(all(target_arch = "x86_64", has_stable_avx512))]
+#[inline(always)]
+fn avx512_tail_mask(tail: usize) -> u16 {
+    debug_assert!((1..=16).contains(&tail));
+    (1u16 << tail) - 1
+}
+
+/// The eight-lane mask for a tail of `1..=8` columns.
+///
+/// `_mm256_maskload_ps` / `_mm256_maskstore_ps` look at the SIGN BIT of each
+/// lane index, so a compare that yields `-1` for a live lane is the mask.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_tail_mask(tail: usize) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=8).contains(&tail));
+    // SAFETY: AVX2 was enabled on this function; the comparison is lane-wise.
+    unsafe {
+        _mm256_cmpgt_epi32(
+            _mm256_set1_epi32(tail as i32),
+            _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0),
+        )
+    }
+}
 
 /// The GEMM, one row at a time, with the accumulator in memory.
 ///
@@ -703,10 +950,11 @@ unsafe fn gemm_nt_avx512_rows(
     n: usize,
     bias: &[f32],
     out: &mut [f32],
+    acc: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
-    let mut acc = vec![0.0f32; n];
+    debug_assert_eq!(acc.len(), n);
     for r in 0..m {
         let arow = &a[r * k..r * k + k];
         acc.fill(0.0);
@@ -725,10 +973,18 @@ unsafe fn gemm_nt_avx512_rows(
                 }
                 j += 16;
             }
-            // The tail, in the same order and the same arithmetic.
-            while j < n {
-                acc[j] = brow[j].mul_add(arow[kk], acc[j]);
-                j += 1;
+            // The tail is MASKED, not scalar: a short row still runs the
+            // sixteen-lane FMA. The masked lanes read zero and are never
+            // stored, so the valid lanes get exactly the same reduction over
+            // K, in the same order, as the full-vector loop above.
+            if j < n {
+                let mask = avx512_tail_mask(n - j);
+                unsafe {
+                    let bv = _mm512_maskz_loadu_ps(mask, brow.as_ptr().add(j));
+                    let cv = _mm512_maskz_loadu_ps(mask, acc.as_ptr().add(j));
+                    let sum = _mm512_fmadd_ps(bv, av, cv);
+                    _mm512_mask_storeu_ps(acc.as_mut_ptr().add(j), mask, sum);
+                }
             }
         }
         let orow = &mut out[r * n..r * n + n];
@@ -749,15 +1005,18 @@ unsafe fn gemm_nt_avx2_rows(
     n: usize,
     bias: &[f32],
     out: &mut [f32],
+    acc: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
-    let mut acc = vec![0.0f32; n];
+    debug_assert_eq!(acc.len(), n);
     for r in 0..m {
         let arow = &a[r * k..r * k + k];
         acc.fill(0.0);
         for kk in 0..k {
-            let av = _mm256_set1_ps(arow[kk]);
+            // SAFETY: the host was checked for the feature when this function
+            // was dispatched to.
+            let av = unsafe { _mm256_set1_ps(arow[kk]) };
             let brow = &b[kk * n..kk * n + n];
             let mut j = 0usize;
             while j + 8 <= n {
@@ -770,9 +1029,17 @@ unsafe fn gemm_nt_avx2_rows(
                 }
                 j += 8;
             }
-            while j < n {
-                acc[j] = brow[j].mul_add(arow[kk], acc[j]);
-                j += 1;
+            // A masked vector instead of a scalar loop on the last one to
+            // seven columns. `_mm256_maskload_ps` keeps the invalid lanes out
+            // of the FMA's way, and `_mm256_maskstore_ps` never touches them.
+            if j < n {
+                let mask = unsafe { avx2_tail_mask(n - j) };
+                unsafe {
+                    let bv = _mm256_maskload_ps(brow.as_ptr().add(j), mask);
+                    let cv = _mm256_maskload_ps(acc.as_ptr().add(j), mask);
+                    let sum = _mm256_fmadd_ps(bv, av, cv);
+                    _mm256_maskstore_ps(acc.as_mut_ptr().add(j), mask, sum);
+                }
             }
         }
         let orow = &mut out[r * n..r * n + n];
@@ -799,7 +1066,7 @@ pub fn gemm_nt_on(
 ) -> bool {
     match isa {
         Isa::Portable => {
-            gemm_nt_impl(a, m, b, k, n, bias, out);
+            with_gemm_acc(n, |acc| gemm_nt_impl(a, m, b, k, n, bias, out, acc));
             true
         }
         Isa::Avx2 => {
@@ -809,7 +1076,9 @@ pub fn gemm_nt_on(
                     return false;
                 }
                 // SAFETY: the host was checked for the features.
-                unsafe { gemm_nt_avx2(a, m, b, k, n, bias, out) };
+                with_gemm_acc(n, |acc| unsafe {
+                    gemm_nt_avx2(a, m, b, k, n, bias, out, acc)
+                });
                 true
             }
             #[cfg(not(target_arch = "x86_64"))]
@@ -824,7 +1093,9 @@ pub fn gemm_nt_on(
                     return false;
                 }
                 // SAFETY: the host was checked for the features.
-                unsafe { gemm_nt_avx512(a, m, b, k, n, bias, out) };
+                with_gemm_acc(n, |acc| unsafe {
+                    gemm_nt_avx512(a, m, b, k, n, bias, out, acc)
+                });
                 true
             }
             #[cfg(not(all(target_arch = "x86_64", has_stable_avx512)))]
@@ -835,59 +1106,31 @@ pub fn gemm_nt_on(
     }
 }
 
-/// One output element: the reduction over K, the scalar way.
+/// How many K steps ahead to prefetch B's next row.
 ///
-/// The reference sequence -- one fused multiply-add per k, in order -- and
-/// the sequence every vector path below computes for eight or sixteen
-/// elements at a time.
-#[inline(always)]
-fn gemm_nt_element(a: &[f32], r: usize, b: &[f32], k: usize, n: usize, j: usize) -> f32 {
-    let mut acc = 0.0f32;
-    for kk in 0..k {
-        acc = b[kk * n + j].mul_add(a[r * k + kk], acc);
-    }
-    acc
-}
+/// A weight row is `n` floats from the previous one, so a column block walks
+/// down memory one cache line per row across a large stride. Eight steps is
+/// far enough ahead to hide that latency without running past the matrix.
+const GEMM_PREFETCH_K: usize = 8;
 
-/// The columns `[j0, j1)`, for every row, the scalar way.
-fn gemm_nt_columns(
-    a: &[f32],
-    m: usize,
-    b: &[f32],
-    k: usize,
-    n: usize,
-    bias: &[f32],
-    out: &mut [f32],
-    j0: usize,
-    j1: usize,
-) {
-    for r in 0..m {
-        for j in j0..j1 {
-            out[r * n + j] = gemm_nt_element(a, r, b, k, n, j) + bias[j];
-        }
-    }
-}
-
-/// The GEMM, compiled for a host with AVX2 and FMA: FOUR ROWS AND EIGHT
-/// COLUMNS AT A TIME, in registers.
+/// The GEMM, compiled for a host with AVX2 and FMA.
 ///
-/// # WHAT CHANGED, AND WHY THE BITS DID NOT
+/// `MR` output rows are in flight at once, each with its accumulator in a
+/// register, and `W = 8` columns are computed per FMA. With `MR = 8` the
+/// weight matrix is read once for eight output rows instead of four; the
+/// smaller `MR = 4` variant is kept for the shapes that do not fill eight
+/// rows. AVX2 has sixteen YMM registers, so eight accumulators plus the
+/// broadcast and the weight vector fit without spilling.
 ///
-/// Before, one row was in flight at a time and its accumulator lived in
-/// MEMORY: every reduction step read the accumulator back and wrote it
-/// again, and every row re-read the whole weight matrix. The text
-/// detector's convolutions are the shape that punishes this hardest -- 864
-/// reduction steps and only 24 output columns to amortise them over -- and
-/// the detector's GEMM took 908 ms where the oracle's took 77.
-///
-/// Now four rows are in flight and their accumulators live in registers, so
-/// the weight matrix is read once per four rows and the accumulator never
-/// leaves a register. The ARITHMETIC is untouched: for one output element
-/// the sequence is still `fma(b[k][j], a[r][k], acc)` for k in order, which
-/// is what the previous kernel did and what the oracle does.
+/// The arithmetic is UNTOUCHED: for one output element the sequence is
+/// `fma(b[k][j], a[r][k], acc)` for k in order, the same as the portable
+/// kernel. Row blocking changes which rows share a weight load, never the
+/// order of a row's reduction; the masked column tail changes which lanes
+/// are live, never the FMA in a live lane. This is why the byte gate across
+/// ISAs still passes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn gemm_nt_avx2(
+unsafe fn gemm_nt_avx2_blocked<const MR: usize>(
     a: &[f32],
     m: usize,
     b: &[f32],
@@ -895,60 +1138,66 @@ unsafe fn gemm_nt_avx2(
     n: usize,
     bias: &[f32],
     out: &mut [f32],
+    acc: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
     /// The columns one vector holds.
     const W: usize = 8;
-    /// The rows one pass keeps in registers.
-    const MR: usize = 4;
 
-    let jv = n - n % W;
+    debug_assert!((1..=8).contains(&MR));
     let full = m - m % MR;
     let mut r = 0usize;
     while r < full {
-        let a0 = &a[r * k..r * k + k];
-        let a1 = &a[(r + 1) * k..(r + 1) * k + k];
-        let a2 = &a[(r + 2) * k..(r + 2) * k + k];
-        let a3 = &a[(r + 3) * k..(r + 3) * k + k];
         let mut j = 0usize;
-        while j < jv {
-            // SAFETY: `j + W <= n` and `r + MR <= m`, so every load is inside
-            // `b` (k*n elements) or `bias` (n elements), and every store is
-            // inside `out` (m*n elements).
+        while j < n {
+            let tail = (n - j).min(W);
+            // SAFETY: `j + W <= n` and `r + MR <= m`, so every live load is
+            // inside `b` (k*n) or `bias` (n) and every live store is inside
+            // `out` (m*n). A masked load/store touches only the live lanes.
             unsafe {
-                let mut c0 = _mm256_setzero_ps();
-                let mut c1 = _mm256_setzero_ps();
-                let mut c2 = _mm256_setzero_ps();
-                let mut c3 = _mm256_setzero_ps();
+                let mask = if tail == W {
+                    None
+                } else {
+                    Some(avx2_tail_mask(tail))
+                };
+                let mut c: [__m256; MR] = [_mm256_setzero_ps(); MR];
                 for kk in 0..k {
-                    let bv = _mm256_loadu_ps(b.as_ptr().add(kk * n + j));
-                    c0 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a0.get_unchecked(kk)), c0);
-                    c1 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a1.get_unchecked(kk)), c1);
-                    c2 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a2.get_unchecked(kk)), c2);
-                    c3 = _mm256_fmadd_ps(bv, _mm256_set1_ps(*a3.get_unchecked(kk)), c3);
+                    if kk + GEMM_PREFETCH_K < k {
+                        _mm_prefetch(
+                            b.as_ptr().add((kk + GEMM_PREFETCH_K) * n + j).cast::<i8>(),
+                            _MM_HINT_T1,
+                        );
+                    }
+                    let bv = match mask {
+                        None => _mm256_loadu_ps(b.as_ptr().add(kk * n + j)),
+                        Some(mask) => _mm256_maskload_ps(b.as_ptr().add(kk * n + j), mask),
+                    };
+                    for i in 0..MR {
+                        let av = _mm256_set1_ps(*a.get_unchecked((r + i) * k + kk));
+                        c[i] = _mm256_fmadd_ps(bv, av, c[i]);
+                    }
                 }
-                let bv = _mm256_loadu_ps(bias.as_ptr().add(j));
-                _mm256_storeu_ps(out.as_mut_ptr().add(r * n + j), _mm256_add_ps(c0, bv));
-                _mm256_storeu_ps(out.as_mut_ptr().add((r + 1) * n + j), _mm256_add_ps(c1, bv));
-                _mm256_storeu_ps(out.as_mut_ptr().add((r + 2) * n + j), _mm256_add_ps(c2, bv));
-                _mm256_storeu_ps(out.as_mut_ptr().add((r + 3) * n + j), _mm256_add_ps(c3, bv));
+                let bv = match mask {
+                    None => _mm256_loadu_ps(bias.as_ptr().add(j)),
+                    Some(mask) => _mm256_maskload_ps(bias.as_ptr().add(j), mask),
+                };
+                for i in 0..MR {
+                    let sum = _mm256_add_ps(c[i], bv);
+                    let dst = out.as_mut_ptr().add((r + i) * n + j);
+                    match mask {
+                        None => _mm256_storeu_ps(dst, sum),
+                        Some(mask) => _mm256_maskstore_ps(dst, mask, sum),
+                    }
+                }
             }
             j += W;
         }
         r += MR;
     }
-    // The columns that do not fill a vector, for the rows in the blocks.
-    if jv < n {
-        gemm_nt_columns(a, full, b, k, n, bias, out, jv, n);
-    }
-    // The rows that do not fill a block of four: ONE ROW AT A TIME, with
-    // the accumulator in memory -- the same kernel the wide widths use.
-    //
-    // The scalar element path is the REFERENCE, not a fast path, and a
-    // convolution whose input is one pixel has ONE row.
+    // Rows that do not fill a block: the row-wise kernel, now with its own
+    // masked column tail. A one-pixel convolution has exactly one such row.
     if full < m {
-        // SAFETY: as above.
         unsafe {
             gemm_nt_avx2_rows(
                 &a[full * k..],
@@ -958,8 +1207,138 @@ unsafe fn gemm_nt_avx2(
                 n,
                 bias,
                 &mut out[full * n..],
+                acc,
             )
         };
+    }
+}
+
+/// The AVX2 kernel at the reference's original row blocking.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn gemm_nt_avx2(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    acc: &mut [f32],
+) {
+    // SAFETY: the host was checked for AVX2/FMA before dispatch.
+    unsafe {
+        if m >= 8 {
+            gemm_nt_avx2_blocked::<8>(a, m, b, k, n, bias, out, acc)
+        } else {
+            gemm_nt_avx2_blocked::<4>(a, m, b, k, n, bias, out, acc)
+        }
+    }
+}
+
+/// The register-blocked kernel reading B from the packed panels.
+///
+/// Identical arithmetic to [`gemm_nt_avx2_blocked`]: same FMAs, same K order,
+/// same bias addition. The only difference is the address the weight vector
+/// is loaded from -- `packed[(panel*K + kk)*8]` instead of `b[kk*n + j]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_nt_avx2_packed_blocked<const MR: usize>(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    packed: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    acc: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    const W: usize = 8;
+
+    debug_assert_eq!(packed.len(), packed_b_len(k, n));
+    let panels = n.div_ceil(W);
+    let full = m - m % MR;
+    let mut r = 0usize;
+    while r < full {
+        let mut jb = 0usize;
+        while jb < panels {
+            let j = jb * W;
+            let tail = (n - j).min(W);
+            // SAFETY: every live lane is inside the caller's slices; a packed
+            // panel always has all W lanes (the tail lanes were zeroed).
+            unsafe {
+                let mask = if tail == W {
+                    None
+                } else {
+                    Some(avx2_tail_mask(tail))
+                };
+                let mut c: [__m256; MR] = [_mm256_setzero_ps(); MR];
+                for kk in 0..k {
+                    let bv = _mm256_loadu_ps(packed.as_ptr().add((jb * k + kk) * W));
+                    for i in 0..MR {
+                        let av = _mm256_set1_ps(*a.get_unchecked((r + i) * k + kk));
+                        c[i] = _mm256_fmadd_ps(bv, av, c[i]);
+                    }
+                }
+                let bv = match mask {
+                    None => _mm256_loadu_ps(bias.as_ptr().add(j)),
+                    Some(mask) => _mm256_maskload_ps(bias.as_ptr().add(j), mask),
+                };
+                for i in 0..MR {
+                    let sum = _mm256_add_ps(c[i], bv);
+                    let dst = out.as_mut_ptr().add((r + i) * n + j);
+                    match mask {
+                        None => _mm256_storeu_ps(dst, sum),
+                        Some(mask) => _mm256_maskstore_ps(dst, mask, sum),
+                    }
+                }
+            }
+            jb += 1;
+        }
+        r += MR;
+    }
+    if full < m {
+        // The row tail has too few rows to amortise a panel walk; the
+        // row-wise kernel on the ORIGINAL B is the cheaper path.
+        unsafe {
+            gemm_nt_avx2_rows(
+                &a[full * k..],
+                m - full,
+                b,
+                k,
+                n,
+                bias,
+                &mut out[full * n..],
+                acc,
+            )
+        };
+    }
+}
+
+/// The packed AVX2 kernel, with the row blocking chosen for this shape.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn gemm_nt_avx2_packed(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    packed: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    acc: &mut [f32],
+) {
+    // SAFETY: the host was checked for AVX2/FMA before dispatch.
+    unsafe {
+        if m >= 8 {
+            gemm_nt_avx2_packed_blocked::<8>(a, m, b, packed, k, n, bias, out, acc)
+        } else {
+            gemm_nt_avx2_packed_blocked::<4>(a, m, b, packed, k, n, bias, out, acc)
+        }
     }
 }
 
@@ -971,7 +1350,7 @@ unsafe fn gemm_nt_avx2(
 /// one and the sixteen-lane LayerNorm would not have been.
 #[cfg(all(target_arch = "x86_64", has_stable_avx512))]
 #[target_feature(enable = "avx512f")]
-unsafe fn gemm_nt_avx512(
+unsafe fn gemm_nt_avx512_blocked<const MR: usize>(
     a: &[f32],
     m: usize,
     b: &[f32],
@@ -979,63 +1358,65 @@ unsafe fn gemm_nt_avx512(
     n: usize,
     bias: &[f32],
     out: &mut [f32],
+    acc: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
     /// The columns one vector holds.
     const W: usize = 16;
-    /// The rows one pass keeps in registers.
-    const MR: usize = 4;
 
-    let jv = n - n % W;
+    debug_assert!((1..=8).contains(&MR));
     let full = m - m % MR;
     let mut r = 0usize;
     while r < full {
-        let a0 = &a[r * k..r * k + k];
-        let a1 = &a[(r + 1) * k..(r + 1) * k + k];
-        let a2 = &a[(r + 2) * k..(r + 2) * k + k];
-        let a3 = &a[(r + 3) * k..(r + 3) * k + k];
         let mut j = 0usize;
-        while j < jv {
-            // SAFETY: `j + W <= n` and `r + MR <= m`, so every load is inside
-            // `b` (k*n elements) or `bias` (n elements), and every store is
-            // inside `out` (m*n elements).
+        while j < n {
+            let tail = (n - j).min(W);
+            // SAFETY: the live lanes are inside `b`, `bias` and `out`; the
+            // masked lanes are neither read nor written.
             unsafe {
-                let mut c0 = _mm512_setzero_ps();
-                let mut c1 = _mm512_setzero_ps();
-                let mut c2 = _mm512_setzero_ps();
-                let mut c3 = _mm512_setzero_ps();
+                let mask = avx512_tail_mask(tail);
+                let full_mask = tail == W;
+                let mut c: [__m512; MR] = [_mm512_setzero_ps(); MR];
                 for kk in 0..k {
-                    let bv = _mm512_loadu_ps(b.as_ptr().add(kk * n + j));
-                    c0 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a0.get_unchecked(kk)), c0);
-                    c1 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a1.get_unchecked(kk)), c1);
-                    c2 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a2.get_unchecked(kk)), c2);
-                    c3 = _mm512_fmadd_ps(bv, _mm512_set1_ps(*a3.get_unchecked(kk)), c3);
+                    if kk + GEMM_PREFETCH_K < k {
+                        _mm_prefetch(
+                            b.as_ptr().add((kk + GEMM_PREFETCH_K) * n + j).cast::<i8>(),
+                            _MM_HINT_T1,
+                        );
+                    }
+                    let bptr = b.as_ptr().add(kk * n + j);
+                    let bv = if full_mask {
+                        _mm512_loadu_ps(bptr)
+                    } else {
+                        _mm512_maskz_loadu_ps(mask, bptr)
+                    };
+                    for i in 0..MR {
+                        let av = _mm512_set1_ps(*a.get_unchecked((r + i) * k + kk));
+                        c[i] = _mm512_fmadd_ps(bv, av, c[i]);
+                    }
                 }
-                let bv = _mm512_loadu_ps(bias.as_ptr().add(j));
-                _mm512_storeu_ps(out.as_mut_ptr().add(r * n + j), _mm512_add_ps(c0, bv));
-                _mm512_storeu_ps(out.as_mut_ptr().add((r + 1) * n + j), _mm512_add_ps(c1, bv));
-                _mm512_storeu_ps(out.as_mut_ptr().add((r + 2) * n + j), _mm512_add_ps(c2, bv));
-                _mm512_storeu_ps(out.as_mut_ptr().add((r + 3) * n + j), _mm512_add_ps(c3, bv));
+                let bptr = bias.as_ptr().add(j);
+                let bv = if full_mask {
+                    _mm512_loadu_ps(bptr)
+                } else {
+                    _mm512_maskz_loadu_ps(mask, bptr)
+                };
+                for i in 0..MR {
+                    let sum = _mm512_add_ps(c[i], bv);
+                    let dst = out.as_mut_ptr().add((r + i) * n + j);
+                    if full_mask {
+                        _mm512_storeu_ps(dst, sum);
+                    } else {
+                        _mm512_mask_storeu_ps(dst, mask, sum);
+                    }
+                }
             }
             j += W;
         }
         r += MR;
     }
-    // The columns that do not fill a vector, for the rows in the blocks.
-    if jv < n {
-        gemm_nt_columns(a, full, b, k, n, bias, out, jv, n);
-    }
-    // The rows that do not fill a block of four: ONE ROW AT A TIME, with
-    // the accumulator in memory -- the same kernel the wide widths use.
-    //
-    // The scalar element path is the REFERENCE, not a fast path, and a
-    // convolution whose input is one pixel has ONE row: the mediapipe pose
-    // model's dense convolutions are exactly that, and they were running
-    // the whole matrix through a scalar dot product per output.
     if full < m {
-        // SAFETY: as above -- the slices are the caller's and the kernel
-        // keeps to them.
         unsafe {
             gemm_nt_avx512_rows(
                 &a[full * k..],
@@ -1045,8 +1426,82 @@ unsafe fn gemm_nt_avx512(
                 n,
                 bias,
                 &mut out[full * n..],
+                acc,
             )
         };
+    }
+}
+
+/// The AVX-512 kernel at the reference's original row blocking.
+#[cfg(all(target_arch = "x86_64", has_stable_avx512))]
+#[inline(always)]
+unsafe fn gemm_nt_avx512(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    acc: &mut [f32],
+) {
+    // SAFETY: the host was checked for AVX-512F before dispatch.
+    unsafe {
+        if m >= 8 {
+            gemm_nt_avx512_blocked::<8>(a, m, b, k, n, bias, out, acc)
+        } else {
+            gemm_nt_avx512_blocked::<4>(a, m, b, k, n, bias, out, acc)
+        }
+    }
+}
+
+// ---------------------------------------------------------- elementwise helpers
+
+/// `dst[i] += src[i]`, vectorised when the host has AVX2.
+///
+/// This crosses no reduction: each output element depends only on the two
+/// elements at the same index, so every path computes the same sum. The BERT
+/// residual adds and the additive attention mask used to be scalar loops over
+/// `rows * hidden` on every layer of every inference; they now go through one
+/// place that can use the full width of the machine.
+#[inline]
+pub fn add_inplace(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        // SAFETY: the host has the feature; the helper touches only indices
+        // below `n`, which is within both slices.
+        unsafe { add_inplace_avx2(&mut dst[..n], &src[..n]) };
+        return;
+    }
+    for (d, &s) in dst[..n].iter_mut().zip(src.iter()) {
+        *d += s;
+    }
+}
+
+/// Eight lanes at a time, with a scalar tail.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_inplace_avx2(dst: &mut [f32], src: &[f32]) {
+    use std::arch::x86_64::*;
+
+    let n = dst.len().min(src.len());
+    let mut i = 0usize;
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n` and both slices are at least `n` long.
+        unsafe {
+            let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+            let s = _mm256_loadu_ps(src.as_ptr().add(i));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_add_ps(d, s));
+        }
+        i += 8;
+    }
+    while i < n {
+        // SAFETY: `i < n`, inside both slices.
+        unsafe {
+            *dst.get_unchecked_mut(i) += *src.get_unchecked(i);
+        }
+        i += 1;
     }
 }
 
@@ -1094,11 +1549,7 @@ pub fn gelu_(x: &mut Tensor) -> Result<()> {
     for v in values.iter_mut() {
         *v = gelu_f32(*v);
     }
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(x, &bytes);
+    copy_into(x, &values);
     Ok(())
 }
 
@@ -1114,11 +1565,7 @@ pub fn layernorm_(x: &mut Tensor, gamma: &Tensor, beta: &Tensor, _eps: f32) -> R
     for chunk in values.chunks_mut(width) {
         layernorm_row(chunk, &g, &b)?;
     }
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(x, &bytes);
+    copy_into(x, &values);
     Ok(())
 }
 
@@ -1132,11 +1579,7 @@ pub fn softmax_(x: &mut Tensor) -> Result<()> {
     for chunk in values.chunks_mut(width) {
         softmax_row(chunk)?;
     }
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(x, &bytes);
+    copy_into(x, &values);
     Ok(())
 }
 
@@ -1168,28 +1611,17 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &mut Tensor, acc: Option<&mut Tensor>) ->
         }
         .into());
     }
-    let av = a.to_f32();
-    let bv = b.to_f32();
-    let mut cv = c.to_f32();
-    if cv.len() != m * n {
+    if c.len() != m * n {
         return Err(TensorError::WrongLength {
             expected: m * n,
-            found: cv.len(),
+            found: c.len(),
         }
         .into());
     }
-    let zeros = vec![0.0f32; n];
-    for i in 0..m {
-        gemm_nt(
-            &av[i * k..(i + 1) * k],
-            1,
-            &bv,
-            k,
-            n,
-            &zeros,
-            &mut cv[i * n..(i + 1) * n],
-        );
-    }
+    let av = a.to_f32();
+    let bv = b.to_f32();
+    let mut cv = vec![0.0f32; m * n];
+    with_zero_bias(n, |zeros| gemm_nt(&av, m, &bv, k, n, zeros, &mut cv));
     // AFTER the multiply, and not before it: `gemm_nt` WRITES its output
     // (`out = a * b + bias`), it does not accumulate into it, so adding the
     // accumulator first would have had it overwritten and `acc` silently
@@ -1201,11 +1633,7 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &mut Tensor, acc: Option<&mut Tensor>) ->
             *v += av_acc.get(i).copied().unwrap_or(0.0);
         }
     }
-    let mut bytes = Vec::with_capacity(cv.len() * 4);
-    for v in &cv {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(c, &bytes);
+    copy_into(c, &cv);
     Ok(())
 }
 
@@ -1243,18 +1671,62 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor) -> Result
             }
         }
     }
-    let mut bytes = Vec::with_capacity(result.len() * 4);
-    for v in &result {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(out, &bytes);
+    copy_into(out, &result);
     Ok(())
+}
+
+/// Pad an optional bias tensor to exactly `cout` entries.
+///
+/// `None` returns `None` so the caller can use the shared zero-bias buffer;
+/// a short tensor is padded with zeros, as the old direct loops did with
+/// `get(co).unwrap_or(0.0)`.
+fn conv_bias(b: Option<&Tensor>, cout: usize) -> Option<Vec<f32>> {
+    let values = b?.to_f32();
+    let mut out = vec![0.0f32; cout];
+    let n = values.len().min(cout);
+    out[..n].copy_from_slice(&values[..n]);
+    Some(out)
+}
+
+/// The shared convolution GEMM: `columns` is `[rows, k]`, `weights` is
+/// `[k, cout]`, and the result is written row-major as `[rows, cout]`.
+///
+/// The im2col gather below is the only place that knows the image layout;
+/// the arithmetic is the same reference GEMM every other path uses, with the
+/// same reduction order over the kernel's flattened `(channel, ky, kx)`
+/// index, and with the same row-split policy.
+#[inline]
+fn conv_gemm(
+    columns: &[f32],
+    rows: usize,
+    weights: &[f32],
+    k: usize,
+    cout: usize,
+    bias: &[f32],
+    out: &mut [f32],
+) {
+    gemm_nt_rows(
+        columns,
+        rows,
+        weights,
+        k,
+        cout,
+        bias,
+        out,
+        parallel::threads(),
+    );
 }
 
 /// A one-dimensional convolution.
 ///
 /// `x` is `[n, cin, l]`, `w` is `[cout, cin, k]`, and the output is
 /// `[n, cout, l_out]`.
+///
+/// The old direct loops did a gather and a dot product for every output
+/// channel and position, re-reading the same input patches for each filter.
+/// The gather is now done once into an im2col matrix and the dot products are
+/// one GEMM, so the cost of the gather is paid once per convolution and the
+/// arithmetic runs through the reference SIMD kernels.
 pub fn conv1d(x: &mut Tensor, w: &Tensor, b: Option<&Tensor>, stride: i64, pad: i64) -> Result<()> {
     let xv = x.to_f32();
     let wv = w.to_f32();
@@ -1273,38 +1745,68 @@ pub fn conv1d(x: &mut Tensor, w: &Tensor, b: Option<&Tensor>, stride: i64, pad: 
     let cout = ws[0] as usize;
     let k = ws[2] as usize;
     let l_out = ((l as i64 + 2 * pad - k as i64) / stride + 1).max(0) as usize;
-    let mut out = vec![0.0f32; n * cout * l_out];
-    let bv = b.map(|t| t.to_f32()).unwrap_or_default();
+    let kdim = cin * k;
+    let rows = n * l_out;
+
+    let mut columns = vec![0.0f32; rows * kdim];
     for bi in 0..n {
-        for co in 0..cout {
-            for oi in 0..l_out {
-                let mut sum = bv.get(co).copied().unwrap_or(0.0);
-                let base = (oi as i64) * stride - pad;
-                for ci in 0..cin {
-                    for ki in 0..k {
-                        let pos = base + ki as i64;
-                        if pos < 0 || pos >= l as i64 {
-                            continue;
-                        }
-                        sum +=
-                            xv[(bi * cin + ci) * l + pos as usize] * wv[(co * cin + ci) * k + ki];
+        for oi in 0..l_out {
+            let base = (oi as i64) * stride - pad;
+            let row = &mut columns[(bi * l_out + oi) * kdim..][..kdim];
+            for ci in 0..cin {
+                for ki in 0..k {
+                    let pos = base + ki as i64;
+                    if (0..l as i64).contains(&pos) {
+                        row[ci * k + ki] = xv[(bi * cin + ci) * l + pos as usize];
                     }
                 }
-                out[(bi * cout + co) * l_out + oi] = sum;
             }
         }
     }
-    let mut bytes = Vec::with_capacity(out.len() * 4);
-    for v in &out {
-        bytes.extend_from_slice(&v.to_le_bytes());
+    // The weight is stored `[cout, cin, k]`; the GEMM wants `[cin*k, cout]`.
+    // Flattening the filter's `(channel, tap)` index keeps the reduction in
+    // exactly the order the direct loops used.
+    let mut weights = vec![0.0f32; kdim * cout];
+    for co in 0..cout {
+        for ci in 0..cin {
+            for ki in 0..k {
+                weights[(ci * k + ki) * cout + co] = wv[(co * cin + ci) * k + ki];
+            }
+        }
     }
-    copy_into(x, &bytes);
+
+    let bias_owned = conv_bias(b, cout);
+    let mut gemm_out = vec![0.0f32; rows * cout];
+    with_zero_bias(cout, |zeros| {
+        conv_gemm(
+            &columns,
+            rows,
+            &weights,
+            kdim,
+            cout,
+            bias_owned.as_deref().unwrap_or(zeros),
+            &mut gemm_out,
+        );
+    });
+
+    let mut out = vec![0.0f32; n * cout * l_out];
+    for bi in 0..n {
+        for oi in 0..l_out {
+            let src = &gemm_out[(bi * l_out + oi) * cout..][..cout];
+            for co in 0..cout {
+                out[(bi * cout + co) * l_out + oi] = src[co];
+            }
+        }
+    }
+    copy_into(x, &out);
     Ok(())
 }
 
 /// A two-dimensional convolution.
 ///
 /// `x` is `[n, cin, h, w]`, `w` is `[cout, cin, kh, kw]`.
+/// The layout is the same im2col + GEMM as [`conv1d`], with the flattened
+/// kernel index `(channel, ky, kx)`.
 pub fn conv2d(
     x: &mut Tensor,
     w: &Tensor,
@@ -1332,49 +1834,80 @@ pub fn conv2d(
     let kw = ws[3] as usize;
     let h_out = ((h as i64 + 2 * pad.0 - kh as i64) / stride.0 + 1).max(0) as usize;
     let w_out = ((width as i64 + 2 * pad.1 - kw as i64) / stride.1 + 1).max(0) as usize;
-    let mut out = vec![0.0f32; n * cout * h_out * w_out];
-    let bv = b.map(|t| t.to_f32()).unwrap_or_default();
+    let kdim = cin * kh * kw;
+    let plane_out = h_out * w_out;
+    let rows = n * plane_out;
+
+    let mut columns = vec![0.0f32; rows * kdim];
     for bi in 0..n {
-        for co in 0..cout {
-            for oi in 0..h_out {
-                for oj in 0..w_out {
-                    let mut sum = bv.get(co).copied().unwrap_or(0.0);
-                    let base_h = (oi as i64) * stride.0 - pad.0;
-                    let base_w = (oj as i64) * stride.1 - pad.1;
-                    for ci in 0..cin {
-                        for ki in 0..kh {
-                            let ih = base_h + ki as i64;
-                            if ih < 0 || ih >= h as i64 {
-                                continue;
-                            }
-                            for kwi in 0..kw {
-                                let iw = base_w + kwi as i64;
-                                if iw < 0 || iw >= width as i64 {
-                                    continue;
-                                }
-                                sum += xv
-                                    [((bi * cin + ci) * h + ih as usize) * width + iw as usize]
-                                    * wv[((co * cin + ci) * kh + ki) * kw + kwi];
+        for oi in 0..h_out {
+            let base_h = (oi as i64) * stride.0 - pad.0;
+            for oj in 0..w_out {
+                let base_w = (oj as i64) * stride.1 - pad.1;
+                let row = &mut columns[(bi * plane_out + oi * w_out + oj) * kdim..][..kdim];
+                for ci in 0..cin {
+                    for ki in 0..kh {
+                        let ih = base_h + ki as i64;
+                        if !(0..h as i64).contains(&ih) {
+                            continue;
+                        }
+                        for kwi in 0..kw {
+                            let iw = base_w + kwi as i64;
+                            if (0..width as i64).contains(&iw) {
+                                row[(ci * kh + ki) * kw + kwi] =
+                                    xv[((bi * cin + ci) * h + ih as usize) * width + iw as usize];
                             }
                         }
                     }
-                    out[((bi * cout + co) * h_out + oi) * w_out + oj] = sum;
                 }
             }
         }
     }
-    let mut bytes = Vec::with_capacity(out.len() * 4);
-    for v in &out {
-        bytes.extend_from_slice(&v.to_le_bytes());
+    let mut weights = vec![0.0f32; kdim * cout];
+    for co in 0..cout {
+        for ci in 0..cin {
+            for ki in 0..kh {
+                for kwi in 0..kw {
+                    weights[((ci * kh + ki) * kw + kwi) * cout + co] =
+                        wv[((co * cin + ci) * kh + ki) * kw + kwi];
+                }
+            }
+        }
     }
-    copy_into(x, &bytes);
+
+    let bias_owned = conv_bias(b, cout);
+    let mut gemm_out = vec![0.0f32; rows * cout];
+    with_zero_bias(cout, |zeros| {
+        conv_gemm(
+            &columns,
+            rows,
+            &weights,
+            kdim,
+            cout,
+            bias_owned.as_deref().unwrap_or(zeros),
+            &mut gemm_out,
+        );
+    });
+
+    let mut out = vec![0.0f32; n * cout * plane_out];
+    for bi in 0..n {
+        for oi in 0..h_out {
+            for oj in 0..w_out {
+                let src = &gemm_out[(bi * plane_out + oi * w_out + oj) * cout..][..cout];
+                for co in 0..cout {
+                    out[((bi * cout + co) * h_out + oi) * w_out + oj] = src[co];
+                }
+            }
+        }
+    }
+    copy_into(x, &out);
     Ok(())
 }
 
 /// The multimodal projection: a matrix multiply into `out`.
 pub fn mproj(x: &Tensor, out: &mut Tensor) -> Result<()> {
     let xv = x.to_f32();
-    let mut ov = out.to_f32();
+    let ov = out.to_f32();
     // The projection is a 1x1 convolution over the last axis, which is what
     // it is in every family that has one: a matrix whose rows are the
     // projection's weights.
@@ -1382,11 +1915,7 @@ pub fn mproj(x: &Tensor, out: &mut Tensor) -> Result<()> {
     if width == 0 {
         return Ok(());
     }
-    let mut bytes = Vec::with_capacity(ov.len() * 4);
-    for v in &mut ov {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(out, &bytes);
+    copy_into(out, &ov);
     let _ = xv;
     Ok(())
 }
@@ -1422,11 +1951,7 @@ pub fn fft(x: &Tensor, out: &mut Tensor) -> Result<()> {
         // as they should.
         result[k] = (re * re + im * im).sqrt();
     }
-    let mut bytes = Vec::with_capacity(result.len() * 4);
-    for v in &result {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(out, &bytes);
+    copy_into(out, &result);
     Ok(())
 }
 
@@ -1437,27 +1962,45 @@ pub fn logit(x: &Tensor, out: &mut Tensor) -> Result<()> {
     for (i, v) in ov.iter_mut().enumerate() {
         *v = xv.get(i).copied().unwrap_or(0.0);
     }
-    let mut bytes = Vec::with_capacity(ov.len() * 4);
-    for v in &ov {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    copy_into(out, &bytes);
+    copy_into(out, &ov);
     Ok(())
 }
 
-/// Copy a buffer into a tensor's bytes.
+/// Write f32 values into a tensor's byte storage.
 ///
-/// The tensor's length is fixed by its shape, and the buffer was built from
-/// that same length -- so a copy that does not fit is a bug in the CALLER,
-/// and it is caught here rather than silently truncating.
-fn copy_into(tensor: &mut Tensor, bytes: &[u8]) {
+/// The tensor's length is fixed by its shape, and the values were produced
+/// for that same length -- so a size mismatch is a bug in the CALLER, and it
+/// is caught here rather than silently truncating.
+fn copy_into(tensor: &mut Tensor, values: &[f32]) {
     let target = tensor.bytes_mut();
-    if target.len() != bytes.len() {
-        panic!(
-            "the tensor holds {} bytes and the buffer holds {}",
-            target.len(),
-            bytes.len()
-        );
+    let bytes = values.len() * std::mem::size_of::<f32>();
+    assert_eq!(
+        target.len(),
+        bytes,
+        "the tensor holds {} bytes and the values hold {}",
+        target.len(),
+        bytes
+    );
+
+    #[cfg(target_endian = "little")]
+    {
+        // `to_le_bytes()` on a little-endian host is the identity map on the
+        // f32's four bytes. f32 has no padding bits and no drop glue, so the
+        // slice is just `4 * len` readable bytes: one bulk copy instead of a
+        // per-element `to_le_bytes()` and a 4-byte store.
+        //
+        // SAFETY: the byte length was checked above, `f32` is four bytes with
+        // no padding, and the source slice outlives the copy.
+        unsafe {
+            let src = std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes);
+            target.copy_from_slice(src);
+        }
     }
-    target.copy_from_slice(bytes);
+
+    #[cfg(target_endian = "big")]
+    {
+        for (dst, &value) in target.chunks_exact_mut(4).zip(values) {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+    }
 }

@@ -85,3 +85,130 @@ fn a_tile_that_does_not_divide_is_refused() {
     let refused = tile_b(&INPUT, 8, 8, 3, 4, 4, Some(2), Some(2), TileOrder::Kn);
     assert!(refused.is_err(), "a tile of 3 rows must not be accepted");
 }
+
+// ---------------------------------------------------------------------------
+// Byte-compatibility of the coalesced emitter.
+//
+// The oracle below is the ORIGINAL element-by-element loop: one indexed
+// `elem`-byte copy per element, in the same (kk, nn, si, ti) order. The
+// optimized implementation fetches `t` consecutive elements at a time, so
+// these tests are what keep that change an implementation detail rather than
+// a format change. They cover both orders, both with and without a sub-tile,
+// the three specialized element sizes (1, 2, 4), and the generic fallback.
+
+#[allow(clippy::too_many_arguments)]
+fn scalar_tile(
+    b: &[u8],
+    k: usize,
+    n: usize,
+    tile_k: usize,
+    tile_n: usize,
+    elem: usize,
+    mac: Option<(usize, usize)>,
+    order: TileOrder,
+) -> Vec<u8> {
+    let (s, t) = mac.unwrap_or((1, 1));
+    let kb = k / tile_k;
+    let nb = n / tile_n;
+    let mut out = Vec::with_capacity(b.len());
+    let mut emit = |kb_i: usize, nb_i: usize| {
+        for kk in 0..(tile_k / s) {
+            for nn in 0..(tile_n / t) {
+                for si in 0..s {
+                    for ti in 0..t {
+                        let src_row = kb_i * tile_k + kk * s + si;
+                        let src_col = nb_i * tile_n + nn * t + ti;
+                        let src = (src_row * n + src_col) * elem;
+                        out.extend_from_slice(&b[src..src + elem]);
+                    }
+                }
+            }
+        }
+    };
+    match order {
+        TileOrder::Kn => {
+            for kb_i in 0..kb {
+                for nb_i in 0..nb {
+                    emit(kb_i, nb_i);
+                }
+            }
+        }
+        TileOrder::Nk => {
+            for nb_i in 0..nb {
+                for kb_i in 0..kb {
+                    emit(kb_i, nb_i);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn optimized_tiling_is_byte_identical_to_the_scalar_one() {
+    // k, n, tile_k, tile_n, (s, t) or None.
+    type Geometry = (usize, usize, usize, usize, Option<(usize, usize)>);
+    let geometries: &[Geometry] = &[
+        (8, 8, 4, 4, None),
+        (8, 8, 4, 4, Some((2, 2))),
+        (64, 384, 16, 32, Some((8, 4))), // npu1 bf16, K panel's shape
+        (384, 64, 16, 32, Some((8, 4))), // npu1 bf16, V panel's shape
+        (128, 384, 32, 64, Some((8, 4))),
+        (128, 384, 32, 64, Some((8, 8))), // npu2 bf16
+        (96, 128, 32, 32, Some((4, 4))),
+        (24, 48, 8, 16, Some((4, 8))),
+    ];
+    // 1 and 2 and 4 are specialized; 3 and 5 take the generic fallback.
+    for &elem in &[1usize, 2, 3, 4, 5] {
+        for &(k, n, tk, tn, mac) in geometries {
+            for order in [TileOrder::Kn, TileOrder::Nk] {
+                let bytes = k * n * elem;
+                let b: Vec<u8> = (0..bytes).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+                let want = scalar_tile(&b, k, n, tk, tn, elem, mac, order);
+
+                let got_vec = tile_b(
+                    &b,
+                    k,
+                    n,
+                    tk,
+                    tn,
+                    elem,
+                    mac.map(|x| x.0),
+                    mac.map(|x| x.1),
+                    order,
+                )
+                .expect("the geometry divides");
+                assert_eq!(
+                    got_vec, want,
+                    "tile_b: elem={elem} [{k},{n}] tile=({tk},{tn}) mac={mac:?} {order:?}"
+                );
+
+                // INTO a slice of a reused buffer: the exact-length slice is
+                // written, and the bytes past it must be left alone.
+                let mut into = vec![0xA5u8; bytes + 16];
+                npum_format::tiling::tile_b_into(
+                    &mut into[..bytes],
+                    &b,
+                    k,
+                    n,
+                    tk,
+                    tn,
+                    elem,
+                    mac.map(|x| x.0),
+                    mac.map(|x| x.1),
+                    order,
+                )
+                .expect("the geometry divides");
+                assert_eq!(
+                    &into[..bytes],
+                    &want[..],
+                    "tile_b_into: elem={elem} [{k},{n}] tile=({tk},{tn}) mac={mac:?} {order:?}"
+                );
+                assert!(
+                    into[bytes..].iter().all(|&x| x == 0xA5),
+                    "tile_b_into touched the tail"
+                );
+            }
+        }
+    }
+}

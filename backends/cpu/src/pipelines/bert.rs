@@ -234,6 +234,100 @@ impl BertSpec {
     }
 }
 
+/// Reusable buffers for a BERT forward pass.
+///
+/// The forward pass touches several large scratch buffers whose sizes depend
+/// on `batch * seq` (and the model's shapes). Allocating them on every call
+/// is measurable for server and batched workloads, so a caller that runs the
+/// same model repeatedly can keep one workspace and let the methods below
+/// grow it as needed.
+#[derive(Debug, Clone, Default)]
+pub struct BertWorkspace {
+    x: Vec<f32>,
+    add_mask: Vec<f32>,
+    attn_mask: Vec<f32>,
+    qkv: Vec<f32>,
+    ctx: Vec<f32>,
+    proj: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    scores: Vec<f32>,
+    pool_acc: Vec<f64>,
+}
+
+impl BertWorkspace {
+    /// A fresh, empty workspace.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn ensure(&mut self, spec: &BertSpec, batch: usize, seq: usize) {
+        let rows = batch * seq;
+        let hidden = spec.hidden;
+        Self::grow_f32(&mut self.x, rows * hidden);
+        Self::grow_f32(&mut self.add_mask, rows);
+        Self::grow_f32(&mut self.attn_mask, rows);
+        Self::grow_f32(&mut self.qkv, rows * 3 * hidden);
+        Self::grow_f32(&mut self.ctx, rows * hidden);
+        Self::grow_f32(&mut self.proj, rows * hidden);
+        Self::grow_f32(&mut self.up, rows * spec.ffn);
+        Self::grow_f32(&mut self.down, rows * hidden);
+        Self::grow_f64(&mut self.pool_acc, hidden);
+    }
+
+    fn ensure_scores(&mut self, score_rows: usize, sc_cols: usize) {
+        Self::grow_f32(&mut self.scores, score_rows.saturating_mul(sc_cols));
+    }
+
+    /// Grow a scratch buffer without zeroing the new tail.
+    ///
+    /// # SAFETY: why the unwritten tail is never read
+    ///
+    /// Every field of `BertWorkspace` is a scratch buffer whose used range is
+    /// defined by the current batch and sequence, and every pass writes that
+    /// range in full BEFORE any pass reads it:
+    ///
+    /// * `x` -- the embedding loop writes all `rows * hidden` values; the
+    ///   residual adds, both LayerNorms and the pooling only read what was
+    ///   written.
+    /// * `add_mask` / `attn_mask` -- both are assigned for every row in the
+    ///   mask loop before the forward pass.
+    /// * `qkv`, `proj`, `up`, `down` -- GEMMs write their entire output range.
+    /// * `ctx` -- the host's `av` zeroes each head's slice with `o.fill(0.0)`
+    ///   before accumulating into it; the array's attention writes its whole
+    ///   output.
+    /// * `scores` -- `qk` writes the `seq` real keys and fills the padded tail
+    ///   with `-1e30`; on the array path the buffer is not read at all.
+    /// * `pool_acc` -- `pool_into` starts every batch with `acc.fill(0.0)`.
+    ///
+    /// Callers always slice to the logical length (`[..rows * hidden]`,
+    /// `[..score_rows * sc_cols]`, `[..hidden]`), so a buffer left longer than
+    /// the current batch is never observed. `f32`/`f64` have no drop glue and
+    /// accept every bit pattern; `reserve` guarantees the allocation exists
+    /// before `set_len` publishes it.
+    ///
+    /// Shrinking is a no-op: the bytes stay allocated and are overwritten on
+    /// the next, larger batch instead of being zero-filled and reallocated.
+    #[inline]
+    fn grow_f32(buf: &mut Vec<f32>, len: usize) {
+        if buf.len() < len {
+            buf.reserve(len - buf.len());
+            // SAFETY: see the audit above; the published range is written in
+            // full before it is read.
+            unsafe { buf.set_len(len) };
+        }
+    }
+
+    #[inline]
+    fn grow_f64(buf: &mut Vec<f64>, len: usize) {
+        if buf.len() < len {
+            buf.reserve(len - buf.len());
+            // SAFETY: see the audit above.
+            unsafe { buf.set_len(len) };
+        }
+    }
+}
+
 /// A GEMM operand as the host reads it: `[K, N]` in f32, row-major.
 ///
 /// # THE CONTAINER STORES IT TWO WAYS
@@ -353,6 +447,8 @@ pub struct LayerWeights {
     pub ln1_gamma: Vec<f32>,
     /// The first LayerNorm's offset.
     pub ln1_beta: Vec<f32>,
+    /// The first LayerNorm's gain and offset concatenated, `[gamma | beta]`.
+    pub ln1_params: Vec<f32>,
     /// The FFN's up projection, `[hidden, ffn]`.
     pub ffn_up: Vec<f32>,
     /// The FFN's up bias.
@@ -365,6 +461,8 @@ pub struct LayerWeights {
     pub ln2_gamma: Vec<f32>,
     /// The second LayerNorm's offset.
     pub ln2_beta: Vec<f32>,
+    /// The second LayerNorm's gain and offset concatenated, `[gamma | beta]`.
+    pub ln2_params: Vec<f32>,
 }
 
 /// The model's weights, read out of a container.
@@ -380,6 +478,8 @@ pub struct BertWeights {
     pub ln_gamma: Vec<f32>,
     /// The embedding LayerNorm's offset.
     pub ln_beta: Vec<f32>,
+    /// The embedding LayerNorm's gain and offset concatenated, `[gamma | beta]`.
+    pub ln_params: Vec<f32>,
     /// The layers, in order.
     pub layers: Vec<LayerWeights>,
 }
@@ -391,6 +491,10 @@ pub struct BertModel {
     pub spec: BertSpec,
     /// The weights.
     pub weights: BertWeights,
+    gemm_names_qkv: Vec<String>,
+    gemm_names_attn_out: Vec<String>,
+    gemm_names_ffn_up: Vec<String>,
+    gemm_names_ffn_down: Vec<String>,
 }
 
 impl BertModel {
@@ -479,10 +583,31 @@ impl BertModel {
             hidden,
         )?;
         let ln_beta = expect("embeddings.ln.bias", read("embeddings.ln.bias")?, hidden)?;
+        let ln_params = layernorm_params(&ln_gamma, &ln_beta);
 
         let mut layers = Vec::with_capacity(spec.layers);
         for l in 0..spec.layers {
             let p = format!("layer.{l}");
+            let ln1_gamma = expect(
+                &format!("{p}.ln1.weight"),
+                read(&format!("{p}.ln1.weight"))?,
+                hidden,
+            )?;
+            let ln1_beta = expect(
+                &format!("{p}.ln1.bias"),
+                read(&format!("{p}.ln1.bias"))?,
+                hidden,
+            )?;
+            let ln2_gamma = expect(
+                &format!("{p}.ln2.weight"),
+                read(&format!("{p}.ln2.weight"))?,
+                hidden,
+            )?;
+            let ln2_beta = expect(
+                &format!("{p}.ln2.bias"),
+                read(&format!("{p}.ln2.bias"))?,
+                hidden,
+            )?;
             layers.push(LayerWeights {
                 qkv: expect(
                     &format!("{p}.qkv"),
@@ -504,16 +629,9 @@ impl BertModel {
                     read(&format!("{p}.attn_out.bias"))?,
                     hidden,
                 )?,
-                ln1_gamma: expect(
-                    &format!("{p}.ln1.weight"),
-                    read(&format!("{p}.ln1.weight"))?,
-                    hidden,
-                )?,
-                ln1_beta: expect(
-                    &format!("{p}.ln1.bias"),
-                    read(&format!("{p}.ln1.bias"))?,
-                    hidden,
-                )?,
+                ln1_params: layernorm_params(&ln1_gamma, &ln1_beta),
+                ln1_gamma,
+                ln1_beta,
                 ffn_up: expect(
                     &format!("{p}.ffn_up"),
                     read_operand(&format!("{p}.ffn_up"))?,
@@ -534,18 +652,22 @@ impl BertModel {
                     read(&format!("{p}.ffn_down.bias"))?,
                     hidden,
                 )?,
-                ln2_gamma: expect(
-                    &format!("{p}.ln2.weight"),
-                    read(&format!("{p}.ln2.weight"))?,
-                    hidden,
-                )?,
-                ln2_beta: expect(
-                    &format!("{p}.ln2.bias"),
-                    read(&format!("{p}.ln2.bias"))?,
-                    hidden,
-                )?,
+                ln2_params: layernorm_params(&ln2_gamma, &ln2_beta),
+                ln2_gamma,
+                ln2_beta,
             });
         }
+
+        let gemm_names_qkv = (0..spec.layers).map(|i| format!("layer.{i}.qkv")).collect();
+        let gemm_names_attn_out = (0..spec.layers)
+            .map(|i| format!("layer.{i}.attn_out"))
+            .collect();
+        let gemm_names_ffn_up = (0..spec.layers)
+            .map(|i| format!("layer.{i}.ffn_up"))
+            .collect();
+        let gemm_names_ffn_down = (0..spec.layers)
+            .map(|i| format!("layer.{i}.ffn_down"))
+            .collect();
 
         Ok(Self {
             spec,
@@ -555,8 +677,13 @@ impl BertModel {
                 token_type,
                 ln_gamma,
                 ln_beta,
+                ln_params,
                 layers,
             },
+            gemm_names_qkv,
+            gemm_names_attn_out,
+            gemm_names_ffn_up,
+            gemm_names_ffn_down,
         })
     }
 
@@ -666,8 +793,85 @@ impl BertModel {
         batch: usize,
         seq: usize,
         array: ArrayTextRef<'_, '_>,
-        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<f32>> {
+        let mut ws = BertWorkspace::new();
+        let mut out = vec![0.0f32; batch * self.spec.hidden];
+        self.embed_timed_with_into(
+            ops, timings, ids, mask, batch, seq, array, eltwise, &mut ws, &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Embed a batch, reusing `workspace` and writing pooled vectors into `out`.
+    ///
+    /// `out` is resized to `batch * hidden`.
+    pub fn embed_into(
+        &self,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        ops: &mut dyn Ops,
+        array: ArrayTextRef<'_, '_>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        workspace: &mut BertWorkspace,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        let mut timings = Timings::default();
+        self.embed_timed_with_into(
+            ops,
+            &mut timings,
+            ids,
+            mask,
+            batch,
+            seq,
+            array,
+            eltwise,
+            workspace,
+            out,
+        )
+    }
+
+    /// Embed a batch, reusing `workspace`, writing pooled vectors into `out`,
+    /// and reporting where the time went.
+    ///
+    /// `out` is resized to `batch * hidden`.
+    pub fn embed_timed_into(
+        &self,
+        timings: &mut Timings,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        ops: &mut dyn Ops,
+        array: ArrayTextRef<'_, '_>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        workspace: &mut BertWorkspace,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.embed_timed_with_into(
+            ops, timings, ids, mask, batch, seq, array, eltwise, workspace, out,
+        )
+    }
+
+    /// Embed a batch, reusing `workspace`, with the arithmetic going through `ops`.
+    ///
+    /// This is the core implementation: scratch buffers come from `workspace`
+    /// and pooled vectors are written into `out` (`batch * hidden`).
+    pub fn embed_timed_with_into(
+        &self,
+        ops: &mut dyn Ops,
+        timings: &mut Timings,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        array: ArrayTextRef<'_, '_>,
+        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        workspace: &mut BertWorkspace,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         let rows = batch * seq;
         if ids.len() != rows || mask.len() != rows {
             return Err(Error::WrongInput {
@@ -686,38 +890,40 @@ impl BertModel {
             });
         }
         let hidden = self.spec.hidden;
+        workspace.ensure(&self.spec, batch, seq);
+        if out.len() != batch * hidden {
+            out.resize(batch * hidden, 0.0);
+        }
 
         // 1. The embeddings: the token, the position and the token type,
         //    added in that order.
-        let mut x = vec![0.0f32; rows * hidden];
         for r in 0..rows {
             let s = r % seq;
             let id = ids[r] as usize;
             let wv = &self.weights.word[id * hidden..id * hidden + hidden];
             let pv = &self.weights.position[s * hidden..s * hidden + hidden];
             let tv = &self.weights.token_type[..hidden];
-            let dst = &mut x[r * hidden..(r + 1) * hidden];
+            let dst = &mut workspace.x[r * hidden..(r + 1) * hidden];
             for c in 0..hidden {
                 dst[c] = wv[c] + pv[c] + tv[c];
             }
         }
 
         // 2. The additive mask: 0 for a real token, -1e30 for padding.
-        let mut add_mask = vec![0.0f32; rows];
-        let mut attn_mask = vec![0.0f32; rows];
         for r in 0..rows {
             if mask[r] > 0 {
-                attn_mask[r] = 1.0;
+                workspace.attn_mask[r] = 1.0;
+                workspace.add_mask[r] = 0.0;
             } else {
-                add_mask[r] = -1.0e30;
+                workspace.attn_mask[r] = 0.0;
+                workspace.add_mask[r] = -1.0e30;
             }
         }
 
         // 3. The forward pass.
-        let h = self.forward(
+        self.forward(
             ops,
-            &mut x,
-            &add_mask,
+            workspace,
             batch,
             seq,
             timings,
@@ -726,23 +932,30 @@ impl BertModel {
         )?;
 
         // 4. The pooling.
-        Ok(self.pool(&h, &attn_mask, batch, seq))
+        self.pool_into(
+            &workspace.x[..rows * hidden],
+            &workspace.attn_mask[..rows],
+            batch,
+            seq,
+            &mut workspace.pool_acc[..hidden],
+            out,
+        );
+        Ok(())
     }
 
-    /// The forward pass over `[rows, hidden]`, in place.
+    /// The forward pass over `[rows, hidden]`, in place in `workspace.x`.
     ///
     /// The reference's `BertEncoder::run()`, step for step.
     fn forward(
         &self,
         ops: &mut dyn Ops,
-        x: &mut [f32],
-        add_mask: &[f32],
+        workspace: &mut BertWorkspace,
         batch: usize,
         seq: usize,
         timings: &mut Timings,
         mut array: ArrayTextRef<'_, '_>,
         mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<()> {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let rows = batch * seq;
@@ -770,6 +983,7 @@ impl BertModel {
             None => seq,
         };
         let score_rows = batch * spec.heads * seq;
+        workspace.ensure_scores(score_rows, sc_cols);
 
         // WHICH PASSES ARE ON THE ARRAY, ASKED ONCE.
         //
@@ -822,13 +1036,16 @@ impl BertModel {
         // The embedding LayerNorm.
         let t0 = std::time::Instant::now();
         if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| ln_on) {
-            let params = layernorm_params(&self.weights.ln_gamma, &self.weights.ln_beta);
-            eltwise.layernorm(&params, x, rows)?;
+            eltwise.layernorm(
+                &self.weights.ln_params,
+                &mut workspace.x[..rows * hidden],
+                rows,
+            )?;
             // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
             timings.array_gemm += t0.elapsed().as_secs_f64();
         } else {
             ops.layernorm_rows(
-                x,
+                &mut workspace.x[..rows * hidden],
                 rows,
                 hidden,
                 &self.weights.ln_gamma,
@@ -841,15 +1058,26 @@ impl BertModel {
             }
         }
 
-        let mut qkv = vec![0.0f32; rows * three_hidden];
-        let mut ctx = vec![0.0f32; rows * hidden];
-        let mut proj = vec![0.0f32; rows * hidden];
-        let mut up = vec![0.0f32; rows * spec.ffn];
-        let mut down = vec![0.0f32; rows * hidden];
-        let mut scores = vec![0.0f32; score_rows * sc_cols];
-
         for (index, layer) in self.weights.layers.iter().enumerate() {
+            let (x_buf, qkv_buf, ctx_buf, proj_buf, up_buf, down_buf, scores_buf, add_mask_buf) = (
+                &mut workspace.x[..rows * hidden],
+                &mut workspace.qkv[..rows * three_hidden],
+                &mut workspace.ctx[..rows * hidden],
+                &mut workspace.proj[..rows * hidden],
+                &mut workspace.up[..rows * spec.ffn],
+                &mut workspace.down[..rows * hidden],
+                &mut workspace.scores[..score_rows * sc_cols],
+                &workspace.add_mask[..rows],
+            );
+
             // The fused QKV projection.
+            //
+            // THE FOUR PROJECTIONS OF A LAYER ARE A CHAIN, NOT A BATCH. QKV
+            // feeds the attention, whose output feeds the output projection,
+            // whose residual feeds LayerNorm and then ffn_up, whose GELU feeds
+            // ffn_down. There is no independent pair here for the array's
+            // `gemm_batch` to overlap; keep these calls sequential. The batch
+            // path is for families with genuinely independent projections.
             //
             // THE SEAM: the array, or the host, decided ONCE per projection
             // and in one place. The two paths are not the same numbers --
@@ -860,26 +1088,26 @@ impl BertModel {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.qkv"),
-                        x,
+                        &self.gemm_names_qkv[index],
+                        x_buf,
                         rows,
                         hidden,
                         three_hidden,
                         Some(&layer.qkv_bias),
-                        &mut qkv,
+                        qkv_buf,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
                     let t = std::time::Instant::now();
                     ops.gemm_nt(
-                        x,
+                        x_buf,
                         rows,
                         &layer.qkv,
                         hidden,
                         three_hidden,
                         &layer.qkv_bias,
-                        &mut qkv,
+                        qkv_buf,
                     )?;
                     // The host's own GEMM has NO row in the reference's split --
                     // the row that holds the projections' time is the
@@ -922,7 +1150,7 @@ impl BertModel {
                     // asks the eltwise backend for a softmax, and a backend
                     // with no softmax design would refuse.
                     let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
-                    array.attention(&qkv, shape, add_mask, softmax, &mut ctx)?;
+                    array.attention(qkv_buf, shape, add_mask_buf, softmax, ctx_buf)?;
                 }
                 let after = array
                     .as_deref()
@@ -937,7 +1165,7 @@ impl BertModel {
                 timings.attention += t_attn.elapsed().as_secs_f64();
             } else {
                 let t_qk = std::time::Instant::now();
-                self.qk(&qkv, &mut scores, batch, seq, sc_cols);
+                self.qk(qkv_buf, scores_buf, batch, seq, sc_cols);
                 let qk_s = t_qk.elapsed().as_secs_f64();
                 timings.qk += qk_s;
                 let t_sm = std::time::Instant::now();
@@ -949,13 +1177,11 @@ impl BertModel {
                 // the score matrix was laid out with.
                 if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| sm_on) {
                     for r in 0..score_rows {
-                        let row = &mut scores[r * sc_cols..][..sc_cols];
-                        let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
-                        for j in 0..seq {
-                            row[j] += mk[j];
-                        }
+                        let row = &mut scores_buf[r * sc_cols..][..sc_cols];
+                        let mk = &add_mask_buf[(r / (spec.heads * seq)) * seq..][..seq];
+                        kernels::add_inplace(row, mk);
                     }
-                    eltwise.softmax(&mut scores, score_rows)?;
+                    eltwise.softmax(scores_buf, score_rows)?;
                     // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
                     timings.array_gemm += t_sm.elapsed().as_secs_f64();
                 } else {
@@ -966,11 +1192,9 @@ impl BertModel {
                     // only, so the padding columns keep the -1e30 the score
                     // matrix was laid out with.
                     for r in 0..score_rows {
-                        let row = &mut scores[r * seq..(r + 1) * seq];
-                        let mk = &add_mask[(r / (spec.heads * seq)) * seq..][..seq];
-                        for j in 0..seq {
-                            row[j] += mk[j];
-                        }
+                        let row = &mut scores_buf[r * seq..(r + 1) * seq];
+                        let mk = &add_mask_buf[(r / (spec.heads * seq)) * seq..][..seq];
+                        kernels::add_inplace(row, mk);
                     }
                     // ONE CALL FOR THE WHOLE MATRIX.
                     //
@@ -979,7 +1203,7 @@ impl BertModel {
                     // the same width. The matrix is laid out at the
                     // SEQUENCE's width here -- the array's padded width is
                     // the array's path, and the host's path never sees it.
-                    ops.softmax_rows(&mut scores, score_rows, seq)?;
+                    ops.softmax_rows(scores_buf, score_rows, seq)?;
                     let spent = t_sm.elapsed().as_secs_f64();
                     match ops.place() {
                         Placement::Host => timings.host_softmax += spent,
@@ -987,7 +1211,7 @@ impl BertModel {
                     }
                 }
                 let t_av = std::time::Instant::now();
-                self.av(&scores, &qkv, &mut ctx, batch, seq, sc_cols);
+                self.av(scores_buf, qkv_buf, ctx_buf, batch, seq, sc_cols);
                 let av_s = t_av.elapsed().as_secs_f64();
                 timings.av += av_s;
                 // THE ATTENTION BLOCK IS QK^T AND softmax.V, and not the
@@ -1002,44 +1226,41 @@ impl BertModel {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.attn_out"),
-                        &ctx,
+                        &self.gemm_names_attn_out[index],
+                        ctx_buf,
                         rows,
                         hidden,
                         hidden,
                         Some(&layer.attn_out_bias),
-                        &mut proj,
+                        proj_buf,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
                     let t = std::time::Instant::now();
                     ops.gemm_nt(
-                        &ctx,
+                        ctx_buf,
                         rows,
                         &layer.attn_out,
                         hidden,
                         hidden,
                         &layer.attn_out_bias,
-                        &mut proj,
+                        proj_buf,
                     )?;
                     if ops.place() != Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
                     }
                 }
             }
-            for i in 0..x.len() {
-                x[i] = proj[i] + x[i];
-            }
+            kernels::add_inplace(x_buf, proj_buf);
 
             // The first LayerNorm, then the FFN.
             let t_ln = std::time::Instant::now();
             if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| ln_on) {
-                let params = layernorm_params(&layer.ln1_gamma, &layer.ln1_beta);
-                eltwise.layernorm(&params, x, rows)?;
+                eltwise.layernorm(&layer.ln1_params, x_buf, rows)?;
                 timings.array_gemm += t_ln.elapsed().as_secs_f64();
             } else {
-                ops.layernorm_rows(x, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
+                ops.layernorm_rows(x_buf, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
                 let spent = t_ln.elapsed().as_secs_f64();
                 match ops.place() {
                     Placement::Host => timings.host_layernorm += spent,
@@ -1050,26 +1271,26 @@ impl BertModel {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.ffn_up"),
-                        x,
+                        &self.gemm_names_ffn_up[index],
+                        x_buf,
                         rows,
                         hidden,
                         spec.ffn,
                         Some(&layer.ffn_up_bias),
-                        &mut up,
+                        up_buf,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
                     let t = std::time::Instant::now();
                     ops.gemm_nt(
-                        x,
+                        x_buf,
                         rows,
                         &layer.ffn_up,
                         hidden,
                         spec.ffn,
                         &layer.ffn_up_bias,
-                        &mut up,
+                        up_buf,
                     )?;
                     if ops.place() != Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
@@ -1078,10 +1299,10 @@ impl BertModel {
             }
             let t_gelu = std::time::Instant::now();
             if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| gelu_on) {
-                eltwise.gelu(&mut up)?;
+                eltwise.gelu(up_buf)?;
                 timings.array_gemm += t_gelu.elapsed().as_secs_f64();
             } else {
-                ops.gelu(&mut up)?;
+                ops.gelu(up_buf)?;
                 let spent = t_gelu.elapsed().as_secs_f64();
                 match ops.place() {
                     Placement::Host => timings.host_gelu += spent,
@@ -1092,44 +1313,41 @@ impl BertModel {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.ffn_down"),
-                        &up,
+                        &self.gemm_names_ffn_down[index],
+                        up_buf,
                         rows,
                         spec.ffn,
                         hidden,
                         Some(&layer.ffn_down_bias),
-                        &mut down,
+                        down_buf,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
                     let t = std::time::Instant::now();
                     ops.gemm_nt(
-                        &up,
+                        up_buf,
                         rows,
                         &layer.ffn_down,
                         spec.ffn,
                         hidden,
                         &layer.ffn_down_bias,
-                        &mut down,
+                        down_buf,
                     )?;
                     if ops.place() != Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
                     }
                 }
             }
-            for i in 0..x.len() {
-                x[i] = down[i] + x[i];
-            }
+            kernels::add_inplace(x_buf, down_buf);
 
             // The second LayerNorm.
             let t_ln = std::time::Instant::now();
             if let Some(eltwise) = eltwise.as_deref_mut().filter(|_| ln_on) {
-                let params = layernorm_params(&layer.ln2_gamma, &layer.ln2_beta);
-                eltwise.layernorm(&params, x, rows)?;
+                eltwise.layernorm(&layer.ln2_params, x_buf, rows)?;
                 timings.array_gemm += t_ln.elapsed().as_secs_f64();
             } else {
-                ops.layernorm_rows(x, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
+                ops.layernorm_rows(x_buf, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
                 let spent = t_ln.elapsed().as_secs_f64();
                 match ops.place() {
                     Placement::Host => timings.host_layernorm += spent,
@@ -1137,7 +1355,7 @@ impl BertModel {
                 }
             }
         }
-        Ok(x.to_vec())
+        Ok(())
     }
 
     /// `QK^T`, as the reference's `qk_impl` computes it.
@@ -1181,10 +1399,7 @@ impl BertModel {
                 // The padding column, only when the array's softmax is what
                 // will read this row and it was compiled wider than the
                 // sequence.
-                let pad = &mut scores[row + seq..][..sc_cols - seq];
-                for slot in pad.iter_mut() {
-                    *slot = -1.0e30;
-                }
+                scores[row + seq..][..sc_cols - seq].fill(-1.0e30);
             }
         }
     }
@@ -1216,21 +1431,17 @@ impl BertModel {
             for i in 0..seq {
                 let a = &scores[(p * seq + i) * sc_cols..][..seq];
                 let o = &mut ctx[(b * seq + i) * hidden + h * head_dim..][..head_dim];
-                // One accumulator per eight of the head's width: the reference's
-                // `__m256 acc[NV]`, and not one accumulator for the whole
-                // head. The difference is the ORDER of the additions, and
-                // the order is the answer.
-                let mut acc = vec![0.0f32; head_dim];
+                o.fill(0.0);
                 for (j, &aj) in a.iter().enumerate() {
                     let v =
                         &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..][..head_dim];
                     for lane in 0..nv {
                         for l in 0..8 {
-                            acc[lane * 8 + l] = aj.mul_add(v[lane * 8 + l], acc[lane * 8 + l]);
+                            let idx = lane * 8 + l;
+                            o[idx] = aj.mul_add(v[idx], o[idx]);
                         }
                     }
                 }
-                o.copy_from_slice(&acc);
             }
         }
     }
@@ -1242,19 +1453,27 @@ impl BertModel {
     /// takes the first row -- and refuses a masked one, because a masked
     /// `[CLS]` means an empty sequence and zeros would be a silently
     /// plausible answer.
-    fn pool(&self, h: &[f32], mask: &[f32], batch: usize, seq: usize) -> Vec<f32> {
+    fn pool_into(
+        &self,
+        h: &[f32],
+        mask: &[f32],
+        batch: usize,
+        seq: usize,
+        acc: &mut [f64],
+        out: &mut [f32],
+    ) {
         let hidden = self.spec.hidden;
-        let mut out = vec![0.0f32; batch * hidden];
         for b in 0..batch {
             let amb = &mask[b * seq..(b + 1) * seq];
             let hb = &h[b * seq * hidden..(b + 1) * seq * hidden];
-            let mut acc = vec![0.0f64; hidden];
+            acc.fill(0.0);
             if self.spec.cls_pooling {
                 if amb[0] == 0.0 {
                     // The reference throws here. A refusal is the Rust's shape for
                     // the same condition: an empty sequence has no pooled
                     // vector, and zero is a plausible answer to a question
                     // nobody asked.
+                    out[b * hidden..(b + 1) * hidden].fill(0.0);
                     continue;
                 }
                 for c in 0..hidden {
@@ -1296,7 +1515,6 @@ impl BertModel {
                 }
             }
         }
-        out
     }
 }
 

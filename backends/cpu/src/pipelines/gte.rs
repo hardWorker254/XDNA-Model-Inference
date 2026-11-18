@@ -277,6 +277,9 @@ struct Weights {
 pub struct GteModel {
     pub spec: GteSpec,
     weights: Weights,
+    /// The four op names the array backend looks up, built once at open.
+    /// They used to be `format!`ed inside the layer loop of every request.
+    names: Vec<[String; 4]>,
 }
 
 impl GteModel {
@@ -401,6 +404,17 @@ impl GteModel {
             });
         }
 
+        let names = (0..spec.layers)
+            .map(|l| {
+                let p = format!("layer.{l}");
+                [
+                    format!("{p}.qkv"),
+                    format!("{p}.attn_out"),
+                    format!("{p}.ffn_up"),
+                    format!("{p}.ffn_down"),
+                ]
+            })
+            .collect();
         Ok(Self {
             spec,
             weights: Weights {
@@ -410,6 +424,7 @@ impl GteModel {
                 ln_beta,
                 layers,
             },
+            names,
         })
     }
 
@@ -507,13 +522,17 @@ impl GteModel {
         let mut down = vec![0.0f32; rows * hidden];
         let mut scores = vec![0.0f32; score_rows * seq];
 
+        // The bias of a GEMM without one: one buffer per CALL, not one per
+        // layer. `gemm_nt` reads `bias[j]` for every column.
+        let zeros_bias = vec![0.0f32; 2 * spec.ffn];
         for (index, layer) in self.weights.layers.iter().enumerate() {
+            let names = &self.names[index];
             // QKV projection
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.qkv"),
+                        &names[0],
                         x,
                         rows,
                         hidden,
@@ -567,7 +586,7 @@ impl GteModel {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.attn_out"),
+                        &names[1],
                         &ctx,
                         rows,
                         hidden,
@@ -602,19 +621,10 @@ impl GteModel {
             timings.host_layernorm += t_ln.elapsed().as_secs_f64();
 
             // Gated GEGLU MLP: up_gate = x @ W (no bias), split [up|gate], gelu(gate)*up, down
-            let zeros_bias = vec![0.0f32; 2 * spec.ffn];
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
-                    array.gemm(
-                        &format!("layer.{index}.ffn_up"),
-                        x,
-                        rows,
-                        hidden,
-                        2 * spec.ffn,
-                        None,
-                        &mut up_gate,
-                    )?;
+                    array.gemm(&names[2], x, rows, hidden, 2 * spec.ffn, None, &mut up_gate)?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
@@ -646,7 +656,7 @@ impl GteModel {
                 Some(array) => {
                     let t = std::time::Instant::now();
                     array.gemm(
-                        &format!("layer.{index}.ffn_down"),
+                        &names[3],
                         &act,
                         rows,
                         inter,
@@ -825,15 +835,16 @@ fn apply_rope_qkv(
 }
 
 fn rotate_inplace(x: &mut [f32], cos: &[f32], sin: &[f32], half: usize) {
-    let mut tmp = vec![0.0f32; x.len()];
+    // The old form built a `tmp` Vec on EVERY call (twice per head per
+    // layer). `tmp[i] = -x2` and `tmp[i + half] = x1` are two scalars; keep
+    // them as scalars and keep the exact multiply/add order -- in particular
+    // `(-x2) * sin`, which is what the temporary encoded. No FMA is introduced.
     for i in 0..half {
         let x1 = x[i];
         let x2 = x[i + half];
-        tmp[i] = -x2;
-        tmp[i + half] = x1;
-    }
-    for i in 0..x.len() {
-        x[i] = x[i] * cos[i] + tmp[i] * sin[i];
+        let j = i + half;
+        x[i] = x1 * cos[i] + (-x2) * sin[i];
+        x[j] = x2 * cos[j] + x1 * sin[j];
     }
 }
 

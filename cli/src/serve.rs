@@ -541,16 +541,21 @@ fn build_state(
     } else {
         None
     };
+    let mut probe = None;
     if let Some(mask) = vulkan_ops {
-        // Refuse early if no device, like the CLI does.
-        let probe = npum_vulkan::ops::VulkanOps::with_ops(mask.0, mask.1, mask.2, mask.3);
-        if !probe.has_gpu() {
+        // Refuse early if no device, like the CLI does. Keep the device the
+        // probe opened: the engine reuses it for every request, so startup
+        // does not open one device to check and another to compute with.
+        let candidate = npum_vulkan::ops::VulkanOps::with_ops(mask.0, mask.1, mask.2, mask.3);
+        if !candidate.has_gpu() {
             eprintln!("error: {}", crate::backend::refuse_no_gpu());
             return Err(crate::EXIT_REFUSED);
         }
+        probe = Some(candidate);
     }
     match npuembeddings_server::Embedder::open_with_vulkan(path, seq, vulkan_ops) {
         Ok(encoder) => {
+            let encoder = encoder.with_vulkan_device(probe);
             state.health = format!(
                 "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"embeddings\"}}",
                 state.model_id

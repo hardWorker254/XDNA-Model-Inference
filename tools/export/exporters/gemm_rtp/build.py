@@ -675,6 +675,13 @@ def build_child_argv(
             cmd += ["--ln-eps", repr(args.ln_eps)]
         if args.sm_cols is not None:
             cmd += ["--sm-cols", str(args.sm_cols)]
+        if args.sm_rows is not None:
+            # The child receives no --target, so it cannot derive the softmax
+            # row CAPACITY from the model: it would fall back to
+            # batch*heads*seq and compile a design twelve times one attention
+            # dispatch. The resolver's value is the parent's, and the child
+            # must build exactly that.
+            cmd += ["--sm-rows", str(args.sm_rows)]
 
     if args.require_arch_marker:
         cmd.append("--require-arch-marker")

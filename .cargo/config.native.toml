@@ -1,0 +1,19 @@
+# Opt-in native build configuration.
+#
+# This file is NOT loaded by cargo automatically: only `.cargo/config.toml`
+# is. To build for the CPU of THIS machine, copy it over the workspace config:
+#
+#   cp .cargo/config.native.toml .cargo/config.toml
+#   cargo build --release
+#
+# `-C target-cpu=native` lets LLVM use the widest instructions this host has.
+# The CPU kernels already dispatch AVX2/AVX-512 at run time, so this mainly
+# helps auto-vectorisation elsewhere (front ends, image/audio preprocessing).
+#
+# TRADE-OFF: the binary is no longer portable, and an auto-vectorised
+# reduction can change the order of floating-point additions. That would
+# break the byte-exact ISA gates and the golden transcripts. Use this for
+# local throughput experiments only; keep the shipped build portable.
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

@@ -17,31 +17,65 @@
 //!
 //! The ISA lives here so that the gate can still ASK for a named one: the
 //! same object, with a different ISA inside, and the bytes compared.
+//!
+//! # Parallelism is a property of this object too
+//!
+//! Splitting rows across the shared pool changes which worker computes a
+//! value, but not the value: each row's reduction is over K in the same order
+//! on every worker. The gate therefore still compares bytes. `on(isa)` is
+//! deliberately serial -- it is what the byte-comparison gate uses --
+//! while `best()` uses the pool above the shared work threshold.
 
 use crate::kernels::{self, Isa};
+use crate::parallel;
 use npum_model::dispatcher::Placement;
-use npum_model::{Ops, Result};
+use npum_model::{Ops, Result, TensorError};
 
-/// The host's arithmetic, on a named ISA.
+/// The host's arithmetic, on a named ISA, with a chosen worker count.
 pub struct CpuOps {
     isa: Isa,
+    /// `1` means the strictly serial reference. Anything above it splits
+    /// independent rows over the shared pool, subject to the work threshold.
+    threads: usize,
 }
 
 impl CpuOps {
-    /// The host's own choice: the widest GEMM this machine has.
+    /// The host's own choice: the widest GEMM this machine has, row-parallel
+    /// when there is enough work to make the split worthwhile.
     pub fn best() -> Self {
-        Self {
-            isa: kernels::gemm_isa(),
-        }
+        Self::with_threads(kernels::gemm_isa(), parallel::threads())
     }
 
-    /// A named ISA.
+    /// A named ISA, strictly serial.
     ///
     /// For the gate that compares the ISAs byte for byte. On a host that
     /// does not have the ISA asked for, the GEMM falls back to the portable
     /// path -- which computes the same bytes, and is a great deal slower.
     pub fn on(isa: Isa) -> Self {
-        Self { isa }
+        Self { isa, threads: 1 }
+    }
+
+    /// A named ISA with a requested number of workers.
+    ///
+    /// A worker count above one is honoured only when the host can actually
+    /// run the named ISA; otherwise the object stays serial and the named
+    /// kernel's own portable fallback applies.
+    pub fn with_threads(isa: Isa, threads: usize) -> Self {
+        let usable = kernels::available_isas().contains(&isa);
+        Self {
+            isa,
+            threads: if usable { threads.max(1) } else { 1 },
+        }
+    }
+
+    /// The byte-exact reference, never parallel, on the host's best ISA.
+    pub fn serial() -> Self {
+        Self::on(kernels::gemm_isa())
+    }
+
+    /// The worker count this object was built with.
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 }
 
@@ -62,7 +96,7 @@ impl Ops for CpuOps {
         bias: &[f32],
         out: &mut [f32],
     ) -> Result<()> {
-        if !kernels::gemm_nt_on(self.isa, a, m, b, k, n, bias, out) {
+        if !kernels::gemm_nt_rows_on(self.isa, a, m, b, k, n, bias, out, self.threads) {
             // The host does not have the ISA that was asked for. The
             // portable path computes the same bytes -- the gate says so --
             // and the alternative, leaving the output alone, is a run that
@@ -82,14 +116,35 @@ impl Ops for CpuOps {
     ) -> Result<()> {
         let span = rows * width;
         if values.len() < span {
-            return Err(npum_model::TensorError::WrongLength {
+            return Err(TensorError::WrongLength {
                 expected: span,
                 found: values.len(),
             }
             .into());
         }
-        for row in values[..span].chunks_mut(width) {
-            kernels::layernorm_row_on(self.isa, row, gamma, beta)?;
+        // The row kernel's only error is a row that is not a multiple of
+        // eight. Check it once here so the parallel path cannot swallow it.
+        if rows > 0 && width > 0 && width % 8 != 0 {
+            return Err(TensorError::WrongLength {
+                expected: width.next_multiple_of(8),
+                found: width,
+            }
+            .into());
+        }
+        let work = (rows as i64) * (width as i64);
+        match parallel::chunk_rows(rows, work, self.threads) {
+            Some(chunk) => {
+                parallel::for_each_chunk_mut(&mut values[..span], chunk * width, |_, part| {
+                    for row in part.chunks_mut(width) {
+                        let _ = kernels::layernorm_row_on(self.isa, row, gamma, beta);
+                    }
+                });
+            }
+            None => {
+                for row in values[..span].chunks_mut(width) {
+                    kernels::layernorm_row_on(self.isa, row, gamma, beta)?;
+                }
+            }
         }
         Ok(())
     }
@@ -102,14 +157,33 @@ impl Ops for CpuOps {
     fn softmax_rows(&mut self, values: &mut [f32], rows: usize, width: usize) -> Result<()> {
         let span = rows * width;
         if values.len() < span {
-            return Err(npum_model::TensorError::WrongLength {
+            return Err(TensorError::WrongLength {
                 expected: span,
                 found: values.len(),
             }
             .into());
         }
-        for row in values[..span].chunks_mut(width) {
-            kernels::softmax_row_on(self.isa, row)?;
+        if rows > 0 && width > 0 && width % 8 != 0 {
+            return Err(TensorError::WrongLength {
+                expected: width.next_multiple_of(8),
+                found: width,
+            }
+            .into());
+        }
+        let work = (rows as i64) * (width as i64);
+        match parallel::chunk_rows(rows, work, self.threads) {
+            Some(chunk) => {
+                parallel::for_each_chunk_mut(&mut values[..span], chunk * width, |_, part| {
+                    for row in part.chunks_mut(width) {
+                        let _ = kernels::softmax_row_on(self.isa, row);
+                    }
+                });
+            }
+            None => {
+                for row in values[..span].chunks_mut(width) {
+                    kernels::softmax_row_on(self.isa, row)?;
+                }
+            }
         }
         Ok(())
     }

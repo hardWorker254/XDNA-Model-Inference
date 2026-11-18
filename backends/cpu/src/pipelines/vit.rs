@@ -26,7 +26,7 @@
 
 use crate::kernels;
 use crate::vit_image::Resample;
-use crate::whisper::attention;
+use crate::whisper::attention_into;
 use crate::whisper::layernorm_row;
 use crate::whisper_features::gelu_erf_exact;
 use npum_format::Container;
@@ -149,6 +149,74 @@ pub struct Vit {
     labels: Vec<String>,
 }
 
+/// The encoder's reusable scratch.
+///
+/// Before this existed, `encode` built eight large buffers for EVERY layer
+/// (two `x.clone()`s, three projections, the feed-forward pair, plus the
+/// attention's own two) and built a new one again for every image. A
+/// classifier sees many images with one loaded model, so the buffers are
+/// kept here and grown once. Nothing about the arithmetic changes: every
+/// buffer is fully written before it is read, exactly as the freshly
+/// allocated `vec![0.0; ..]` was.
+pub struct VitWorkspace {
+    patch_out: Vec<f32>,
+    x: Vec<f32>,
+    norm: Vec<f32>,
+    qkv: Vec<f32>,
+    ctx: Vec<f32>,
+    proj: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    scores: Vec<f32>,
+    acc: Vec<f32>,
+}
+
+impl Default for VitWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VitWorkspace {
+    /// An empty workspace; the first `encode_into` grows it to the model.
+    pub fn new() -> Self {
+        Self {
+            patch_out: Vec::new(),
+            x: Vec::new(),
+            norm: Vec::new(),
+            qkv: Vec::new(),
+            ctx: Vec::new(),
+            proj: Vec::new(),
+            up: Vec::new(),
+            down: Vec::new(),
+            scores: Vec::new(),
+            acc: Vec::new(),
+        }
+    }
+
+    /// Grow a scratch buffer to `len`, if needed. GEMMs and copies below
+    /// overwrite the whole published range, so a grow's zero fill is only a
+    /// convenience, never a dependency.
+    fn grow(buf: &mut Vec<f32>, len: usize) {
+        if buf.len() < len {
+            buf.resize(len, 0.0);
+        }
+    }
+
+    fn ensure(&mut self, n_patches: usize, n_pos: usize, d: usize, width: usize, head_dim: usize) {
+        Self::grow(&mut self.patch_out, n_patches * d);
+        Self::grow(&mut self.x, n_pos * d);
+        Self::grow(&mut self.norm, n_pos * d);
+        Self::grow(&mut self.qkv, n_pos * 3 * d);
+        Self::grow(&mut self.ctx, n_pos * d);
+        Self::grow(&mut self.proj, n_pos * d);
+        Self::grow(&mut self.up, n_pos * width);
+        Self::grow(&mut self.down, n_pos * d);
+        Self::grow(&mut self.scores, n_pos);
+        Self::grow(&mut self.acc, head_dim);
+    }
+}
+
 impl Vit {
     /// Read the weights out of a container.
     pub fn open(path: &Path) -> Result<Vit, String> {
@@ -229,16 +297,60 @@ impl Vit {
 
     /// The encoder: the patches to the normalised positions.
     ///
-    /// `patches` is the front end's `[n_patches, patch_dim]` matrix.
+    /// `patches` is the front end's `[n_patches, patch_dim]` matrix. This
+    /// convenience wrapper owns a fresh workspace; callers running more
+    /// than one image should keep a [`VitWorkspace`] and use
+    /// [`encode_into`](Self::encode_into).
     pub fn encode(&self, patches: &[f32]) -> Vec<f32> {
+        let mut ws = VitWorkspace::new();
+        let mut out = Vec::new();
+        self.encode_into(patches, &mut ws, &mut out);
+        out
+    }
+
+    /// The encoder, writing into the caller's output buffer and reusing a
+    /// workspace across images.
+    ///
+    /// The arithmetic is the same as [`encode`](Self::encode): the same GEMMs,
+    /// the same `x.clone()` expressed as `copy_from_slice`, the same
+    /// `attention_into` that `attention` itself calls, and the same residual
+    /// adds. Only the addresses of the scratch buffers change.
+    pub fn encode_into(&self, patches: &[f32], ws: &mut VitWorkspace, out: &mut Vec<f32>) {
         let g = &self.geometry;
         let d = g.hidden as usize;
         let n_pos = g.n_pos as usize;
         let n_patches = g.n_patches as usize;
+        let width = self
+            .layers
+            .iter()
+            .map(|l| l.ffn_up.len() / d)
+            .max()
+            .unwrap_or(0);
+        ws.ensure(n_patches, n_pos, d, width, g.head_dim as usize);
+
+        let VitWorkspace {
+            patch_out,
+            x,
+            norm,
+            qkv,
+            ctx,
+            proj,
+            up,
+            down,
+            scores,
+            acc,
+        } = ws;
+        let patch_out = &mut patch_out[..n_patches * d];
+        let x = &mut x[..n_pos * d];
+        let norm = &mut norm[..n_pos * d];
+        let qkv = &mut qkv[..n_pos * 3 * d];
+        let ctx = &mut ctx[..n_pos * d];
+        let proj = &mut proj[..n_pos * d];
+        let up = &mut up[..n_pos * width];
+        let down = &mut down[..n_pos * d];
 
         // The patch embedding: a conv rewritten as an exact GEMM, because
         // the stride equals the kernel, so im2col is a permutation.
-        let mut patch_out = vec![0.0f32; n_patches * d];
         kernels::gemm_nt(
             patches,
             n_patches,
@@ -246,7 +358,7 @@ impl Vit {
             g.patch_dim as usize,
             d,
             &self.patch_embed_bias,
-            &mut patch_out,
+            patch_out,
         );
 
         // The CLS row and the position table. Positions are added AFTER
@@ -254,7 +366,11 @@ impl Vit {
         // order: pos_embeddings[:, 1:] + patch, then cat((cls, patches)),
         // then + pos_embeddings[:, :1]. Same sum, same tensor, and the CLS
         // row therefore holds position 0 like any other.
-        let mut x = vec![0.0f32; n_pos * d];
+        //
+        // The scratch may hold a previous image: zero the WHOLE row range,
+        // including any padding positions the patches do not fill, so a
+        // reused buffer behaves exactly like the old `vec![0.0; ..]`.
+        x.fill(0.0);
         x[..d].copy_from_slice(&self.cls_token[..d]);
         for p in 0..n_patches {
             x[(p + 1) * d..(p + 2) * d].copy_from_slice(&patch_out[p * d..(p + 1) * d]);
@@ -275,31 +391,19 @@ impl Vit {
         } else {
             g.attn_scale as f32
         };
-        let inter = g.hidden as usize; // placeholder, replaced below
-        let _ = inter;
 
         for layer in &self.layers {
             // ---- self-attention, pre-LN ----
-            let mut norm = x.clone();
+            norm.copy_from_slice(x);
             for row in norm.chunks_exact_mut(d) {
                 layernorm_row(row, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
             }
-            let mut qkv = vec![0.0f32; n_pos * 3 * d];
-            kernels::gemm_nt(
-                &norm,
-                n_pos,
-                &layer.qkv,
-                d,
-                3 * d,
-                &layer.qkv_bias,
-                &mut qkv,
-            );
+            kernels::gemm_nt(norm, n_pos, &layer.qkv, d, 3 * d, &layer.qkv_bias, qkv);
             // The fused [Q|K|V] row is Q at offset 0 and a K|V block at
             // offset d, both with row stride 3*d_model -- the same layout
             // the Whisper's encoder reads. There is NO mask.
-            let mut ctx = vec![0.0f32; n_pos * d];
-            attention(
-                &qkv,
+            attention_into(
+                qkv,
                 3 * d,
                 &qkv[d..],
                 3 * d,
@@ -309,51 +413,35 @@ impl Vit {
                 g.heads as usize,
                 g.head_dim as usize,
                 scale,
-                &mut ctx,
+                ctx,
+                scores,
+                acc,
             );
-            let mut proj = vec![0.0f32; n_pos * d];
             kernels::gemm_nt(
-                &ctx,
+                ctx,
                 n_pos,
                 &layer.attn_out,
                 d,
                 d,
                 &layer.attn_out_bias,
-                &mut proj,
+                proj,
             );
             for i in 0..n_pos * d {
                 x[i] += proj[i];
             }
 
             // ---- feed-forward, pre-LN ----
-            let mut norm = x.clone();
+            norm.copy_from_slice(x);
             for row in norm.chunks_exact_mut(d) {
                 layernorm_row(row, &layer.ln2_gamma, &layer.ln2_beta, g.ln_eps);
             }
-            let width = layer.ffn_up.len() / d;
-            let mut up = vec![0.0f32; n_pos * width];
-            kernels::gemm_nt(
-                &norm,
-                n_pos,
-                &layer.ffn_up,
-                d,
-                width,
-                &layer.ffn_up_bias,
-                &mut up,
-            );
+            let w = layer.ffn_up.len() / d;
+            let up = &mut up[..n_pos * w];
+            kernels::gemm_nt(norm, n_pos, &layer.ffn_up, d, w, &layer.ffn_up_bias, up);
             for v in up.iter_mut() {
                 *v = gelu_erf_exact(*v);
             }
-            let mut down = vec![0.0f32; n_pos * d];
-            kernels::gemm_nt(
-                &up,
-                n_pos,
-                &layer.ffn_down,
-                width,
-                d,
-                &layer.ffn_down_bias,
-                &mut down,
-            );
+            kernels::gemm_nt(up, n_pos, &layer.ffn_down, w, d, &layer.ffn_down_bias, down);
             for i in 0..n_pos * d {
                 x[i] += down[i];
             }
@@ -363,7 +451,8 @@ impl Vit {
         for row in x.chunks_exact_mut(d) {
             layernorm_row(row, &self.final_gamma, &self.final_beta, g.ln_eps);
         }
-        x
+        out.resize(n_pos * d, 0.0);
+        out.copy_from_slice(x);
     }
 
     /// The head: the CLS row to the logits.
@@ -372,18 +461,24 @@ impl Vit {
     /// axis of the weight, and the accumulation is in DOUBLE -- the same
     /// arithmetic as the reference's `head_matvec`.
     pub fn classify(&self, cls_row: &[f32]) -> Vec<f32> {
+        let mut logits = vec![0.0f32; self.geometry.num_labels as usize];
+        self.classify_into(cls_row, &mut logits);
+        logits
+    }
+
+    /// The head, writing into the caller's buffer. The double accumulation
+    /// and its order are identical to [`classify`](Self::classify).
+    pub fn classify_into(&self, cls_row: &[f32], logits: &mut [f32]) {
         let g = &self.geometry;
         let d = g.hidden as usize;
         let nlab = g.num_labels as usize;
-        let mut logits = vec![0.0f32; nlab];
-        for j in 0..nlab {
+        for j in 0..nlab.min(logits.len()) {
             let mut acc = self.head_bias[j] as f64;
             for t in 0..d {
                 acc += cls_row[t] as f64 * self.head[t * nlab + j] as f64;
             }
             logits[j] = acc as f32;
         }
-        logits
     }
 }
 

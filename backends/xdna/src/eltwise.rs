@@ -87,6 +87,26 @@ impl Kind {
     }
 }
 
+/// A parameter set staged once: its prepared byte form and the slot it occupies.
+///
+/// The bytes are the f32 values in little-endian order, which is both the
+/// form the design's parameter buffer expects and a stable key for lookup.
+struct StagedParam {
+    bytes: Vec<u8>,
+    slot: usize,
+}
+
+impl StagedParam {
+    /// Whether these bytes are the little-endian encoding of `params`.
+    fn matches(&self, params: &[f32]) -> bool {
+        self.bytes.len() == params.len() * 4
+            && params
+                .iter()
+                .zip(self.bytes.chunks_exact(4))
+                .all(|(value, bytes)| value.to_le_bytes() == bytes)
+    }
+}
+
 /// One elementwise design, loaded onto the board.
 ///
 /// A design is a program and a set of buffers, and it computes ONE pass:
@@ -113,7 +133,13 @@ pub struct EltwiseDesign<T: Transport> {
     /// reads them out of buffer 1 whichever slot that buffer is bound
     /// to. Writing them per call would re-upload them per call, and the
     /// status block's line says they are staged once.
-    staged_params: Vec<(Vec<f32>, usize)>,
+    staged_params: Vec<StagedParam>,
+    /// Reusable input buffer (bf16 bytes), `capacity * 2` long.
+    in_bytes: Vec<u8>,
+    /// Alternate input buffer for pipelining host conversion with dispatch.
+    in_bytes_alt: Vec<u8>,
+    /// Reusable output buffer (bf16 bytes), `capacity * 2` long.
+    out_bytes: Vec<u8>,
 }
 
 impl<T: Transport> EltwiseDesign<T> {
@@ -164,6 +190,9 @@ impl<T: Transport> EltwiseDesign<T> {
             capacity,
             dispatches: 0,
             staged_params: Vec::new(),
+            in_bytes: vec![0u8; capacity * 2],
+            in_bytes_alt: vec![0u8; capacity * 2],
+            out_bytes: vec![0u8; capacity * 2],
         })
     }
 
@@ -185,6 +214,28 @@ impl<T: Transport> EltwiseDesign<T> {
     /// How many dispatches have run.
     pub fn dispatches(&self) -> usize {
         self.dispatches
+    }
+
+    /// THE PARAMETERS, STAGED ONCE PER SITE.
+    ///
+    /// Returns the slot holding `params`, staging and uploading it on first
+    /// use. Matching is by value so the same parameter set reuses its slot
+    /// without rebuilding or re-uploading its byte form.
+    fn ensure_param_slot(&mut self, params: &[f32]) -> Result<usize, ArrayError> {
+        if let Some(staged) = self
+            .staged_params
+            .iter()
+            .find(|staged| staged.matches(params))
+        {
+            return Ok(staged.slot);
+        }
+        let mut bytes = Vec::with_capacity(params.len() * 4);
+        for value in params {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let slot = self.design.stage(BUFFER_PARAMS, &bytes)?;
+        self.staged_params.push(StagedParam { bytes, slot });
+        Ok(slot)
     }
 
     /// The LayerNorm, over `n_rows` rows.
@@ -209,36 +260,11 @@ impl<T: Transport> EltwiseDesign<T> {
                 self.cols
             )));
         }
-        // THE PARAMETERS, IN BYTES.
-        //
-        // The design's parameter buffer holds them as f32 -- gamma then
-        // beta -- and the buffer is BOUND to a staged slot: a site is
-        // staged once and bound, and the same site is bound again the
-        // next time it is used.
-        let mut bytes = Vec::with_capacity(params.len() * 4);
-        for value in params {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        let slot = match self.staged_params.iter().find(|(p, _)| p == params) {
-            Some((_, slot)) => *slot,
-            None => {
-                let slot = self.design.stage(BUFFER_PARAMS, &bytes)?;
-                self.staged_params.push((params.to_vec(), slot));
-                slot
-            }
-        };
+        // THE PARAMETERS, STAGED ONCE PER SITE.
+        let slot = self.ensure_param_slot(params)?;
         self.design.bind(BUFFER_PARAMS, slot)?;
-
-        let mut done = 0usize;
-        while done < n_rows {
-            let chunk = (n_rows - done).min(self.rows);
-            let n = chunk * self.cols;
-            self.fill(&x[done * self.cols..done * self.cols + n])?;
-            self.dispatch()?;
-            self.read_back(&mut x[done * self.cols..done * self.cols + n])?;
-            done += chunk;
-        }
-        Ok(())
+        let total = n_rows * self.cols;
+        self.run_chunked(x, total, self.capacity)
     }
 
     /// The RMSNorm, over `n_rows` rows.
@@ -261,30 +287,10 @@ impl<T: Transport> EltwiseDesign<T> {
                 self.cols
             )));
         }
-        let mut bytes = Vec::with_capacity(weight.len() * 4);
-        for value in weight {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        let slot = match self.staged_params.iter().find(|(p, _)| p == weight) {
-            Some((_, slot)) => *slot,
-            None => {
-                let slot = self.design.stage(BUFFER_PARAMS, &bytes)?;
-                self.staged_params.push((weight.to_vec(), slot));
-                slot
-            }
-        };
+        let slot = self.ensure_param_slot(weight)?;
         self.design.bind(BUFFER_PARAMS, slot)?;
-
-        let mut done = 0usize;
-        while done < n_rows {
-            let chunk = (n_rows - done).min(self.rows);
-            let n = chunk * self.cols;
-            self.fill(&x[done * self.cols..done * self.cols + n])?;
-            self.dispatch()?;
-            self.read_back(&mut x[done * self.cols..done * self.cols + n])?;
-            done += chunk;
-        }
-        Ok(())
+        let total = n_rows * self.cols;
+        self.run_chunked(x, total, self.capacity)
     }
 
     /// The softmax, over `n_rows` rows.
@@ -293,16 +299,8 @@ impl<T: Transport> EltwiseDesign<T> {
     /// width is the design's own.
     pub fn softmax(&mut self, x: &mut [f32], n_rows: usize) -> Result<(), ArrayError> {
         self.require(Kind::Softmax)?;
-        let mut done = 0usize;
-        while done < n_rows {
-            let chunk = (n_rows - done).min(self.rows);
-            let n = chunk * self.cols;
-            self.fill(&x[done * self.cols..done * self.cols + n])?;
-            self.dispatch()?;
-            self.read_back(&mut x[done * self.cols..done * self.cols + n])?;
-            done += chunk;
-        }
-        Ok(())
+        let total = n_rows * self.cols;
+        self.run_chunked(x, total, self.capacity)
     }
 
     /// The softmax, over `n_rows` rows, WITHOUT counting the dispatch.
@@ -326,45 +324,76 @@ impl<T: Transport> EltwiseDesign<T> {
     /// count is in elements and not in rows.
     pub fn gelu(&mut self, x: &mut [f32]) -> Result<(), ArrayError> {
         self.require(Kind::Gelu)?;
-        let n = x.len();
-        let mut done = 0usize;
-        while done < n {
-            let chunk = (n - done).min(self.capacity);
-            self.fill(&x[done..done + chunk])?;
-            self.dispatch()?;
-            self.read_back(&mut x[done..done + chunk])?;
-            done += chunk;
+        let total = x.len();
+        self.run_chunked(x, total, self.capacity)
+    }
+
+    /// Convert input values to bf16 into `buf`, zeroing the tail.
+    fn encode_input(values: &[f32], buf: &mut [u8]) {
+        npum_format::bf16::f32_to_bf16_bytes(values, buf);
+        let used = values.len() * 2;
+        if used < buf.len() {
+            buf[used..].fill(0);
         }
-        Ok(())
     }
 
-    /// THE INPUT BUFFER, FILLED WHOLE.
-    ///
-    /// The real values first, then the tail as zeros: the buffer is the
-    /// design's own, so a tail still holding the previous call's
-    /// activations would be read as this call's data.
-    fn fill(&mut self, values: &[f32]) -> Result<(), ArrayError> {
-        let mut bytes = vec![0u8; self.capacity * 2];
-        npum_format::bf16::f32_to_bf16_bytes(values, &mut bytes);
-        self.design.write_bound(0, &bytes)
-    }
-
-    /// THE DISPATCH.
-    fn dispatch(&mut self) -> Result<(), ArrayError> {
-        self.design.dispatch(0)?;
+    /// Submit a dispatch without waiting for it.
+    fn submit(&mut self) -> Result<crate::transport::Run, ArrayError> {
+        let run = self.design.start_dispatch(0)?;
         self.dispatches += 1;
-        Ok(())
+        Ok(run)
     }
 
     /// THE OUTPUT BUFFER, BACK IN f32.
     ///
     /// The C buffer is the LAST one: the design's buffers are A, the
     /// parameters and C.
-    fn read_back(&self, values: &mut [f32]) -> Result<(), ArrayError> {
-        let mut out = vec![0u8; values.len() * 2];
+    fn read_back(&mut self, values: &mut [f32]) -> Result<(), ArrayError> {
+        let used = values.len() * 2;
         let c = self.design.info().buffers.len() - 1;
-        self.design.read(c, &mut out)?;
-        npum_format::bf16::bf16_to_f32_bytes(&out, values);
+        self.design.read(c, &mut self.out_bytes[..used])?;
+        npum_format::bf16::bf16_to_f32_bytes(&self.out_bytes[..used], values);
+        Ok(())
+    }
+
+    /// Run the pass over chunks of `x`, pipelining host bf16 conversion of the
+    /// next chunk with the device dispatch of the current one.
+    fn run_chunked(
+        &mut self,
+        x: &mut [f32],
+        total: usize,
+        chunk_elems: usize,
+    ) -> Result<(), ArrayError> {
+        if total == 0 {
+            return Ok(());
+        }
+        let mut done = 0usize;
+        // First chunk: encode + upload + submit.
+        let first_n = (total - done).min(chunk_elems);
+        Self::encode_input(&x[done..done + first_n], &mut self.in_bytes);
+        self.design.write_bound(0, &self.in_bytes)?;
+        let mut run = self.submit()?;
+        let mut cur_n = first_n;
+
+        loop {
+            let next_done = done + cur_n;
+            if next_done < total {
+                // Prepare next chunk's input on the host while current runs.
+                let next_n = (total - next_done).min(chunk_elems);
+                Self::encode_input(&x[next_done..next_done + next_n], &mut self.in_bytes_alt);
+                ArrayDesign::<T>::wait_dispatch(run)?;
+                self.read_back(&mut x[done..done + cur_n])?;
+                self.design.write_bound(0, &self.in_bytes_alt)?;
+                std::mem::swap(&mut self.in_bytes, &mut self.in_bytes_alt);
+                run = self.submit()?;
+                done = next_done;
+                cur_n = next_n;
+            } else {
+                ArrayDesign::<T>::wait_dispatch(run)?;
+                self.read_back(&mut x[done..done + cur_n])?;
+                break;
+            }
+        }
         Ok(())
     }
 

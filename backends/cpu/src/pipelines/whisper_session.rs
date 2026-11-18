@@ -41,7 +41,7 @@
 //! of the left window and the effect is plain concatenation -- which is
 //! the right behaviour for windows that share no words at all.
 
-use crate::whisper::{Decoder, Encoder};
+use crate::whisper::{Decoder, Encoder, EncoderWorkspace};
 use crate::whisper_tokenizer::Tokenizer;
 
 /// The sample rate every Whisper model runs at.
@@ -189,6 +189,9 @@ pub fn transcribe_samples(
     let step = chunk - 2 * stride;
     let n = samples.len();
     let mut window_ids: Vec<Vec<i32>> = Vec::new();
+    // One workspace for the whole transcription: the encoder's scratch is
+    // reused across every window, not just across its layers.
+    let mut encoder_ws = EncoderWorkspace::new();
 
     let mut position = 0usize;
     loop {
@@ -196,6 +199,7 @@ pub fn transcribe_samples(
         let segment = run_window(
             encoder,
             decoder,
+            &mut encoder_ws,
             tokenizer,
             &samples[position..end],
             position,
@@ -236,6 +240,7 @@ pub struct FrontEndWeights {
 fn run_window(
     encoder: &Encoder,
     decoder: &mut Decoder,
+    encoder_ws: &mut EncoderWorkspace,
     tokenizer: &Tokenizer,
     window: &[f32],
     start: usize,
@@ -261,7 +266,7 @@ fn run_window(
     transcript.conv_seconds += conv_start.elapsed().as_secs_f64();
 
     let encoder_start = std::time::Instant::now();
-    let hidden = encoder.run(&conv, ENCODER_POSITIONS);
+    let hidden = encoder.run_into(&conv, ENCODER_POSITIONS, encoder_ws);
     transcript.encoder_seconds += encoder_start.elapsed().as_secs_f64();
 
     // The cross-attention cache is built once per WINDOW, not once per

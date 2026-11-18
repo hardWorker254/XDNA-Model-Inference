@@ -521,14 +521,19 @@ pub fn decode_det(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut keep: Vec<i64> = Vec::new();
-    while !order.is_empty() && (keep.len() as i64) < g.top_k {
-        let i = order[0];
+    // A read cursor plus one reused `rest` replaces `order.remove(0)` (an
+    // O(n) shift per survivor) and a fresh Vec per iteration. The surviving
+    // order is unchanged: the stable sort and the IoU predicate are untouched.
+    let mut rest: Vec<i64> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < order.len() && (keep.len() as i64) < g.top_k {
+        let i = order[cursor];
+        cursor += 1;
         if sc[i as usize] < g.score_threshold {
             break;
         }
         keep.push(i);
-        order.remove(0);
-        if order.is_empty() {
+        if cursor >= order.len() {
             break;
         }
         let bi = [
@@ -538,8 +543,8 @@ pub fn decode_det(
             bx[(i * 4 + 3) as usize],
         ];
         let ai = (bi[2] - bi[0]) * (bi[3] - bi[1]);
-        let mut rest = Vec::with_capacity(order.len());
-        for j in &order {
+        rest.clear();
+        for j in &order[cursor..] {
             let bj = [
                 bx[(*j * 4) as usize],
                 bx[(*j * 4 + 1) as usize],
@@ -555,7 +560,12 @@ pub fn decode_det(
                 rest.push(*j);
             }
         }
-        order = rest;
+        // Replace the order entirely with the survivors: draining only the
+        // consumed prefix would leave the SUPPRESSED candidates at the front
+        // of the next iteration.
+        order.clear();
+        order.extend_from_slice(&rest);
+        cursor = 0;
     }
 
     let mut out = Vec::with_capacity(keep.len());

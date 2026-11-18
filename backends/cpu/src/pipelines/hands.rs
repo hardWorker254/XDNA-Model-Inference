@@ -1582,14 +1582,26 @@ fn check_extent(
     Ok((oh, ow))
 }
 
-/// im2col with FOUR padding terms.
+/// The host-side scratch for one walk: the im2col rows and the GEMM output.
+///
+/// A walk's convolutions reuse the same pair of buffers; the storage grows to
+/// the largest shape and is never shrunk or dropped between nodes.
+struct ConvHostScratch {
+    a: Vec<f32>,
+    c: Vec<f32>,
+}
+
+/// im2col with FOUR padding terms, into a caller-owned buffer.
 ///
 /// The k index is `(ci*kh + i)*kw + j` and the row index is `y*W + x`, which is
 /// the order the weights are read in too, so the GEMM's K reduction walks the
 /// kernel exactly as the checkpoint stores it. Zero outside the window, and not
 /// a clamp: a clamped edge replicates the border pixel, which is a different
 /// network.
-fn im2col(
+///
+/// The gather writes only the IN-window columns, so the out-of-window ones are
+/// cleared first: a reused buffer still holds the previous convolution there.
+fn im2col_into(
     input: &Tensor,
     kh: i64,
     kw: i64,
@@ -1598,11 +1610,14 @@ fn im2col(
     sw: i64,
     oh: i64,
     ow: i64,
-) -> Vec<f32> {
+    a: &mut Vec<f32>,
+) {
     let (c, h, w) = (input.c, input.h, input.w);
     let m = oh * ow;
     let k = c * kh * kw;
-    let mut a = vec![0.0f32; (m * k) as usize];
+    let len = (m * k) as usize;
+    a.resize(len, 0.0);
+    a.fill(0.0);
     for y in 0..oh {
         for x in 0..ow {
             let row = &mut a[((y * ow + x) * k) as usize..][..k as usize];
@@ -1624,25 +1639,38 @@ fn im2col(
             }
         }
     }
-    a
 }
 
 /// The `[M, N]` to NCHW transpose, with the activation fused into it.
 ///
-/// Tiled 32 rows at a time: a naive n-outer / m-inner copy writes M runs of one
-/// float each for every channel and streams the destination as N simultaneous
-/// write pointers.
+/// Blocked over BOTH rows and channels: a BM x BN tile of the source is
+/// gathered into a small L1-resident buffer and scattered into NCHW as plane
+/// runs. Both sides are contiguous. The old version tiled only M and swept
+/// all N channels per block, keeping N source strides live for a 32-float
+/// write -- expensive at the landmark net's channel counts.
 fn transpose_mn_to_nchw(src: &[f32], m: i64, n: i64, dst: &mut [f32], act: Act, slope: &[f32]) {
-    const TILE: i64 = 32;
-    let mut m0 = 0i64;
+    const BM: usize = 32;
+    const BN: usize = 32;
+    let (m, n) = (m as usize, n as usize);
+    let mut tile = [0f32; BM * BN];
+    let mut m0 = 0usize;
     while m0 < m {
-        let m1 = (m0 + TILE).min(m);
-        for ch in 0..n {
-            let sl = slope.get(ch as usize).copied().unwrap_or(0.0);
-            let d = &mut dst[(ch * m) as usize..][..m as usize];
-            for mm in m0..m1 {
-                d[mm as usize] = act1(act, src[(mm * n + ch) as usize], sl);
+        let m1 = (m0 + BM).min(m);
+        let mut n0 = 0usize;
+        while n0 < n {
+            let n1 = (n0 + BN).min(n);
+            for r in 0..m1 - m0 {
+                let row = &src[(m0 + r) * n + n0..][..n1 - n0];
+                tile[r * BN..r * BN + (n1 - n0)].copy_from_slice(row);
             }
+            for c in 0..n1 - n0 {
+                let sl = slope.get(n0 + c).copied().unwrap_or(0.0);
+                let d = &mut dst[(n0 + c) * m + m0..][..m1 - m0];
+                for r in 0..m1 - m0 {
+                    d[r] = act1(act, tile[r * BN + c], sl);
+                }
+            }
+            n0 = n1;
         }
         m0 = m1;
     }
@@ -1664,23 +1692,9 @@ fn gemm_rows(
     out: &mut [f32],
     threads: usize,
 ) {
-    let threads = threads.min(m).max(1);
-    if threads <= 1 || m == 0 {
-        kernels::gemm_nt(a, m, b, k, n, bias, out);
-        return;
-    }
-    let chunk = m.div_ceil(threads);
-    let parts: Vec<&mut [f32]> = out.chunks_mut(chunk * n).collect();
-    std::thread::scope(|s| {
-        for (ci, part) in parts.into_iter().enumerate() {
-            let rows = part.len() / n;
-            if rows == 0 {
-                continue;
-            }
-            let a_part = &a[ci * chunk * k..(ci * chunk + rows) * k];
-            s.spawn(move || kernels::gemm_nt(a_part, rows, b, k, n, bias, part));
-        }
-    });
+    // One policy for every host GEMM: shared pool, work threshold and a
+    // minimum number of rows per worker, all bit-exact by construction.
+    kernels::gemm_nt_rows(a, m, b, k, n, bias, out, threads);
 }
 
 /// How many threads the host convolutions are split over.
@@ -1800,6 +1814,13 @@ impl Hands {
         cost: &mut Cost,
     ) -> Result<Vec<Tensor>, String> {
         let mut vals: Vec<Tensor> = vec![Tensor::default(); graph.len()];
+        // ONE pair of host buffers for the whole walk. The convolutions reuse
+        // them; the storage grows to the largest shape and is never dropped
+        // between nodes.
+        let mut host = ConvHostScratch {
+            a: Vec::new(),
+            c: Vec::new(),
+        };
         for (i, layer) in graph.iter().enumerate() {
             let name = names.get(i).map(|s| s.as_str()).unwrap_or("?");
             let nl = format!("{which} node {i} '{name}'");
@@ -1812,6 +1833,7 @@ impl Hands {
                 slopes,
                 &nl,
                 cost,
+                &mut host,
                 array.as_deref_mut(),
             )?;
             vals[i] = out;
@@ -1836,6 +1858,7 @@ impl Hands {
         slopes: &[Slope],
         label: &str,
         cost: &mut Cost,
+        host: &mut ConvHostScratch,
         array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let operand = |idx: i32| -> Result<&Tensor, String> {
@@ -1883,7 +1906,7 @@ impl Hands {
                         layer.conv
                     ));
                 };
-                self.conv(first, layer, conv, net, slope, label, cost, array)
+                self.conv(first, layer, conv, net, slope, label, cost, host, array)
             }
             Op::DwConv => {
                 let conv = convs.get(layer.conv as usize).filter(|c| !c.w.is_empty());
@@ -1935,6 +1958,7 @@ impl Hands {
         slope: Option<&[f32]>,
         label: &str,
         cost: &mut Cost,
+        host: &mut ConvHostScratch,
         mut array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let (oh, ow) = check_extent(layer, input.h, input.w, w.kh, w.kw, label)?;
@@ -1962,7 +1986,7 @@ impl Hands {
             ));
         }
         let t = std::time::Instant::now();
-        let a = im2col(
+        im2col_into(
             input,
             w.kh,
             w.kw,
@@ -1971,12 +1995,13 @@ impl Hands {
             layer.stride_w,
             oh,
             ow,
+            &mut host.a,
         );
         cost.t_im2col += t.elapsed().as_secs_f64();
         let m = (oh * ow) as usize;
         let k = w.kin() as usize;
         let n = w.cout as usize;
-        let mut c = vec![0.0f32; m * n];
+        host.c.resize(m * n, 0.0);
         // THE ARRAY'S SPAN, AND THE HOST'S.
         //
         // The array's own time is measured around the dispatch, and the
@@ -1997,7 +2022,7 @@ impl Hands {
                 let before_convert = array.convert_seconds();
                 let t = std::time::Instant::now();
                 array
-                    .conv(&name, &a, m, k, n, &mut c)
+                    .conv(&name, &host.a, m, k, n, &mut host.c)
                     .map_err(|e| format!("{label}: {e}"))?;
                 array_s = t.elapsed().as_secs_f64();
                 repack_s = array.convert_seconds() - before_convert;
@@ -2009,7 +2034,7 @@ impl Hands {
             }
             None => {
                 let t = std::time::Instant::now();
-                gemm_rows(&a, m, wmat, k, n, &w.b, &mut c, self.threads);
+                gemm_rows(&host.a, m, wmat, k, n, &w.b, &mut host.c, self.threads);
                 t.elapsed().as_secs_f64()
             }
         };
@@ -2023,7 +2048,7 @@ impl Hands {
         let t = std::time::Instant::now();
         let empty: &[f32] = &[];
         transpose_mn_to_nchw(
-            &c,
+            &host.c,
             m as i64,
             n as i64,
             &mut out.d,
@@ -2597,5 +2622,31 @@ impl Hands {
             array,
             cost,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The blocked transpose must equal the plain copy value for value,
+    /// across tile boundaries and for every activation.
+    #[test]
+    fn blocked_transpose_matches_plain() {
+        for &(m, n) in &[(1usize, 1usize), (5, 3), (32, 32), (40, 70), (129, 131)] {
+            let src: Vec<f32> = (0..m * n).map(|i| (i as f32 - 7.0) / 11.0).collect();
+            let slope: Vec<f32> = (0..n).map(|i| (i as f32) / 20.0).collect();
+            let mut got = vec![0f32; m * n];
+            let mut want = vec![0f32; m * n];
+            for act in [Act::None, Act::Relu, Act::Relu6, Act::PreLu] {
+                transpose_mn_to_nchw(&src, m as i64, n as i64, &mut got, act, &slope);
+                for mm in 0..m {
+                    for ch in 0..n {
+                        want[ch * m + mm] = act1(act, src[mm * n + ch], slope[ch]);
+                    }
+                }
+                assert_eq!(got, want, "m={m} n={n} act={act:?}");
+            }
+        }
     }
 }

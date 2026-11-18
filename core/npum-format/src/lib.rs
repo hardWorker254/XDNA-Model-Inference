@@ -57,6 +57,7 @@ pub use digest::{model_digest, sha256_bytes, sha256_file};
 pub use directory::{Directory, TensorEntry};
 pub use header::{ContainerFormat, Header, MAGIC_CURRENT, MAGIC_LEGACY, VERSION};
 pub use layout::{BLayout, MacGeom, gemm_b_layout, layout_hash};
+pub use tiling::tile_b_into;
 pub use writer::Writer;
 
 use std::path::Path;

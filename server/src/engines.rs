@@ -4,20 +4,20 @@
 //! families exposed by the server. Route handlers and HTTP DTO/error mapping live
 //! in `routes`; this layer focuses on turning requests into model outputs.
 
+use std::sync::Arc;
+
 /// The speech endpoint's engine.
 ///
-/// The encoder, the decoder with its KV cache, the tokenizer and the front
-/// end's weights. The decoder is behind a lock because it holds state --
-/// the cache and the "first generated step" counter the decoding policy is
-/// keyed on -- and two requests must not share it: a request that fed its
-/// tokens into another request's cache would answer with the other
-/// request's words.
+/// The encoder, the tokenizer and the front end's weights are shared, while
+/// each decoder instance keeps its own KV cache/state and is guarded by a
+/// lock. A pool larger than one allows independent requests to decode in
+/// parallel at the cost of loading the decoder weights/state multiple times.
 ///
 /// The work is the CPU backend's and the numbers are the reference's numbers: the
 /// same container through the same arithmetic gives the same bytes.
 pub struct Transcriber {
     encoder: npum_cpu::whisper::Encoder,
-    decoder: std::sync::Mutex<npum_cpu::whisper::Decoder>,
+    decoders: Vec<std::sync::Mutex<npum_cpu::whisper::Decoder>>,
     tokenizer: npum_cpu::whisper_tokenizer::Tokenizer,
     weights: npum_cpu::whisper_session::FrontEndWeights,
     options: npum_cpu::whisper_session::Options,
@@ -29,12 +29,31 @@ impl Transcriber {
         path: &std::path::Path,
         options: npum_cpu::whisper_session::Options,
     ) -> std::result::Result<Self, String> {
+        Self::open_with_pool(path, options, 1)
+    }
+
+    /// Build an engine from a container with a pool of decoder instances.
+    ///
+    /// `pool` is clamped to at least one. Each instance keeps its own
+    /// KV cache/state, so a larger pool enables concurrent transcriptions
+    /// but uses more memory.
+    pub fn open_with_pool(
+        path: &std::path::Path,
+        options: npum_cpu::whisper_session::Options,
+        pool: usize,
+    ) -> std::result::Result<Self, String> {
         let container =
             npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let encoder = npum_cpu::whisper::Encoder::open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let decoder = npum_cpu::whisper::Decoder::open(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let pool = pool.max(1);
+        let mut decoders = Vec::with_capacity(pool);
+        for _ in 0..pool {
+            decoders.push(std::sync::Mutex::new(
+                npum_cpu::whisper::Decoder::open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            ));
+        }
         let table = container
             .tensor_bytes("tokenizer.whisper_table")
             .map_err(|_| format!("{}: the container holds no tokenizer table", path.display()))?;
@@ -47,7 +66,7 @@ impl Transcriber {
         };
         Ok(Self {
             encoder,
-            decoder: std::sync::Mutex::new(decoder),
+            decoders,
             tokenizer,
             weights,
             options,
@@ -80,10 +99,21 @@ impl Transcriber {
         options: &npum_cpu::whisper_session::Options,
     ) -> std::result::Result<npum_cpu::whisper_session::Transcript, String> {
         let read = npum_cpu::whisper_features::read_wav_bytes(audio, name).map_err(|r| r.0)?;
-        let mut decoder = self
-            .decoder
-            .lock()
-            .map_err(|_| "the decoder's state is poisoned".to_string())?;
+        // Prefer an idle decoder so pooled engines can serve requests in
+        // parallel; fall back to waiting on the first instance.
+        let mut decoder = None;
+        for mutex in &self.decoders {
+            if let Ok(guard) = mutex.try_lock() {
+                decoder = Some(guard);
+                break;
+            }
+        }
+        let mut decoder = match decoder {
+            Some(guard) => guard,
+            None => self.decoders[0]
+                .lock()
+                .map_err(|_| "the decoder's state is poisoned".to_string())?,
+        };
         npum_cpu::whisper_session::transcribe_samples(
             &self.encoder,
             &mut decoder,
@@ -102,18 +132,45 @@ impl Transcriber {
 
 /// The classifier endpoint's engine.
 ///
-/// The ViT's weights and the geometry they describe. Unlike the speech
-/// engine this one holds no STATE between requests -- the encoder is a
-/// function of the image -- so it needs no lock.
+/// One classification's reusable scratch. The encoder used to allocate eight
+/// large buffers per layer and two result vectors per image; those now live
+/// here and are handed to `encode_into` / `classify_into`.
+struct ClassifierScratch {
+    workspace: npum_cpu::vit::VitWorkspace,
+    hidden: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl ClassifierScratch {
+    fn new() -> Self {
+        Self {
+            workspace: npum_cpu::vit::VitWorkspace::new(),
+            hidden: Vec::new(),
+            logits: Vec::new(),
+        }
+    }
+}
+
+/// The ViT's weights and the geometry they describe, plus a small pool of
+/// reusable encoder scratch. Scratch is state about ALLOCATION, not about the
+/// model: the encoder is still a pure function of the image. A second slot
+/// lets two classifications overlap; a third request falls back to a local
+/// scratch rather than waiting behind a lock.
 pub struct Classifier {
     vit: npum_cpu::vit::Vit,
+    scratch: Vec<std::sync::Mutex<ClassifierScratch>>,
 }
 
 impl Classifier {
     /// Build an engine from a container.
     pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         let vit = npum_cpu::vit::Vit::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self { vit })
+        Ok(Self {
+            vit,
+            scratch: (0..2)
+                .map(|_| std::sync::Mutex::new(ClassifierScratch::new()))
+                .collect(),
+        })
     }
 
     /// How many labels.
@@ -149,13 +206,28 @@ impl Classifier {
         let front = std::time::Instant::now();
         let patches = npum_cpu::vit_image::preprocess(&decoded, geometry)?;
         let front_end_s = front.elapsed().as_secs_f64();
+        // Take a free scratch slot; when both are busy, use a local one.
+        // The encoding itself is unchanged -- same kernels, same order.
+        let mut fallback = std::cell::OnceCell::new();
+        let mut slot = self.scratch.iter().find_map(|m| m.try_lock().ok());
+        let scratch: &mut ClassifierScratch = match slot.as_mut() {
+            Some(guard) => &mut **guard,
+            None => {
+                let _ = fallback.set(ClassifierScratch::new());
+                fallback.get_mut().unwrap()
+            }
+        };
         let enc = std::time::Instant::now();
-        let hidden = self.vit.encode(&patches);
+        self.vit
+            .encode_into(&patches, &mut scratch.workspace, &mut scratch.hidden);
         let encoder_s = enc.elapsed().as_secs_f64();
         let head = std::time::Instant::now();
         let d = geometry.hidden as usize;
-        let logits = self.vit.classify(&hidden[..d]);
-        let prediction = npum_cpu::vit::predict(&logits, self.vit.labels())?;
+        let nlab = self.vit.geometry().num_labels as usize;
+        scratch.logits.resize(nlab, 0.0);
+        self.vit
+            .classify_into(&scratch.hidden[..d], &mut scratch.logits[..nlab]);
+        let prediction = npum_cpu::vit::predict(&scratch.logits[..nlab], self.vit.labels())?;
         let head_s = head.elapsed().as_secs_f64();
         Ok(Classification {
             prediction,
@@ -317,7 +389,25 @@ pub struct Embedder {
     model: EmbedModel,
     seq: usize,
     vulkan_ops: Option<(bool, bool, bool, bool)>,
+    /// The device context, opened once and shared by every request.
+    ///
+    /// `VulkanOps::with_ops` opens a Vulkan device. Doing that per request
+    /// paid device setup on each HTTP call even though the model, the shaders
+    /// and the queues are the same every time. The `Option` inside the lock
+    /// is empty until either `with_vulkan_device` hands in the device the
+    /// startup probe opened or the first GPU request opens one, so a
+    /// host-only server stays host-only. The lock is held for the whole batch
+    /// loop, which also keeps two requests from issuing work to the same
+    /// device context at once.
+    vulkan: Option<Arc<std::sync::Mutex<Option<npum_vulkan::ops::VulkanOps>>>>,
+    /// Reusable BERT scratch and output, shared across requests by cloning
+    /// the `Arc` (the engine itself is cloned into every `ServerState`).
+    /// Two slots let two requests run concurrently; a third allocates a
+    /// local scratch instead of waiting.
+    bert_scratch: Arc<Vec<std::sync::Mutex<BertSlot>>>,
 }
+
+type BertSlot = (npum_cpu::bert::BertWorkspace, Vec<f32>);
 
 impl Embedder {
     /// Build an engine from a container (host arithmetic).
@@ -372,8 +462,29 @@ impl Embedder {
             tokenizer,
             model,
             seq,
+            vulkan: vulkan_ops.map(|_| Arc::new(std::sync::Mutex::new(None))),
             vulkan_ops,
+            bert_scratch: Arc::new(
+                (0..2)
+                    .map(|_| {
+                        std::sync::Mutex::new((npum_cpu::bert::BertWorkspace::new(), Vec::new()))
+                    })
+                    .collect(),
+            ),
         })
+    }
+
+    /// Give the engine a Vulkan device that is already open.
+    ///
+    /// `serve` probes for a GPU before it opens a model, and the probe is a
+    /// real `VulkanOps`. Keeping that object here means the first request
+    /// reuses the device the startup check opened instead of opening a
+    /// second one. A host-only engine ignores it.
+    pub fn with_vulkan_device(self, device: Option<npum_vulkan::ops::VulkanOps>) -> Self {
+        if let (Some(shared), Some(device)) = (self.vulkan.as_ref(), device) {
+            *shared.lock().expect("the Vulkan device mutex was poisoned") = Some(device);
+        }
+        self
     }
 
     /// The vocabulary's size.
@@ -389,11 +500,32 @@ impl Embedder {
         self.seq
     }
 
+    /// Run `f` with a free BERT scratch slot (or a local one when both are
+    /// in use). The vectors are written by `f` into the caller's `vectors`;
+    /// only the scratch is reused, never the arithmetic.
+    fn with_bert_slot<R>(&self, f: impl FnOnce(&mut BertSlot) -> R) -> R {
+        let mut slot = self.bert_scratch.iter().find_map(|m| m.try_lock().ok());
+        if let Some(guard) = slot.as_mut() {
+            f(&mut **guard)
+        } else {
+            f(&mut (npum_cpu::bert::BertWorkspace::new(), Vec::new()))
+        }
+    }
+
     /// Embed the texts.
     ///
     /// The vectors and the token count, which the usage block reports.
     pub fn embed(&self, texts: &[String]) -> std::result::Result<(Vec<Vec<f32>>, usize), String> {
-        let mut vectors = Vec::with_capacity(texts.len());
+        if texts.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        // Tokenise and pad every text up front so the model can be run in
+        // batches instead of one forward pass per input. The Vulkan device
+        // opened for the first such request stays alive across all later
+        // batches and requests; the CPU ops instance is per request.
+        let mut all_ids = Vec::with_capacity(texts.len() * self.seq);
+        let mut all_mask = Vec::with_capacity(texts.len() * self.seq);
         let mut tokens = 0usize;
         for text in texts {
             let (encoding, _) = self
@@ -401,86 +533,115 @@ impl Embedder {
                 .encode_padded(text, self.seq)
                 .map_err(|e| e.to_string())?;
             tokens += encoding.mask.iter().filter(|m| **m > 0).count();
-            let chunk = match &self.model {
-                EmbedModel::Bert(model) => {
-                    if let Some((gemm, layn, gelu, softm)) = self.vulkan_ops {
-                        let mut ops =
-                            npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm);
-                        if !ops.has_gpu() {
-                            return Err(
-                                "no Vulkan device was opened on this machine for --vk-ops/--backend vulkan"
-                                    .to_string(),
-                            );
-                        }
-                        model
-                            .embed(
-                                &encoding.ids,
-                                &encoding.mask,
-                                1,
-                                self.seq,
-                                &mut ops,
-                                None,
-                                None,
-                            )
-                            .map_err(|e| e.to_string())?
-                    } else {
-                        let mut ops = npum_cpu::ops::CpuOps::best();
-                        model
-                            .embed(
-                                &encoding.ids,
-                                &encoding.mask,
-                                1,
-                                self.seq,
-                                &mut ops,
-                                None,
-                                None,
-                            )
-                            .map_err(|e| e.to_string())?
-                    }
-                }
-                EmbedModel::Gte(model) => {
-                    if let Some((gemm, layn, gelu, softm)) = self.vulkan_ops {
-                        let mut ops =
-                            npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm);
-                        if !ops.has_gpu() {
-                            return Err(
-                                "no Vulkan device was opened on this machine for --vk-ops/--backend vulkan"
-                                    .to_string(),
-                            );
-                        }
-                        let mut timings = npum_cpu::gte::Timings::default();
-                        model
-                            .embed_timed_with(
-                                &mut ops,
-                                &mut timings,
-                                &encoding.ids,
-                                &encoding.mask,
-                                1,
-                                self.seq,
-                                None,
-                                None,
-                            )
-                            .map_err(|e| e.to_string())?
-                    } else {
-                        let mut ops = npum_cpu::ops::CpuOps::best();
-                        let mut timings = npum_cpu::gte::Timings::default();
-                        model
-                            .embed_timed_with(
-                                &mut ops,
-                                &mut timings,
-                                &encoding.ids,
-                                &encoding.mask,
-                                1,
-                                self.seq,
-                                None,
-                                None,
-                            )
-                            .map_err(|e| e.to_string())?
-                    }
-                }
-            };
-            vectors.push(chunk);
+            all_ids.extend_from_slice(&encoding.ids);
+            all_mask.extend_from_slice(&encoding.mask);
         }
+
+        let hidden = match &self.model {
+            EmbedModel::Bert(model) => model.spec.hidden,
+            EmbedModel::Gte(model) => model.spec.hidden,
+        };
+
+        // Bound workspace/activation growth for large requests while still
+        // amortising tokenisation, dispatch and device setup.
+        const BATCH: usize = 16;
+
+        let mut vectors = Vec::with_capacity(texts.len());
+        let mut offset = 0usize;
+        if let (Some((gemm, layn, gelu, softm)), Some(shared)) =
+            (self.vulkan_ops, self.vulkan.as_ref())
+        {
+            // OPEN ONCE. Every later request reuses the same device context
+            // instead of paying Vulkan setup again, and the lock keeps one
+            // request at a time on it.
+            let mut guard = shared.lock().expect("the Vulkan device mutex was poisoned");
+            let ops = guard.get_or_insert_with(|| {
+                npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm)
+            });
+            if !ops.has_gpu() {
+                return Err(
+                    "no Vulkan device was opened on this machine for --vk-ops/--backend vulkan"
+                        .to_string(),
+                );
+            }
+            while offset < texts.len() {
+                let batch = (texts.len() - offset).min(BATCH);
+                let start = offset * self.seq;
+                let end = (offset + batch) * self.seq;
+                let ids = &all_ids[start..end];
+                let mask = &all_mask[start..end];
+                self.with_bert_slot(|(workspace, flat)| {
+                    match &self.model {
+                        EmbedModel::Bert(model) => {
+                            model
+                                .embed_into(
+                                    ids, mask, batch, self.seq, ops, None, None, workspace, flat,
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                        EmbedModel::Gte(model) => {
+                            let mut timings = npum_cpu::gte::Timings::default();
+                            model
+                                .embed_timed_with(
+                                    ops,
+                                    &mut timings,
+                                    ids,
+                                    mask,
+                                    batch,
+                                    self.seq,
+                                    None,
+                                    None,
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    for i in 0..batch {
+                        vectors.push(flat[i * hidden..(i + 1) * hidden].to_vec());
+                    }
+                    Ok::<(), String>(())
+                })?;
+                offset += batch;
+            }
+        } else {
+            let mut ops = npum_cpu::ops::CpuOps::best();
+            while offset < texts.len() {
+                let batch = (texts.len() - offset).min(BATCH);
+                let start = offset * self.seq;
+                let end = (offset + batch) * self.seq;
+                let ids = &all_ids[start..end];
+                let mask = &all_mask[start..end];
+                self.with_bert_slot(|(workspace, flat)| {
+                    match &self.model {
+                        EmbedModel::Bert(model) => model
+                            .embed_into(
+                                ids, mask, batch, self.seq, &mut ops, None, None, workspace, flat,
+                            )
+                            .map_err(|e| e.to_string())?,
+                        EmbedModel::Gte(model) => {
+                            let mut timings = npum_cpu::gte::Timings::default();
+                            model
+                                .embed_timed_with(
+                                    &mut ops,
+                                    &mut timings,
+                                    ids,
+                                    mask,
+                                    batch,
+                                    self.seq,
+                                    None,
+                                    None,
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    for i in 0..batch {
+                        vectors.push(flat[i * hidden..(i + 1) * hidden].to_vec());
+                    }
+                    Ok::<(), String>(())
+                })?;
+                offset += batch;
+            }
+        }
+
         Ok((vectors, tokens))
     }
 }

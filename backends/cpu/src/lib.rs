@@ -50,6 +50,7 @@
 pub mod frontend;
 pub mod kernels;
 pub mod ops;
+pub mod parallel;
 pub mod pipelines;
 
 // Backward-compatible module paths.

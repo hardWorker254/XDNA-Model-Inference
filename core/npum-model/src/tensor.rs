@@ -171,31 +171,41 @@ impl Tensor {
     /// number. That is why the int8 path has its own tolerances and does not
     /// share the f32 ones.
     pub fn to_f32(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.to_f32_into(&mut out);
+        out
+    }
+
+    /// Widening into a caller-owned `Vec`, reusing its capacity.
+    ///
+    /// `to_f32` allocates a fresh vector on every call, and the generic
+    /// `Backend` path calls it for every operand of every op. The decode
+    /// loop here is the SAME as `to_f32`'s, element by element and in order,
+    /// so reusing the buffer cannot change a single bit.
+    pub fn to_f32_into(&self, out: &mut Vec<f32>) {
+        out.clear();
+        out.reserve(self.len());
         match self.dtype {
-            DType::F32 => self
-                .data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            DType::Bf16 => self
-                .data
-                .chunks_exact(2)
-                .map(|c| npum_format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-            DType::I32 => self
-                .data
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
-                .collect(),
-            DType::I8 => self.data.iter().map(|b| (*b as i8) as f32).collect(),
-            DType::I64 => self
-                .data
-                .chunks_exact(8)
-                .map(|c| {
-                    i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
-                })
-                .collect(),
-            DType::U16 | DType::U8 => self.data.iter().map(|b| *b as f32).collect(),
+            DType::F32 => out.extend(
+                self.data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            ),
+            DType::Bf16 => out.extend(
+                self.data
+                    .chunks_exact(2)
+                    .map(|c| npum_format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
+            ),
+            DType::I32 => out.extend(
+                self.data
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32),
+            ),
+            DType::I8 => out.extend(self.data.iter().map(|b| (*b as i8) as f32)),
+            DType::I64 => out.extend(self.data.chunks_exact(8).map(|c| {
+                i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
+            })),
+            DType::U16 | DType::U8 => out.extend(self.data.iter().map(|b| *b as f32)),
         }
     }
 }

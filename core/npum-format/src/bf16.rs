@@ -54,6 +54,30 @@ pub fn f32_to_bf16_bytes(src: &[f32], dst: &mut [u8]) {
     }
 }
 
+/// A row of f32 values, packed into bf16, followed by a zeroed padding tail.
+///
+/// This is the shape the array's A operand has: a real row of `src.len()`
+/// values, then `pad_values` more columns whose bf16 bytes are zero. The
+/// caller used to write those zeros in a separate pass before the conversion;
+/// doing both here means each design row is VISITED ONCE rather than twice,
+/// and the bytes are the same -- the real values go through
+/// [`f32_to_bf16_bytes`] unchanged and the tail is zero.
+///
+/// `dst` may be longer than the row; the bytes past it are left alone. A
+/// shorter `dst` still converts as many values as fit and zeroes the rest of
+/// what fits, matching [`f32_to_bf16_bytes`]'s short-destination rule.
+pub fn f32_to_bf16_bytes_padded(src: &[f32], dst: &mut [u8], pad_values: usize) {
+    let real = src.len() * 2;
+    let end = real + pad_values * 2;
+    let fit = end.min(dst.len());
+    let dst = &mut dst[..fit];
+    let converted = real.min(fit);
+    f32_to_bf16_bytes(src, &mut dst[..converted]);
+    if fit > converted {
+        dst[converted..].fill(0);
+    }
+}
+
 /// A block of bf16 bytes, widened into f32.
 ///
 /// `src` holds two bytes per value, little-endian; the values past `dst`'s
@@ -77,6 +101,69 @@ pub fn bf16_to_f32_bytes(src: &[u8], dst: &mut [f32]) {
         let at = index * 2;
         let bits = u16::from_le_bytes([src[at], src[at + 1]]);
         dst[index] = crate::bf16_to_f32(bits);
+    }
+}
+
+/// A block of bf16 bytes, widened into f32 and added to a bias vector.
+///
+/// This is the read-back half of a biased dispatch fused into ONE pass. A plain
+/// [`bf16_to_f32_bytes`] followed by a bias add decodes into a scratch row and
+/// then reads that row again for the add -- two visits to every output value,
+/// plus a buffer the size of a row. At the array's volume (hundreds of millions
+/// of values per frame on the vision families) the second visit is the sort of
+/// overhead that shows up in a measurement as "host shuffling". Here the widening
+/// writes straight into its final place with the bias already added.
+///
+/// `dst[i] = bf16_to_f32(src[2i..2i+2]) + bias[i]`, with a missing bias entry
+/// contributing zero. That matches the padded-bias convention the dispatch uses:
+/// the convolution's own bias is followed by zeros out to the design's width.
+pub fn bf16_to_f32_add_bias_bytes(src: &[u8], dst: &mut [f32], bias: &[f32]) {
+    let n = dst.len().min(src.len() / 2);
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && bias.len() >= n {
+            // SAFETY: the feature was just detected, and the function below
+            // reads 16 bytes and 8 floats and writes 8 floats only while all
+            // eight values are inside the slices it was given.
+            unsafe { bf16_to_f32_add_bias_avx2(src, dst, bias, n) };
+            i = n & !7;
+        }
+    }
+
+    // THE SCALAR, for what is left and for every other machine.
+    for index in i..n {
+        let at = index * 2;
+        let bits = u16::from_le_bytes([src[at], src[at + 1]]);
+        dst[index] = crate::bf16_to_f32(bits) + bias.get(index).copied().unwrap_or(0.0);
+    }
+}
+
+/// The AVX2 path: eight bf16 widened, biased and written in one visit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bf16_to_f32_add_bias_avx2(src: &[u8], dst: &mut [f32], bias: &[f32], n: usize) {
+    use std::arch::x86_64::*;
+
+    // SAFETY: the caller checked the feature and that `bias` holds at least
+    // `n` entries. Every pointer below stays inside its slice: the loop reads
+    // 16 source bytes and 8 bias floats and writes 8 floats only while eight
+    // values remain in all three.
+    unsafe {
+        let mut index = 0usize;
+        while index + 8 <= n {
+            let packed = _mm_loadu_si128(src.as_ptr().add(index * 2) as *const __m128i);
+            let widened = _mm256_cvtepu16_epi32(packed);
+            let shifted = _mm256_slli_epi32(widened, 16);
+            let values = _mm256_castsi256_ps(shifted);
+            let bias_values = _mm256_loadu_ps(bias.as_ptr().add(index));
+            _mm256_storeu_ps(
+                dst.as_mut_ptr().add(index),
+                _mm256_add_ps(values, bias_values),
+            );
+            index += 8;
+        }
     }
 }
 
@@ -223,5 +310,67 @@ mod tests {
         f32_to_bf16_bytes(&values, &mut short);
         assert_eq!(short[4], packed[4]);
         assert_eq!(short[5], packed[5]);
+    }
+
+    #[test]
+    fn widening_with_bias_is_the_widen_then_add() {
+        // The numbers the array's output holds are bf16-exact, so comparing the
+        // fused helper with the two-pass original is an exact bit comparison.
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 31.0) / 9.0).collect();
+        let packed = {
+            let mut p = vec![0u8; values.len() * 2];
+            f32_to_bf16_bytes(&values, &mut p);
+            p
+        };
+        let bias: Vec<f32> = (0..values.len())
+            .map(|i| ((i % 7) as f32 - 3.0) / 4.0)
+            .collect();
+
+        let mut want = vec![0f32; values.len()];
+        bf16_to_f32_bytes(&packed, &mut want);
+        for (w, b) in want.iter_mut().zip(&bias) {
+            *w += *b;
+        }
+
+        let mut got = vec![0f32; values.len()];
+        bf16_to_f32_add_bias_bytes(&packed, &mut got, &bias);
+        assert_eq!(
+            got, want,
+            "the fused widen+add must be the two passes' result"
+        );
+
+        // A short bias contributes zero past its end, like the padded bias.
+        let short = &bias[..5];
+        let mut want_short = vec![0f32; values.len()];
+        bf16_to_f32_bytes(&packed, &mut want_short);
+        for (i, w) in want_short.iter_mut().enumerate() {
+            *w += short.get(i).copied().unwrap_or(0.0);
+        }
+        let mut got_short = vec![0f32; values.len()];
+        bf16_to_f32_add_bias_bytes(&packed, &mut got_short, short);
+        assert_eq!(
+            got_short, want_short,
+            "a short bias must contribute zero past its end"
+        );
+    }
+
+    #[test]
+    fn the_padded_row_is_the_conversion_then_zeros() {
+        let values = vec![1.0f32, -2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        const PAD: usize = 7;
+        let row_len = values.len() + PAD;
+        let mut got = vec![0xAAu8; row_len * 2 + 4];
+        f32_to_bf16_bytes_padded(&values, &mut got, PAD);
+
+        let mut want = vec![0xAAu8; row_len * 2 + 4];
+        f32_to_bf16_bytes(&values, &mut want[..values.len() * 2]);
+        want[values.len() * 2..row_len * 2].fill(0);
+        assert_eq!(got, want, "one pass must write the old two passes' bytes");
+
+        // A destination shorter than the row stops at its own length, and
+        // still converts the same leading values.
+        let mut short = vec![0xFFu8; 6];
+        f32_to_bf16_bytes_padded(&values, &mut short, PAD);
+        assert_eq!(&short, &want[..6]);
     }
 }

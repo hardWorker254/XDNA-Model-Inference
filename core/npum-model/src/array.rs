@@ -260,6 +260,58 @@ pub trait ArrayGemm {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()>;
+
+    /// Run a batch of INDEPENDENT projections.
+    ///
+    /// `outs[i]` receives op `i`'s output. An array backend overlaps the host
+    /// side of op N+1 with the device compute of op N; a backend with nothing
+    /// to overlap runs the ops in order through [`Self::gemm`], which is what
+    /// the default does and what every caller sees when the projections stay
+    /// on the host.
+    ///
+    /// Dependent ops do NOT belong in one batch: the overlap is only safe when
+    /// an op does not read another op's output. The four projections of a
+    /// transformer layer are a chain, not a batch -- QKV feeds the attention,
+    /// whose output feeds the output projection, and so on -- so a layer's own
+    /// GEMMs stay sequential. A batch is for projections that really are
+    /// independent, such as a decoder's self-attention and cross-attention
+    /// inputs, or a head's parallel key and value panels.
+    fn gemm_batch(&mut self, ops: &[PipelinedGemm<'_>], outs: &mut [&mut [f32]]) -> Result<()> {
+        if ops.len() != outs.len() {
+            return Err(ArrayError(format!(
+                "{} projections were submitted with {} output buffers",
+                ops.len(),
+                outs.len()
+            )));
+        }
+        for (op, out) in ops.iter().zip(outs.iter_mut()) {
+            self.gemm(op.weight, op.a, op.rows, op.k, op.n, op.bias, out)?;
+        }
+        Ok(())
+    }
+}
+
+/// One independent projection in a pipelined batch.
+///
+/// The same arguments as [`ArrayGemm::gemm`], gathered so a caller can hand
+/// several projections to [`ArrayGemm::gemm_batch`] at once. The ops must NOT
+/// depend on one another: an array implementation overlaps op N+1's host
+/// packing and upload with op N's device compute, which is only safe when
+/// N+1 does not read N's output.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelinedGemm<'a> {
+    /// The weight's name in the container -- "layer.0.qkv".
+    pub weight: &'a str,
+    /// The activations: `rows` rows of `k` f32 values.
+    pub a: &'a [f32],
+    /// The number of rows in `a` and in the output.
+    pub rows: usize,
+    /// The reduction width.
+    pub k: usize,
+    /// The output width.
+    pub n: usize,
+    /// The bias of `n` values, when the projection has one.
+    pub bias: Option<&'a [f32]>,
 }
 
 /// The array's side of a family's dense convolution.

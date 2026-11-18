@@ -225,17 +225,25 @@ async fn labels(State(state): State<Shared>) -> Response {
 
 /// `POST /v1/embeddings`.
 async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Response {
-    let body = String::from_utf8_lossy(&body).to_string();
     let Some(encoder) = &state.encoder else {
         return not_found(&state, "/v1/embeddings");
     };
-    let request: Value = match serde_json::from_str(&body) {
+    // Parse straight from the request bytes: a large embeddings input used
+    // to be copied into a `String` first. On error, retry through the lossy
+    // string so the exact error text the API returns does not change.
+    let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return json(
-                StatusCode::BAD_REQUEST,
-                error_body(&e.to_string(), "invalid_request_error"),
-            );
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(&body).to_string();
+            match serde_json::from_str(&lossy) {
+                Ok(v) => v,
+                Err(e) => {
+                    return json(
+                        StatusCode::BAD_REQUEST,
+                        error_body(&e.to_string(), "invalid_request_error"),
+                    );
+                }
+            }
         }
     };
     let texts: Vec<String> = match &request["input"] {
@@ -367,7 +375,7 @@ async fn classify(
             ),
         );
     };
-    let parts = match crate::multipart::parse(&body, &boundary) {
+    let mut parts = match crate::multipart::parse(&body, &boundary) {
         Ok(parts) => parts,
         Err(reason) => {
             return json(
@@ -377,12 +385,12 @@ async fn classify(
         }
     };
 
-    let mut image = None;
+    let mut image_idx = None;
     let mut n_image = 0usize;
-    for part in &parts {
+    for (i, part) in parts.iter().enumerate() {
         if part.name == "image" {
             n_image += 1;
-            image = Some(part);
+            image_idx = Some(i);
         }
     }
     if n_image > 1 {
@@ -397,7 +405,7 @@ async fn classify(
             ),
         );
     }
-    let Some(image) = image.filter(|p| !p.data.is_empty()) else {
+    let Some(image_idx) = image_idx.filter(|&i| !parts[i].data.is_empty()) else {
         return json(
             StatusCode::BAD_REQUEST,
             error_body(
@@ -406,13 +414,13 @@ async fn classify(
             ),
         );
     };
-    if image.data.len() > 64 * 1024 * 1024 {
+    if parts[image_idx].data.len() > 64 * 1024 * 1024 {
         return json(
             StatusCode::PAYLOAD_TOO_LARGE,
             error_body(
                 &format!(
                     "the upload is {} MB; this build caps a request at 64 MB",
-                    image.data.len() / (1 << 20)
+                    parts[image_idx].data.len() / (1 << 20)
                 ),
                 "invalid_request_error",
             ),
@@ -455,12 +463,14 @@ async fn classify(
         }
     }
 
-    let label = if image.filename.is_empty() {
+    let label = if parts[image_idx].filename.is_empty() {
         "upload".to_string()
     } else {
-        image.filename.clone()
+        parts[image_idx].filename.clone()
     };
-    let data = image.data.clone();
+    // Take the upload's bytes out of the parsed parts: the old clone doubled
+    // the peak memory of a buffer that can be tens of megabytes.
+    let data = std::mem::take(&mut parts[image_idx].data);
     let engine = classifier.clone();
     let name = label.clone();
     let outcome = tokio::task::spawn_blocking(move || engine.classify_bytes(&data, &name))
@@ -555,7 +565,7 @@ async fn pose(
             ),
         );
     };
-    let parts = match crate::multipart::parse(&body, &boundary) {
+    let mut parts = match crate::multipart::parse(&body, &boundary) {
         Ok(parts) => parts,
         Err(reason) => {
             return json(
@@ -564,12 +574,12 @@ async fn pose(
             );
         }
     };
-    let mut image = None;
+    let mut image_idx = None;
     let mut n_image = 0usize;
-    for part in &parts {
+    for (i, part) in parts.iter().enumerate() {
         if part.name == "image" {
             n_image += 1;
-            image = Some(part);
+            image_idx = Some(i);
         }
     }
     if n_image > 1 {
@@ -584,7 +594,7 @@ async fn pose(
             ),
         );
     }
-    let Some(image) = image.filter(|p| !p.data.is_empty()) else {
+    let Some(image_idx) = image_idx.filter(|&i| !parts[i].data.is_empty()) else {
         return json(
             StatusCode::BAD_REQUEST,
             error_body(
@@ -593,13 +603,13 @@ async fn pose(
             ),
         );
     };
-    if image.data.len() > 64 * 1024 * 1024 {
+    if parts[image_idx].data.len() > 64 * 1024 * 1024 {
         return json(
             StatusCode::PAYLOAD_TOO_LARGE,
             error_body(
                 &format!(
                     "the upload is {} MB; this build caps a request at 64 MB",
-                    image.data.len() / (1 << 20)
+                    parts[image_idx].data.len() / (1 << 20)
                 ),
                 "invalid_request_error",
             ),
@@ -651,12 +661,14 @@ async fn pose(
         }
     }
 
-    let label = if image.filename.is_empty() {
+    let label = if parts[image_idx].filename.is_empty() {
         "upload".to_string()
     } else {
-        image.filename.clone()
+        parts[image_idx].filename.clone()
     };
-    let data = image.data.clone();
+    // Take, do not clone: the pose upload is the largest body the server
+    // accepts and the old clone doubled its peak memory.
+    let data = std::mem::take(&mut parts[image_idx].data);
     let engine = detector.clone();
     let name = label.clone();
     let request_params = params.clone();
@@ -761,7 +773,7 @@ async fn transcriptions(
             ),
         );
     };
-    let parts = match crate::multipart::parse(&body, &boundary) {
+    let mut parts = match crate::multipart::parse(&body, &boundary) {
         Ok(parts) => parts,
         Err(reason) => {
             return json(
@@ -837,12 +849,12 @@ async fn transcriptions(
     }
 
     // -- the audio --------------------------------------------------------
-    let mut audio = None;
+    let mut audio_idx = None;
     let mut n_audio = 0usize;
-    for part in &parts {
+    for (i, part) in parts.iter().enumerate() {
         if part.name == "file" {
             n_audio += 1;
-            audio = Some(part);
+            audio_idx = Some(i);
         }
     }
     if n_audio > 1 {
@@ -857,7 +869,7 @@ async fn transcriptions(
             ),
         );
     }
-    let Some(audio) = audio.filter(|p| !p.data.is_empty()) else {
+    let Some(audio_idx) = audio_idx.filter(|&i| !parts[i].data.is_empty()) else {
         return json(
             StatusCode::BAD_REQUEST,
             error_body(
@@ -866,13 +878,13 @@ async fn transcriptions(
             ),
         );
     };
-    if audio.data.len() > 200 * 1024 * 1024 {
+    if parts[audio_idx].data.len() > 200 * 1024 * 1024 {
         return json(
             StatusCode::PAYLOAD_TOO_LARGE,
             error_body(
                 &format!(
                     "the upload is {} MB; this build caps a request at 200 MB",
-                    audio.data.len() / (1 << 20)
+                    parts[audio_idx].data.len() / (1 << 20)
                 ),
                 "invalid_request_error",
             ),
@@ -895,12 +907,14 @@ async fn transcriptions(
     // The transcription is host work and it takes seconds, so it goes on a
     // blocking thread: an async task that holds the runtime's worker for
     // twenty seconds would stall every other connection this server has.
-    let name = if audio.filename.is_empty() {
+    let name = if parts[audio_idx].filename.is_empty() {
         "the upload".to_string()
     } else {
-        audio.filename.clone()
+        parts[audio_idx].filename.clone()
     };
-    let data = audio.data.clone();
+    // Audio uploads run to hundreds of megabytes; take them out of the
+    // parsed parts instead of cloning them for the blocking task.
+    let data = std::mem::take(&mut parts[audio_idx].data);
     let engine = transcriber.clone();
     let transcript =
         tokio::task::spawn_blocking(move || engine.transcribe_bytes(&data, &name, &options))

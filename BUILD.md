@@ -491,6 +491,50 @@ runtime\build\npuembeddings.exe . --probe-design artifacts_b128il/gemm_rtp    # 
 
 ---
 
+## 3.1 Profiling and tuning the CPU backend
+
+**Profile before changing a kernel.** The GEMM microbenchmark prints wall
+time and GFLOP/s for the shapes that dominate embedding and encoder runs;
+run it several times — a shared machine moves these numbers by tens of
+percent:
+
+```sh
+cargo bench -p npum-cpu --bench gemm
+```
+
+Then confirm where the time goes in the real scenario, not in the
+microbenchmark: the CLI prints its built-in time split (`gemm + epilogue`,
+attention and its QK/AV parts, LayerNorm, softmax, GELU), and the tool of
+choice on Linux is `perf stat` / `perf record` or `samply` around one CLI
+invocation. A GEMM change is only a win if BOTH the microbenchmark and the
+end-to-end split agree.
+
+The parallelism policy is read once per process from the environment, so a
+profile can be tuned without rebuilding:
+
+| variable | meaning | default |
+|---|---|---|
+| `NPU_CPU_THREADS` | workers in the shared rayon pool | `available_parallelism()` |
+| `NPU_PAR_MIN_ITEMS` | work below which rows stay serial | 65 536 |
+| `NPU_PAR_MIN_ROWS_PER_WORKER` | rows a worker must get before splitting | 8 |
+| `NPU_CPU_NO_PACK` | disable B repacking (A/B comparison) | unset |
+
+These knobs only change WHICH thread computes an independent row; the
+reduction order inside a row is unchanged, so the byte-exact ISA gates still
+apply. The GEMM repacks B into contiguous column panels when several row
+blocks will reuse it; the packed path is deliberately limited to shapes
+where measurement showed it helps (it is disabled for single-token decode
+and for the row-parallel path except at page-multiple widths, where it
+fixes cache-set conflicts).
+
+For a build tuned to one machine, `.cargo/config.native.toml` is an opt-in
+template for `-C target-cpu=native`. Copy it to `.cargo/config.toml` for
+local experiments and restore the portable config for anything shipped:
+auto-vectorisation can change floating-point addition order and break the
+golden transcripts.
+
+---
+
 ## 4. Troubleshooting
 
 | symptom | cause |

@@ -37,15 +37,29 @@
 //! The attention's panels are the exception: they are ACTIVATIONS, and they
 //! are built on the host, per head, because every head reads a different
 //! slice of the keys.
+//!
+//! # A DISPATCH CAN BE SPLIT IN TWO
+//!
+//! The trait's `gemm` is synchronous: pack A, submit, wait, read C, one after
+//! another. A caller with INDEPENDENT projections does not have to pay for
+//! that. [`ArrayGemms::gemm_submit`] packs and starts a dispatch and returns a
+//! ticket; [`ArrayGemms::gemm_complete`] waits and reads it back. Between the
+//! two the host is free to work, and a second dispatch can run against the
+//! other slot of a ping-pong pair. [`ArrayGemms::gemm_batch`] drives that
+//! overlap for a whole set of independent projections, the same way the
+//! convolution's chunk pipeline does.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use npum_format::Container;
+use npum_model::array::PipelinedGemm;
 
 use crate::array::{ArrayDesign, ArrayError as DesignError};
 use crate::attention::Attention;
-use crate::gemm::gemm;
+use crate::gemm::{
+    Datapath, GemmDispatch, GemmScratch, check_fit, complete_gemm, gemm_with_scratch, submit_gemm,
+};
 use crate::transport::Transport;
 
 /// The data buffer the weight panels live in.
@@ -89,6 +103,33 @@ struct Panel {
     n: usize,
 }
 
+/// A projection submitted with [`ArrayGemms::gemm_submit`] and not yet read.
+///
+/// An index into the backend's outstanding runs, not a pointer or a borrow:
+/// the caller can hold it across other calls and hand it back to
+/// [`ArrayGemms::gemm_complete`] whenever the host work between the two halves
+/// is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmTicket(pub usize);
+
+/// A submitted run and the A slot it owns until it is completed.
+struct Outstanding {
+    dispatch: GemmDispatch,
+    a_slot: usize,
+}
+
+/// A projection after validation, with the design's own numbers resolved.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedGemm {
+    weight_slot: usize,
+    instr: usize,
+    tier_rows: usize,
+    dp: Datapath,
+    rows: usize,
+    k: usize,
+    n: usize,
+}
+
 /// The array's projections.
 pub struct ArrayGemms<T: Transport> {
     design: ArrayDesign<T>,
@@ -99,10 +140,28 @@ pub struct ArrayGemms<T: Transport> {
     /// `None` is a run that asked for the projections only, and then the
     /// attention is the host's.
     attention: Option<Attention>,
+    /// The GEMM's scratch, reused across dispatches.
+    ///
+    /// A transformer dispatches many projections per layer and per step, and
+    /// reusing these buffers avoids an allocation per projection.
+    scratch: GemmScratch,
     /// How many projections have been dispatched.
     dispatches: usize,
     /// How many bytes of panels are staged.
     staged: usize,
+    /// Runs submitted but not yet read back, by ticket.
+    ///
+    /// Completed entries are set to `None`; the index is never reused, so an
+    /// old ticket cannot accidentally complete a different run.
+    outstanding: Vec<Option<Outstanding>>,
+    /// Which ping-pong slot pair is held by an in-flight run.
+    slot_busy: [bool; 2],
+    /// Reused staging for the validated ops of one `gemm_batch`.
+    ///
+    /// A model repeats the same projection sets every layer and every step;
+    /// resolving them into a fresh `Vec` each call would allocate in the
+    /// inference loop. The buffer is cleared and refilled in place.
+    resolved_buf: Vec<ResolvedGemm>,
 }
 
 impl<T: Transport> ArrayGemms<T> {
@@ -232,14 +291,302 @@ impl<T: Transport> ArrayGemms<T> {
             design,
             panels,
             attention,
+            scratch: GemmScratch::new(),
             dispatches: 0,
             staged,
+            outstanding: Vec::new(),
+            slot_busy: [false; 2],
+            resolved_buf: Vec::new(),
         })
     }
 
     /// The design this backend runs on.
     pub fn design(&self) -> &ArrayDesign<T> {
         &self.design
+    }
+
+    /// Validate one projection and resolve the design's own numbers.
+    ///
+    /// Everything that can be checked without the board is checked here, BEFORE
+    /// a dispatch is started: a shape bug in the last op of a batch is still a
+    /// shape bug, and must not leave earlier runs in flight. The result holds
+    /// only owned, Copy data, so no borrow of `self` survives into the
+    /// submission.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &self,
+        weight: &str,
+        a_len: usize,
+        rows: usize,
+        k: usize,
+        n: usize,
+        bias: Option<&[f32]>,
+        out_len: usize,
+    ) -> Result<ResolvedGemm, DesignError> {
+        let panel = self.panels.get(weight).ok_or_else(|| {
+            DesignError::Design(format!(
+                "the array has no panel for {weight}. The projection was not staged, and a \
+                 dispatch against a missing panel is a wrong answer rather than an error."
+            ))
+        })?;
+        if k != panel.k || n != panel.n {
+            return Err(DesignError::Design(format!(
+                "{weight} is {k}x{n}, and the array's panel for it is {}x{}.",
+                panel.k, panel.n
+            )));
+        }
+        if a_len != rows * k {
+            return Err(DesignError::Design(format!(
+                "the activations hold {a_len} values, and {rows} rows of {k} need {}.",
+                rows * k
+            )));
+        }
+        if out_len < rows * n {
+            return Err(DesignError::Design(format!(
+                "the output holds {out_len} floats, and {rows} rows of {n} need {}.",
+                rows * n
+            )));
+        }
+        if let Some(bias) = bias {
+            if bias.len() != n {
+                return Err(DesignError::Design(format!(
+                    "the bias holds {} values, and the projection has {n} output columns.",
+                    bias.len()
+                )));
+            }
+        }
+
+        // THE TIER: the smallest one that holds the run's rows.
+        let Some((tier_rows, instr)) = panel.tiers.iter().find(|(tier, _)| *tier >= rows).copied()
+        else {
+            return Err(DesignError::Design(format!(
+                "{weight}: the design's smallest tier computes {} rows, and the run has {rows}. \
+                 The design set was exported for a different batch.",
+                panel.tiers.first().map(|(tier, _)| *tier).unwrap_or(0)
+            )));
+        };
+
+        let dp = Datapath::of(&self.design)?;
+        check_fit(&self.design, tier_rows, k, n, dp)?;
+        Ok(ResolvedGemm {
+            weight_slot: panel.slot,
+            instr,
+            tier_rows,
+            dp,
+            rows,
+            k,
+            n,
+        })
+    }
+
+    /// Submit one projection to the array WITHOUT waiting for it.
+    ///
+    /// The returned ticket is handed to [`Self::gemm_complete`] once the host
+    /// work between the two halves is done. While the device computes, the
+    /// caller may submit another projection -- the bindings a dispatch
+    /// captured at `start_dispatch` are its own, so rebinding does not move an
+    /// in-flight run's operands. At most two runs may be in flight, one per
+    /// ping-pong slot pair; a third is refused until one is completed.
+    pub fn gemm_submit(
+        &mut self,
+        weight: &str,
+        a: &[f32],
+        rows: usize,
+        k: usize,
+        n: usize,
+        bias: Option<&[f32]>,
+    ) -> Result<GemmTicket, DesignError> {
+        let resolved = self.resolve(weight, a.len(), rows, k, n, bias, rows * n)?;
+        self.submit_resolved(&resolved, a, bias)
+    }
+
+    /// Submit a validated projection into a free ping-pong slot pair.
+    fn submit_resolved(
+        &mut self,
+        resolved: &ResolvedGemm,
+        a: &[f32],
+        bias: Option<&[f32]>,
+    ) -> Result<GemmTicket, DesignError> {
+        if self.slot_busy[0] && self.slot_busy[1] {
+            return Err(DesignError::Design(
+                "both GEMM ping-pong slots are busy -- complete a submitted projection \
+                 before submitting a third"
+                    .to_string(),
+            ));
+        }
+        let slot = usize::from(self.slot_busy[0]);
+        if slot == 1 {
+            // A second run needs its own A and C slot pair. Allocate it on the
+            // first overlap, so a plain submit/complete pair pays for no extra
+            // buffer and a batch does not have to know how slots are managed.
+            if self.design.slots_of(0) < 2 {
+                self.design.add_slot_uninit(0)?;
+            }
+            if self.design.slots_of(2) < 2 {
+                self.design.add_slot_uninit(2)?;
+            }
+        }
+
+        // The bindings belong to THIS dispatch: start_dispatch captures them,
+        // so rebinding for the next run cannot move this one's operands.
+        self.design.bind(BUFFER_WEIGHTS, resolved.weight_slot)?;
+        self.design.bind(0, slot)?;
+        self.design.bind(2, slot)?;
+        let dispatch = submit_gemm(
+            &mut self.design,
+            resolved.instr,
+            a,
+            resolved.rows,
+            resolved.tier_rows,
+            resolved.k,
+            resolved.dp,
+            bias,
+            resolved.n,
+            &mut self.scratch,
+        )?;
+
+        self.slot_busy[slot] = true;
+        self.dispatches += 1;
+        let ticket = GemmTicket(self.outstanding.len());
+        self.outstanding.push(Some(Outstanding {
+            dispatch,
+            a_slot: slot,
+        }));
+        Ok(ticket)
+    }
+
+    /// Wait for a submitted projection, read its output and add the bias.
+    ///
+    /// Between [`Self::gemm_submit`] and this call the host is free to do any
+    /// work that does not depend on this projection's output -- pack another
+    /// projection, run an independent LayerNorm, and so on. The read-back goes
+    /// to the C slot captured at submit, not to whatever slot is bound now.
+    pub fn gemm_complete(
+        &mut self,
+        ticket: GemmTicket,
+        out: &mut [f32],
+    ) -> Result<(), DesignError> {
+        // Validate before consuming the ticket: a too-short output must not
+        // leave a run in flight with its slot mistakenly marked free.
+        let needed = self
+            .outstanding
+            .get(ticket.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                DesignError::Design(format!(
+                    "unknown or already completed GEMM ticket {}",
+                    ticket.0
+                ))
+            })?;
+        let needed = needed.dispatch.n_real * needed.dispatch.n;
+        if out.len() < needed {
+            return Err(DesignError::Design(format!(
+                "the output holds {} floats, and the submitted projection needs {}",
+                out.len(),
+                needed
+            )));
+        }
+
+        let entry = self.outstanding[ticket.0]
+            .take()
+            .expect("the ticket was checked above");
+        let result = complete_gemm(&mut self.design, entry.dispatch, out, &mut self.scratch);
+        self.slot_busy[entry.a_slot] = false;
+        // Leave both buffers on slot 0 so the plain synchronous path stays
+        // predictable. Other in-flight runs captured their own bindings.
+        self.design.bind(0, 0)?;
+        self.design.bind(2, 0)?;
+        result
+    }
+
+    /// Run a batch of INDEPENDENT projections with the two halves overlapped.
+    ///
+    /// Each op's output goes to the matching `outs` entry. While op N's GEMM is
+    /// on the device, op N+1's A is packed and uploaded; once N is waited on,
+    /// its C is read and widened while N+1 is already running. This is the same
+    /// two-slot ping-pong that the convolution's chunk pipeline uses. A slot is
+    /// never reused until the run that owned it has been waited on and read.
+    ///
+    /// Ops that depend on one another do NOT belong in one batch: there is no
+    /// overlap to gain and the result would be a race on the host buffers.
+    pub fn gemm_batch(
+        &mut self,
+        ops: &[PipelinedGemm<'_>],
+        outs: &mut [&mut [f32]],
+    ) -> Result<(), DesignError> {
+        if ops.len() != outs.len() {
+            return Err(DesignError::Design(format!(
+                "{} projections were submitted with {} output buffers",
+                ops.len(),
+                outs.len()
+            )));
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        // Resolve and validate ALL of them first. A bad shape in the last op
+        // must be reported before any run is started. The staging buffer is
+        // the backend's and is refilled in place: a model repeats its
+        // projection sets every layer and every step, and a fresh `Vec` here
+        // would be an allocation in the middle of the inference loop.
+        self.resolved_buf.clear();
+        for (op, out) in ops.iter().zip(outs.iter()) {
+            let resolved = self.resolve(
+                op.weight,
+                op.a.len(),
+                op.rows,
+                op.k,
+                op.n,
+                op.bias,
+                out.len(),
+            )?;
+            self.resolved_buf.push(resolved);
+        }
+
+        // More than one op needs the ping-pong pairs. A single op has nothing
+        // to overlap and pays for no extra slot.
+        if ops.len() > 1 {
+            if self.design.slots_of(0) < 2 {
+                self.design.add_slot_uninit(0)?;
+            }
+            if self.design.slots_of(2) < 2 {
+                self.design.add_slot_uninit(2)?;
+            }
+        }
+
+        // At most two runs are in flight -- one per ping-pong pair -- so this
+        // is a fixed two-slot ring with no heap allocation per batch.
+        let mut in_flight: [Option<(GemmTicket, &mut [f32])>; 2] = [None, None];
+        let mut head = 0usize;
+        let mut live = 0usize;
+        for (index, out) in outs.iter_mut().enumerate() {
+            // Keep at most two runs in flight. Completing the oldest frees its
+            // slot pair for the run about to be submitted; its read-back still
+            // overlaps with the younger run's device compute.
+            if live == 2 {
+                let (ticket, done_out) = in_flight[head].take().expect("two runs are in flight");
+                head = (head + 1) & 1;
+                live -= 1;
+                self.gemm_complete(ticket, done_out)?;
+            }
+            // `ResolvedGemm` is Copy, so the borrow of the reuse buffer ends
+            // here and the submit can borrow the backend mutably.
+            let resolved = self.resolved_buf[index];
+            let op = &ops[index];
+            let ticket = self.submit_resolved(&resolved, op.a, op.bias)?;
+            let tail = (head + live) & 1;
+            in_flight[tail] = Some((ticket, &mut **out));
+            live += 1;
+        }
+        // EPILOGUE: the last runs have no successors to hide their read-back.
+        while live > 0 {
+            let (ticket, out) = in_flight[head].take().expect("a run is in flight");
+            head = (head + 1) & 1;
+            live -= 1;
+            self.gemm_complete(ticket, out)?;
+        }
+        Ok(())
     }
 }
 
@@ -270,58 +617,68 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> npum_model::array::Result<()> {
-        let panel = self.panels.get(weight).ok_or_else(|| {
-            npum_model::array::ArrayError(format!(
-                "the array has no panel for {weight}. The projection was not staged, and a \
-                 dispatch against a missing panel is a wrong answer rather than an error."
-            ))
-        })?;
-        if k != panel.k || n != panel.n {
-            return Err(npum_model::array::ArrayError(format!(
-                "{weight} is {k}x{n}, and the array's panel for it is {}x{}.",
-                panel.k, panel.n
-            )));
-        }
-        if a.len() != rows * k {
-            return Err(npum_model::array::ArrayError(format!(
-                "the activations hold {} values, and {rows} rows of {k} need {}.",
-                a.len(),
-                rows * k
-            )));
-        }
-        if out.len() < rows * n {
-            return Err(npum_model::array::ArrayError(format!(
-                "the output holds {} floats, and {rows} rows of {n} need {}.",
-                out.len(),
-                rows * n
-            )));
-        }
-        if let Some(bias) = bias {
-            if bias.len() != n {
-                return Err(npum_model::array::ArrayError(format!(
-                    "the bias holds {} values, and the projection has {n} output columns.",
-                    bias.len()
-                )));
+        let resolved = self
+            .resolve(weight, a.len(), rows, k, n, bias, out.len())
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+
+        // An in-flight async run owns its A/C slot pair even though its
+        // bindings were captured at submit. Use a free pair here rather than
+        // writing into the slot it is still reading from.
+        let slot = usize::from(self.slot_busy[0]);
+        if slot == 1 {
+            if self.slot_busy[1] {
+                return Err(npum_model::array::ArrayError(
+                    "both GEMM slots are busy -- complete the submitted projections first"
+                        .to_string(),
+                ));
+            }
+            if self.design.slots_of(0) < 2 {
+                self.design
+                    .add_slot_uninit(0)
+                    .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+            }
+            if self.design.slots_of(2) < 2 {
+                self.design
+                    .add_slot_uninit(2)
+                    .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
             }
         }
-
-        // THE TIER: the smallest one that holds the run's rows.
-        let Some((tier_rows, instr)) = panel.tiers.iter().find(|(tier, _)| *tier >= rows).copied()
-        else {
-            return Err(npum_model::array::ArrayError(format!(
-                "{weight}: the design's smallest tier computes {} rows, and the run has {rows}. \
-                 The design set was exported for a different batch.",
-                panel.tiers.first().map(|(tier, _)| *tier).unwrap_or(0)
-            )));
-        };
-
         self.design
-            .bind(BUFFER_WEIGHTS, panel.slot)
+            .bind(BUFFER_WEIGHTS, resolved.weight_slot)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
-        gemm(&mut self.design, instr, a, rows, tier_rows, k, bias, n, out)
+        self.design
+            .bind(0, slot)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        self.design
+            .bind(2, slot)
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        gemm_with_scratch(
+            &mut self.design,
+            resolved.instr,
+            a,
+            rows,
+            resolved.tier_rows,
+            k,
+            bias,
+            n,
+            out,
+            &mut self.scratch,
+        )
+        .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
         self.dispatches += 1;
         Ok(())
+    }
+
+    fn gemm_batch(
+        &mut self,
+        ops: &[PipelinedGemm<'_>],
+        outs: &mut [&mut [f32]],
+    ) -> npum_model::array::Result<()> {
+        // The inherent method is the pipelined one; the trait's default would
+        // just run the ops in order. Reaching the seam from a family must not
+        // quietly lose the overlap.
+        ArrayGemms::gemm_batch(self, ops, outs)
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))
     }
 }
 
@@ -368,3 +725,445 @@ impl<T: Transport> npum_model::array::ArrayAttention for ArrayGemms<T> {
 }
 
 impl<T: Transport> npum_model::array::ArrayText for ArrayGemms<T> {}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use crate::array::ArrayDesign;
+    use crate::transport::{BufferFlags, TransportError};
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    #[derive(Clone)]
+    struct FakeBuffer {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        log: Log,
+        id: String,
+    }
+
+    struct FakeRun {
+        a: FakeBuffer,
+        c: FakeBuffer,
+        log: Log,
+    }
+
+    unsafe extern "C" fn free_fake_run(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr as *mut FakeRun)) };
+        }
+    }
+
+    struct FakeTransport {
+        log: Log,
+        counts: Mutex<HashMap<i32, usize>>,
+    }
+
+    impl FakeTransport {
+        fn new(log: Log) -> Self {
+            Self {
+                log,
+                counts: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl Transport for FakeTransport {
+        type Buffer = FakeBuffer;
+
+        fn open(_index: u32) -> Result<Self, TransportError> {
+            Ok(Self::new(Arc::new(Mutex::new(Vec::new()))))
+        }
+        fn open_context(&mut self, _xclbin: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn open_kernel(&mut self, _name: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn group_id(&self, argno: i32) -> Result<i32, TransportError> {
+            Ok(argno)
+        }
+        fn alloc(
+            &mut self,
+            bytes: u64,
+            _flags: BufferFlags,
+            group: i32,
+        ) -> Result<Self::Buffer, TransportError> {
+            let mut counts = self.counts.lock().unwrap();
+            let slot = counts.entry(group).or_insert(0);
+            let id = format!("{group}:{slot}");
+            *slot += 1;
+            Ok(FakeBuffer {
+                bytes: Arc::new(Mutex::new(vec![0u8; bytes as usize])),
+                log: self.log.clone(),
+                id,
+            })
+        }
+        fn write(bo: &Self::Buffer, data: &[u8], offset: u64) -> Result<(), TransportError> {
+            bo.log.lock().unwrap().push(format!("write({})", bo.id));
+            let mut bytes = bo.bytes.lock().unwrap();
+            let at = offset as usize;
+            bytes[at..at + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn size(bo: &Self::Buffer) -> u64 {
+            bo.bytes.lock().unwrap().len() as u64
+        }
+        fn read(bo: &Self::Buffer, data: &mut [u8], offset: u64) -> Result<(), TransportError> {
+            bo.log.lock().unwrap().push(format!("read({})", bo.id));
+            let bytes = bo.bytes.lock().unwrap();
+            let at = offset as usize;
+            data.copy_from_slice(&bytes[at..at + data.len()]);
+            Ok(())
+        }
+        fn sync_to_device(
+            bo: &Self::Buffer,
+            _bytes: u64,
+            _offset: u64,
+        ) -> Result<(), TransportError> {
+            bo.log
+                .lock()
+                .unwrap()
+                .push(format!("sync_to_device({})", bo.id));
+            Ok(())
+        }
+        fn sync_from_device(
+            bo: &Self::Buffer,
+            _bytes: u64,
+            _offset: u64,
+        ) -> Result<(), TransportError> {
+            bo.log
+                .lock()
+                .unwrap()
+                .push(format!("sync_from_device({})", bo.id));
+            Ok(())
+        }
+        fn start(
+            &mut self,
+            _instr: &Self::Buffer,
+            _words: u32,
+            args: &[&Self::Buffer],
+        ) -> Result<crate::transport::Run, TransportError> {
+            self.log.lock().unwrap().push("start".to_string());
+            let run = Box::new(FakeRun {
+                a: args[0].clone(),
+                c: args[2].clone(),
+                log: self.log.clone(),
+            });
+            Ok(crate::transport::Run::new(
+                Box::into_raw(run) as *mut c_void,
+                free_fake_run,
+            ))
+        }
+        fn wait(run: &crate::transport::Run) -> Result<(), TransportError> {
+            let r = unsafe { &*(run.handle() as *const FakeRun) };
+            r.log.lock().unwrap().push("wait".to_string());
+            // Simulated GEMM: every C element becomes this dispatch's A marker.
+            // The A slot is captured at start, so a later rebind cannot change
+            // what this run read -- a slot mix-up is a wrong number, not a race.
+            let a = r.a.bytes.lock().unwrap();
+            let marker = [a[0], a[1]];
+            let mut c = r.c.bytes.lock().unwrap();
+            for cell in c.chunks_exact_mut(2) {
+                cell.copy_from_slice(&marker);
+            }
+            Ok(())
+        }
+    }
+
+    /// A design with one stream, and an `ArrayGemms` whose single panel is
+    /// staged in slot 0. Built directly so the test needs no container.
+    fn backend(rows: usize, k: usize, n: usize) -> (ArrayGemms<FakeTransport>, Log) {
+        let dir = std::env::temp_dir().join(format!(
+            "npum_gemm_async_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = format!(
+            r#"{{
+                "name": "fake",
+                "kernel": "MLIR_AIE",
+                "arch": 1,
+                "device": "npu1",
+                "buffers": [{}, 8, {}],
+                "a_dtype": "bf16",
+                "c_dtype": "bf16",
+                "tile": {{ "m": {rows}, "k": {k}, "n": {n}, "rows": 1 }},
+                "slot0": {{ "op": "qkv", "batch": 0, "slot": 0, "file": "insts.bin",
+                            "M": {rows}, "K": {k}, "N": {n} }}
+            }}"#,
+            rows * k * 2,
+            rows * n * 2
+        );
+        std::fs::write(dir.join("design.json"), manifest).unwrap();
+        std::fs::write(dir.join("final.xclbin"), b"xclbin").unwrap();
+        std::fs::write(dir.join("insts.bin"), vec![0u8; 4]).unwrap();
+
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let design = ArrayDesign::open(&dir, FakeTransport::new(log.clone())).unwrap();
+        let mut panels = HashMap::new();
+        panels.insert(
+            "w".to_string(),
+            Panel {
+                slot: 0,
+                tiers: vec![(rows, 0)],
+                k,
+                n,
+            },
+        );
+        (
+            ArrayGemms {
+                design,
+                panels,
+                attention: None,
+                scratch: GemmScratch::new(),
+                dispatches: 0,
+                staged: 0,
+                outstanding: Vec::new(),
+                slot_busy: [false; 2],
+                resolved_buf: Vec::new(),
+            },
+            log,
+        )
+    }
+
+    /// bf16-exact marker values, one per op: each dispatch's output identifies
+    /// the A slot it actually read.
+    fn activation(marker: f32, rows: usize, k: usize) -> Vec<f32> {
+        let mut a = vec![0f32; rows * k];
+        a[0] = marker;
+        a
+    }
+
+    /// Three independent projections through the pipelined batch. Checks both
+    /// the numbers and the ORDER of operations: the next op's A is written
+    /// BEFORE the wait for the current one, and the current one's C is read
+    /// AFTER the next dispatch has started. That order IS the overlap.
+    #[test]
+    fn batch_ping_pongs_slots_and_overlaps_stages() {
+        let (rows, k, n) = (2usize, 4usize, 3usize);
+        let (mut gemms, log) = backend(rows, k, n);
+        let a0 = activation(10.0, rows, k);
+        let a1 = activation(11.0, rows, k);
+        let a2 = activation(12.0, rows, k);
+        let bias = [1.0f32, 2.0, 3.0];
+        let mut o0 = vec![0f32; rows * n];
+        let mut o1 = vec![0f32; rows * n];
+        let mut o2 = vec![0f32; rows * n];
+        let ops = [
+            PipelinedGemm {
+                weight: "w",
+                a: &a0,
+                rows,
+                k,
+                n,
+                bias: Some(&bias),
+            },
+            PipelinedGemm {
+                weight: "w",
+                a: &a1,
+                rows,
+                k,
+                n,
+                bias: Some(&bias),
+            },
+            PipelinedGemm {
+                weight: "w",
+                a: &a2,
+                rows,
+                k,
+                n,
+                bias: Some(&bias),
+            },
+        ];
+        let mut outs: [&mut [f32]; 3] = [&mut o0, &mut o1, &mut o2];
+        gemms.gemm_batch(&ops, &mut outs).unwrap();
+
+        for (out, marker) in [(&o0, 10.0), (&o1, 11.0), (&o2, 12.0)] {
+            for r in 0..rows {
+                for j in 0..n {
+                    assert_eq!(
+                        out[r * n + j],
+                        marker + bias[j],
+                        "row {r} column {j} came from the wrong A slot"
+                    );
+                }
+            }
+        }
+
+        let log = log.lock().unwrap();
+        // The design's load zeroes its instruction and data buffers first.
+        // The pipeline starts at the first dispatch.
+        let first_start = log.iter().position(|e| e == "start").unwrap();
+        let expected = [
+            "start",
+            "write(3:1)",
+            "sync_to_device(3:1)",
+            "start",
+            "wait",
+            "sync_from_device(5:0)",
+            "read(5:0)",
+            "write(3:0)",
+            "sync_to_device(3:0)",
+            "start",
+            "wait",
+            "sync_from_device(5:1)",
+            "read(5:1)",
+            "wait",
+            "sync_from_device(5:0)",
+            "read(5:0)",
+        ];
+        assert_eq!(
+            &log[first_start..],
+            &expected[..],
+            "the pipeline stages did not overlap"
+        );
+    }
+
+    /// The second ping-pong pair is allocated WITHOUT a zero-fill: the A half
+    /// is written in full by the submit, and the C half is read back only over
+    /// the rows the device wrote. Zeroing either would be work nobody reads.
+    #[test]
+    fn pipelined_slots_are_not_zero_filled() {
+        let (rows, k, n) = (2usize, 4usize, 3usize);
+        let (mut gemms, log) = backend(rows, k, n);
+        let a = activation(10.0, rows, k);
+
+        // The first submit reuses the design's own slot pair; the SECOND one
+        // allocates the ping-pong pair, which is where the zero-fill used to
+        // be paid.
+        let t0 = gemms.gemm_submit("w", &a, rows, k, n, None).unwrap();
+        let t1 = gemms.gemm_submit("w", &a, rows, k, n, None).unwrap();
+        let mut out0 = vec![0f32; rows * n];
+        let mut out1 = vec![0f32; rows * n];
+        gemms.gemm_complete(t0, &mut out0).unwrap();
+        gemms.gemm_complete(t1, &mut out1).unwrap();
+
+        let log = log.lock().unwrap();
+        let starts: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| (e == "start").then_some(i))
+            .collect();
+        let before_second = &log[..starts[1]];
+        assert_eq!(
+            before_second.iter().filter(|e| **e == "write(3:1)").count(),
+            1,
+            "the second A slot is written once, by the submit, not zeroed first: {before_second:?}"
+        );
+        assert!(
+            !before_second
+                .iter()
+                .any(|e| e == "write(5:1)" || e == "sync_to_device(5:1)"),
+            "the second C slot must not be zeroed or synced before the device writes it: {before_second:?}"
+        );
+    }
+
+    /// The pipelined batch is reachable through the family's trait seam: a
+    /// family holding `&mut dyn ArrayText` gets the overlap, not the trait's
+    /// sequential default.
+    #[test]
+    fn trait_batch_delegates_to_the_pipeline() {
+        let (rows, k, n) = (2usize, 4usize, 3usize);
+        let (mut gemms, log) = backend(rows, k, n);
+        let a0 = activation(10.0, rows, k);
+        let a1 = activation(11.0, rows, k);
+        let bias = [1.0f32, 2.0, 3.0];
+        let ops = [
+            PipelinedGemm {
+                weight: "w",
+                a: &a0,
+                rows,
+                k,
+                n,
+                bias: Some(&bias),
+            },
+            PipelinedGemm {
+                weight: "w",
+                a: &a1,
+                rows,
+                k,
+                n,
+                bias: Some(&bias),
+            },
+        ];
+        let mut o0 = vec![0f32; rows * n];
+        let mut o1 = vec![0f32; rows * n];
+        let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
+
+        npum_model::array::ArrayGemm::gemm_batch(&mut gemms, &ops, &mut outs).unwrap();
+
+        assert_eq!(o0[0], 10.0 + bias[0]);
+        assert_eq!(o1[0], 11.0 + bias[0]);
+        assert_eq!(gemms.dispatches, 2);
+
+        // Overlap's signature: op 2's A is uploaded before op 1 is waited on.
+        let log = log.lock().unwrap();
+        let first_wait = log.iter().position(|e| e == "wait").unwrap();
+        assert!(
+            log[..first_wait].iter().any(|e| e == "write(3:1)"),
+            "the trait path ran the ops in order instead of overlapping them: {log:?}"
+        );
+    }
+
+    /// Repeated biased submissions reuse ONE bias buffer: the async ticket
+    /// must own its bias while the device works, but it need not allocate a
+    /// fresh `Vec` for every dispatch of a long inference loop.
+    #[test]
+    fn bias_buffer_is_reused_across_submissions() {
+        let (rows, k, n) = (2usize, 4usize, 3usize);
+        let (mut gemms, _log) = backend(rows, k, n);
+        let bias = [1.0f32, 2.0, 3.0];
+        let a = activation(10.0, rows, k);
+        let before = gemms.scratch.bias_pool_len();
+
+        for _ in 0..8 {
+            let ticket = gemms.gemm_submit("w", &a, rows, k, n, Some(&bias)).unwrap();
+            let mut out = vec![0f32; rows * n];
+            gemms.gemm_complete(ticket, &mut out).unwrap();
+            assert_eq!(out[0], 10.0 + bias[0]);
+        }
+
+        assert_eq!(
+            gemms.scratch.bias_pool_len(),
+            before + 1,
+            "the bias pool must reuse its buffer, not grow per dispatch"
+        );
+    }
+
+    /// The submit/complete pair leaves the host free between the halves, and
+    /// a ticket cannot be completed twice.
+    #[test]
+    fn submit_complete_tickets_are_one_shot() {
+        let (rows, k, n) = (2usize, 4usize, 3usize);
+        let (mut gemms, _log) = backend(rows, k, n);
+        let a0 = activation(10.0, rows, k);
+        let a1 = activation(11.0, rows, k);
+        let bias = [1.0f32, 2.0, 3.0];
+
+        let t0 = gemms
+            .gemm_submit("w", &a0, rows, k, n, Some(&bias))
+            .unwrap();
+        // Host work between the two halves has no effect on the outcome.
+        let _host_side = 1 + 1;
+        let t1 = gemms
+            .gemm_submit("w", &a1, rows, k, n, Some(&bias))
+            .unwrap();
+
+        let mut o0 = vec![0f32; rows * n];
+        let mut o1 = vec![0f32; rows * n];
+        gemms.gemm_complete(t0, &mut o0).unwrap();
+        gemms.gemm_complete(t1, &mut o1).unwrap();
+        assert_eq!(o0[0], 10.0 + bias[0]);
+        assert_eq!(o1[0], 11.0 + bias[0]);
+
+        assert!(gemms.gemm_complete(t0, &mut o0).is_err());
+        assert_eq!(gemms.dispatches, 2);
+    }
+}
