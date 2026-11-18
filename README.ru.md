@@ -1,105 +1,74 @@
-# NpuEmbeddings — Rust-рантайм
+# NpuEmbeddings
 
-Инференс BERT-семейства (эмбеддинги), а также STT, классификация, поза/руки и OCR на AMD NPU (XDNA1/npu1, XDNA2/npu2) с резервным путём на CPU и опциональным Vulkan-бэкендом.
+NpuEmbeddings — это Rust-workspace для инференса моделей на AMD NPU (XDNA1/npu1, XDNA2/npu2) с эталонным CPU-путём и опциональным ускорением на Vulkan для поддерживаемых операций.
 
-Это дерево — **переписывание рантайма на Rust**. C++-рантайм остаётся в соседнем дереве как **оракул паритета**.
+Проект включает три CLI-бинарника, общий HTTP-сервер, инструменты для работы с контейнерами/моделями и документацию по сборке, использованию, бэкендам и проверкам.
 
----
+## Бинарники
 
-## Два дерева (один репозиторий, worktree)
+| Бинарник | Основные команды | Назначение |
+| --- | --- | --- |
+| `npuembeddings` | `list`, `add`, `tokenize`, `embed`, `serve` | Сценарии текстовых эмбеддингов |
+| `npuaudio` | `transcribe`, `serve` | Распознавание речи (speech-to-text) |
+| `npuimage` | `classify`, `pose`, `hands`, `mppose`, `ocr`, `serve` | Сценарии компьютерного зрения |
 
-| | это дерево | оракул |
-|---|---|---|
-| путь | `~/XDNA-Model-Inference` | `~/Npu-Embeddings-XDNA1` |
-| ветка | `rust/clean-tree` | `main` |
-| рантайм | Rust | C++ |
-| роль | разрабатываемый код | эталон для сверки |
+## Структура workspace
 
-Полная историческая документация C++-дерева (большой README, сборка, точность) — в оракуле. Этот README описывает текущее состояние Rust-дерева.
-
----
-
-## Структура
-
-```
-backends/cpu         host-kernels (эталон чисел)
-backends/vulkan      GPU-бэкенд (WGSL/ash)
-backends/xdna        NPU: транспорт, диспетчеризация, геометрия
-core/npum-format     контейнер .npum/.npue (чтение)
-core/npum-model      тензоры, граф, шов арифметики (Ops/Backend)
-core/npum-tokenizers токенизаторы (WordPiece, Unigram, Gemma, Whisper-BPE, XLM-R)
-core/npum-families   семейства, каталог, отказы
-cli/                 бинарники npuembeddings, npuaudio, npuimage
-server/              HTTP-сервер (axum)
-tools/               Python-инструменты (упаковка, parity, verify)
-docs/                документация (en/ru)
+```text
+backends/cpu/         CPU-ядра, арифметика и эталонные пути выполнения
+backends/vulkan/      Vulkan-бэкенд
+backends/xdna/        Транспорт/диспетчеризация NPU и device-специфичное выполнение
+core/npum-format/     Формат контейнера (.npum/.npue): чтение/запись, дайджесты, метаданные
+core/npum-model/      Тензоры, runtime-абстракции, контракты backend/ops
+core/npum-tokenizers/ Токенизаторы
+core/npum-families/   Семейства моделей, каталог и правила маршрутизации/валидации
+cli/                  CLI-бинарники и диспетчеризация команд
+server/               HTTP-сервер и маршруты
+tools/                Упаковка, экспорт, проверки, генерация и вспомогательные скрипты
+docs/                 Документация для пользователей и разработчиков (EN/RU)
+kernels/              Исходники AIE/NPU-ядер для пайплайна экспорта/сборки
+models/               Локальные метаданные/контейнеры моделей (крупные веса обычно хранятся локально)
 ```
 
-Правило зависимостей: `core/` не знает о `backends/`, `backends/` не знают о `cli/`/`server/`.
-
-## Карта контуров репозитория
-
-| Путь | Назначение | API/стабильность | Основные потребители | Примечания |
-|---|---|---|---|---|
-| `core/npum-format` | Контейнер `.npum/.npue` (чтение/запись, дайджесты, provenance) | Канонический источник истины по формату; Rust API в workspace (`rlib` + `cdylib`) | `core/*`, `backends/*`, `cli`, `server`, `tools`/Python через FFI | Единственный writer формата; reader принимает legacy `.npue` и `.npum` |
-| `core/npum-model` | Тензоры, типы модели/графа, швы `Backend`/`Ops`, caps/dispatch | Контракты core-слоя (внутренние, стабильность по соглашению workspace) | `backends/*`, `core/npum-families`, `cli`, `server` | `Backend` — tensor-ориентированный контракт; `Ops` — slice-шов для семейств/forward-pass |
-| `core/npum-tokenizers`, `core/npum-families` | Токенизация и правила семейств/каталога/владения | Контракты core-слоя | `cli`, `server`, backend/семейные реализации | Владение семействами проверяется на границах маршрутизации/CLI |
-| `backends/cpu`, `backends/vulkan`, `backends/xdna` | Провайдеры вычислений и device-специфичные пути | Реализации backend’ов, выбор на краю | `cli`, `server`, тесты/инструменты | CPU — эталон чисел; Vulkan/XDNA имеют ограничения возможностей/точности |
-| `cli/` | Пользовательские бинарники (`npuembeddings`, `npuaudio`, `npuimage`) | CLI-контракт (флаги/вывод/отказы) | Пользователи, скрипты, parity-harness | Composition root выбора backend/семейства |
-| `server/` | HTTP-сервис и обработчики маршрутов | HTTP-контракт | Клиенты/сервисы, пути `serve` | Единый набор маршрутов; режим определяется контейнером/семейством |
-| `tools/` | Build-time/export/pack/verify/gen/research/data инструменты | Внутренний tooling (эволюционирует вместе с пайплайном) | Разработка, CI/parity/build-процессы | В основном Python; детали в [`tools/README.md`](tools/README.md) |
-| `reference/` | Оракул/эталонная среда и входы для сравнения | Не runtime-API; только parity/reference | Запись/сравнение parity, валидация | Не продуктовый runtime-код; отделён от Rust-runtime |
-| `kernels/` | Исходники AIE-ядер для экспорта/сборки NPU-дизайнов | Источники артефактов (не Rust API) | Пайплайн `tools/export`, артефакты для `backends/xdna` | См. [`kernels/README.md`](kernels/README.md) |
-| `python/` | Удобные Python-обёртки/фасады поверх runtime-потоков | Удобный слой, не каноническая runtime-логика | Пользователи/скрипты на Python | Сейчас небольшой; делегирует в CLI/server/runtime |
-| `npue_tools/` | Область Python-пакета/ассетов в переходном состоянии | Переходный/внутренний (минимальный) | Инструменты/процессы, которые ещё на него ссылаются | Не канонический writer формата и не runtime-реализация |
-| `docs/` | Контракты и документация (usage/build/backends/models/parity) | Документация (нормативна где указано, напр. инварианты/parity) | Разработчики/пользователи/ревьюеры | EN/RU для нормативных изменений должны быть согласованы |
-| `models/`, `weights/` (локальные layout’ы) | Хранилище контейнеров/моделей и пути разрешения | Соглашение о данных/расположении, не API кода | Разрешение моделей в CLI/server и tooling | Содержимое может быть локальным; пути определяются во время работы |
-
----
+Направление зависимостей (по дизайну): `core/` не зависит от `backends/`, а `backends/` не зависят от `cli/` и `server/`. Выбор бэкенда и семейства выполняется на краях системы (CLI/server).
 
 ## Сборка
 
-```sh
-./bootstrap.sh          # Python venv с зависимостями для tools
+Набор зависимостей зависит от используемого пути (только CPU, Vulkan, NPU/export toolchain). Для Python-окружения инструментов из `tools/` в репозитории есть bootstrap-скрипт.
+
+```bash
+./bootstrap.sh
 cargo build --release
 ```
 
-Бинарники: `target/release/{npuembeddings,npuaudio,npuimage}`.
+Собранные бинарники будут в `target/release/`:
 
-Проверка отсутствия XRT/Python в direct-сборке (гейт): `python3 tools/verify/verify_no_xrt.py` (в контексте дерева, где доступен скрипт).
-
----
+- `npuembeddings`
+- `npuaudio`
+- `npuimage`
 
 ## Использование (кратко)
 
-- `npuembeddings list|add|tokenize|embed|serve`
-- `npuaudio transcribe|serve`
-- `npuimage classify|pose|hands|mppose|ocr|serve`
+- Модель/контейнер можно передать путём (`.npum` или legacy `.npue`) или, где поддерживается, по имени (разрешение в настроенных расположениях моделей).
+- Режим и набор HTTP-эндпоинтов определяются семейством/`arch` контейнера (а не отдельным флагом режима).
+- Параметры выбора бэкенда и маршрутизации операций (CPU/Vulkan/NPU ops) зависят от команды, семейства и доступных артефактов/возможностей.
 
-Режим/эндпоинт сервера определяется `arch` контейнера, а не флагом. Модель можно передать путём к `.npue/.npum` или именем (поиск в `models/`, а также в `weights/<family>/<model>/`).
+Подробности по командам и флагам: `--help` у бинарников/подкоманд и документация в `docs/`.
 
-### Выбор бэкенда/путей
-- `--backend cpu|vulkan` — выбор арифметического бэкенда (где поддерживается).
-- `--vk-ops gemm,layn,gelu,softm` — выборочный offload на Vulkan (подразумевает Vulkan); `--backend vulkan` без `--vk-ops` включает поддерживаемые ops.
-- `--npu-ops ...` — массивный/NPU-путь операций (где реализован), независим от `--backend`; неподдерживаемые комбинации/семейства отказывают по имени.
+## Документация
 
-Embed-сервер поддерживает Vulkan ops; прочие серверные движки в текущем состоянии работают на хосте.
+- [docs/en/BUILDING.md](docs/en/BUILDING.md) / [docs/ru/BUILDING.md](docs/ru/BUILDING.md) — сборка и проверки
+- [docs/en/USAGE.md](docs/en/USAGE.md) / [docs/ru/USAGE.md](docs/ru/USAGE.md) — использование CLI/server и разрешение моделей
+- [docs/en/BACKENDS.md](docs/en/BACKENDS.md) / [docs/ru/BACKENDS.md](docs/ru/BACKENDS.md) — выбор бэкендов и возможности
+- [docs/en/MODELS.md](docs/en/MODELS.md) / [docs/ru/MODELS.md](docs/ru/MODELS.md) — контейнеры, модели и расположение весов
+- [docs/en/PARITY.md](docs/en/PARITY.md) / [docs/ru/PARITY.md](docs/ru/PARITY.md) — проверки/паритет
+- [docs/en/INVARIANTS.md](docs/en/INVARIANTS.md) / [docs/ru/INVARIANTS.md](docs/ru/INVARIANTS.md) — инварианты и контракты runtime
+- [tools/README.md](tools/README.md) — обзор инструментов
 
----
+## Формат контейнера
 
-## Контейнер и модели
+Основной формат контейнера — `.npum` (NPU Model). Для совместимости принимаются legacy-контейнеры `.npue`; при записи используется `.npum`.
 
-- Формат: `.npum` (принимается также legacy `.npue`).
-- Источник весов для упаковки — safetensors (где применимо), ONNX остаётся для графов/vision-случаев.
-- Упаковка: Python (`tools/pack/pack_npue.py`).
+## Лицензия
 
----
-
-## Паритет и инварианты
-
-- Инварианты: [docs/en/INVARIANTS.md](docs/en/INVARIANTS.md), [docs/ru/INVARIANTS.md](docs/ru/INVARIANTS.md).
-- Паритет с C++-оракулом: `python3 tools/parity/run.py record|compare` (golden’ы в `tools/parity/golden/` — контракт; осмысленные расхождения фиксируются в `tools/parity/divergences.txt`).
-
-Дополнительно: [docs/ru/BUILDING.md](docs/ru/BUILDING.md), [docs/ru/USAGE.md](docs/ru/USAGE.md), [docs/ru/BACKENDS.md](docs/ru/BACKENDS.md).
-
-Лицензия: Apache-2.0 (`LICENSE`, `THIRD-PARTY.md`).
+Apache-2.0. См. [LICENSE](LICENSE), [THIRD-PARTY.md](THIRD-PARTY.md) и [PROVENANCE.md](PROVENANCE.md).

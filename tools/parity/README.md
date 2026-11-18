@@ -1,199 +1,53 @@
-# The parity harness
+# Parity harness
 
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-It records what the C++ runtime does and checks that the Rust runtime does
-the same.
+This directory contains tooling to record baseline ("golden") outputs and compare candidate binaries against them.
 
 ```sh
-# record the goldens, from the oracle
-python tools/parity/run.py record --oracle ~/Npu-Embeddings-XDNA1/runtime/build
+# Record goldens from a baseline/oracle build
+python tools/parity/run.py record --oracle <path-to-oracle-build>
 
-# check the Rust binaries against them
-python tools/parity/run.py compare --candidate target/release
+# Compare candidate binaries against recorded goldens
+python tools/parity/run.py compare --candidate <path-to-candidate-build>
 
-# the case table, and the normalisation rules
+# Show the case table and normalization rules
 python tools/parity/run.py list -v
 python tools/parity/run.py rules
 ```
 
----
+## Golden artifacts
 
-## What a golden is
+For each case, a directory under `golden/<case-id>/` typically contains:
 
-For each case, a directory under `golden/<case-id>/` holding:
+| File | Purpose |
+| --- | --- |
+| `stdout` | Captured standard output |
+| `stderr` | Captured standard error |
+| `code` | Exit code |
+| `body` | HTTP response body (HTTP cases) |
+| `status` | HTTP response status (HTTP cases) |
+| `meta.json` | Case parameters and normalization metadata |
 
-| file | what |
-|---|---|
-| `stdout` | what the process wrote to stdout |
-| `stderr` | what it wrote to stderr |
-| `code` | the exit code |
-| `body` | the HTTP response's body, for the http cases |
-| `status` | the HTTP response's status code, for the http cases |
-| `meta.json` | the case's parameters, and the rules that fired |
+`meta.json` makes a golden reviewable (what ran, when, and which normalization rules were applied).
 
-`meta.json` is what makes a golden REVIEWABLE: it says which binary wrote
-it, on what date, and which normalisation rules were applied. A golden
-without it is a mystery file.
+## Harness principles
 
----
+- **Separate record/compare roles:** `record` captures baseline outputs; `compare` checks candidate outputs against them using the same harness logic.
+- **Consistent fixture root:** runs should use the same fixture/model root so differences reflect behavior, not different inputs.
+- **No unintended network dependence:** offline-by-default execution is preferred for reproducible goldens (network-dependent cases should be explicitly gated).
+- **Skips are not passes:** if a case cannot run due to missing fixtures/artifacts/hardware, it should be reported as skipped.
+- **Differences require intent:** update goldens or declare/document divergences deliberately; do not silently rewrite expected results.
+- **Explicit normalization rules:** only documented normalization rules should be applied (`run.py rules`).
 
-## The rules of the harness
+## Fixtures
 
-### The oracle is the oracle
+`fixtures/` contains inputs and helper assets used by parity cases (text/image/audio samples, fixture root layout, and scripts for fetching/preparing required model data where applicable).
 
-`record` runs the **C++** binaries and writes the goldens. `compare` runs the
-**Rust** binaries and diffs. They are the same machinery with a different
-binary directory, and that is the point: a difference between the two
-transcripts is a difference between the two runtimes, and not a difference
-between two harnesses.
+Some cases may require additional compiled artifacts or local models and will be skipped when prerequisites are unavailable.
 
-### Every run gets the SAME root
+## Notes
 
-Each run is given `--root <the fixture root>`, which holds one set of
-containers.
-
-It is not inferred: the oracle's default root is the tree its BINARY lives
-in, and the candidate's default root is the tree its binary lives in, and
-those are two different directories holding two different containers. A
-harness that let each side use its own root would be comparing two different
-models and calling the difference a mismatch.
-
-The fixture root is `tools/parity/fixtures/root/`, and its `models/` is a
-SYMLINK to the repository's `models/`, so the packed containers are used
-where they are and not copied by the hundred megabytes.
-
-### The network is not used
-
-`HF_HUB_OFFLINE=1` is set for every run, and the cases that need the network
-are tagged `network` and skipped unless `NPUE_PARITY_NETWORK=1` is set.
-
-A golden that depends on what HuggingFace answered that day is a golden of
-the internet, not of the runtime.
-
-### A skip is not a pass
-
-A case is SKIPPED when:
-
-* **its model is not installed** -- a golden of a refusal that says "there
-  is no model" is a golden of the ABSENCE, and it would be matched by any
-  implementation that also refuses;
-* **it needs a compiled design set** -- the C++ runtime asks for one before
-  it runs the embedding, the classification and the transcription paths, and
-  it asks even for a container whose operands are row-major host-side values
-  and whose every operation would run on the CPU. A design set is the
-  OUTPUT of MLIR-AIE: it is a compiled AIE program with an xclbin and
-  instruction binaries beside a design.json. There is no way to fetch one
-  and no way to make one without the toolchain;
-* **it needs the network** -- see above.
-
-The number of skips is printed beside the number of passes, so that a run
-which compared nothing cannot be mistaken for a run which passed everything.
-
-### A failure is a difference, not a golden that needs updating
-
-If a golden has to change, the change says what changed and why. A golden
-that is updated as a side effect of a run is not a golden.
-
-If the difference is intended AND it will stay that way, declare it in
-`divergences.txt` with its reason. A declared divergence is still printed
-on every run, with the diff. It just does not fail the run.
-
-### The normalisation rules are named, finite, and printed
-
-A rule that is not on the list is not applied, and a difference that is not
-on the list is a failure. `run.py rules` prints them.
-
-They forgive: durations, ports, temporary paths, process ids, the container
-extension rename (`.npue` → `.npum`), and the absolute paths of the two
-trees. They forgive nothing else.
-
----
-
-## The fixture root
-
-```
-tools/parity/fixtures/
-  in.txt            the text the embed and tokenize cases use
-  bus.jpg           the image the vision cases use
-  ocr_text.png      the image the OCR case uses
-  tone.wav          the audio the transcribe case uses
-  root/             THE ROOT: models/ (a symlink) and runtime/artifacts/
-  fetch_models.sh   the pinned download manifest
-```
-
-`fetch_models.sh` fetches the ONNX exports the packer needs, pinned by
-sha256 where the repository records one. It is a separate script because it
-is a download and the rest of the harness must never touch the network.
-
----
-
-## What the oracle cannot do
-
-Some of this is the harness's fault and some of it is the machine's, and
-both are worth writing down:
-
-* **`add` crashes.** The C++ runtime ABORTS inside glibc ("invalid stdio
-  handle") when the network path runs on this machine. A crash is not a
-  contract: it says what the process did, not what the runtime means. The
-  Rust runtime refuses cleanly, and the difference is declared in
-  `divergences.txt`.
-* **`list` ignores `--root`.** The C++ runtime's `list` reports the tree its
-  own binary lives in, whatever `--root` says. The Rust runtime honours
-  `--root`, which is the fix. The `sub/list` case therefore only compares
-  the two runtimes when the oracle's default root holds the same containers
-  as the fixture root -- and the harness copies them there, because the
-  oracle's design-set lookup reads ITS tree too.
-
-## The design sets
-
-The embedding, classification and transcription paths need a COMPILED design
-set: a `design.json` with an `xclbin` and the instruction binaries beside
-it. That is the OUTPUT of MLIR-AIE -- it cannot be downloaded, and it
-cannot be made without the toolchain.
-
-The toolchain is in the venv (`aiecc`, `aie-opt` and `aie.iron` are all
-there), and two things have to be on the PATH for the exporters to work:
-
-```sh
-export PATH="$PWD/.venv/bin:/opt/xilinx/xrt/bin:$PATH"
-export PYTHONPATH=/opt/xilinx/xrt/python      # pyxrt, for the validation step
-export NPU_RUNTIME=xrt                        # the exporters RUN the kernel
-```
-
-The last one is the surprising one: the exporter validates its own output
-by running the compiled kernel, and without a NPU runtime it cannot. It
-needs the device, not a simulator.
-
-With those, one model is one command:
-
-```sh
-python tools/export/export_gemm_rtp.py --target all-MiniLM-L6-v2 --arch 1 \
-    --out tools/parity/fixtures/root/runtime
-```
-
-and it writes `runtime/artifacts/<model>/artifacts_npu1/{gemm_rtp,gelu,layernorm,softmax}/`.
-
-## What is recorded, and what compares byte for byte today
-
-Forty-six of the forty-seven cases are recorded. Twenty-one of them compare
-byte for byte:
-
-* the three `--help` texts and the no-argument behaviour;
-* the `list` table, its states and its legend;
-* `tokenize`, which is a real test of the wordpiece tokenizer;
-* the refusals: an unknown option, a removed flag, a wrong binary, an
-  unknown model, a missing argument, a container of another family, a
-  `--serve=8080`;
-* the flag semantics: the last occurrence wins, a flag after the
-  positionals, an unknown `--npu-ops` code.
-
-Four are DECLARED DIVERGENCES, with the reason in `divergences.txt`: the
-`add` crash, `list`'s `--root`, the generation that the C++ does not check
-by name, and the two prefix refusals whose wording matches and whose
-preceding banner does not exist yet.
-
-The remaining nineteen are the numerics -- the embedding, the
-classification, the transcription, the pose, the hands, the whole-body pose,
-the OCR, and the eight HTTP endpoints -- and they are the goldens for the
-work to come.
+- Treat `tools/parity/golden/` as a behavioral contract for covered cases.
+- If a behavior change is intentional, update the corresponding golden(s) and/or document the divergence according to project practice.
+- See [docs/en/PARITY.md](../../docs/en/PARITY.md) and [docs/ru/PARITY.md](../../docs/ru/PARITY.md) for project-level parity guidance.
