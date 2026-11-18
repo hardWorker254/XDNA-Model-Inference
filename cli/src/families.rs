@@ -36,88 +36,6 @@ pub type Outcome = i32;
 /// The vectors come from the CPU backend, and they are the C++'s vectors:
 /// the same container through the same arithmetic gives the same bytes, and
 /// `backends/cpu/tests/exact.rs` is the gate that says so.
-pub fn embed(args: &Args, root: &Path) -> Outcome {
-    let Some((model, input)) = args.positional.first().zip(args.positional.get(1)) else {
-        return crate::needs_a_model("embed");
-    };
-    let prefix = args.value("--prefix").map(|s| s.to_string());
-    let allow_truncation = args.switch("--allow-truncation");
-    // The provenance warning comes FIRST, before the banner: it is about
-    // the MODEL and not about this run.
-    if !looks_like_container_path(model) {
-        warn_if_unpinned(model);
-    }
-    with_model(model, npum_families::Family::Embed, root, |path, arch| {
-        // THE BACKEND, and the arithmetic it names.
-        //
-        // The choice is made HERE, before the banner: a machine with no
-        // Vulkan device is refused before a status block that would claim
-        // the GPU is printed.
-        let choice = match crate::backend::choose(args) {
-            Ok(choice) => choice,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        // The banner comes before the refusal, as in the C++.
-        crate::status::announce(
-            path,
-            root,
-            &crate::embed::places(path, root, args, choice.ops.as_ref()),
-        );
-        // `--npu-ops` is a valid request and a valid question, and this
-        // runtime answers it for five of the codes: the projections, the
-        // LayerNorm, the GELU, the softmax and the attention go to the
-        // array. The rest are not ported yet, and accepting them and
-        // running the host would leave the command line saying "array"
-        // about a run that dispatched nothing -- which is the one thing
-        // the flag exists to prevent.
-        //
-        // The array path itself is NOT missing: the transport, the design
-        // loader, the array's GEMM, its elementwise passes and its
-        // attention are ported and checked on the board. What is missing is
-        // the SEAM for the other families.
-        if let Some(reason) = refuse_array_not_ported(
-            npum_families::Family::Embed,
-            args,
-            &["gemm", "layn", "gelu", "softm", "attn"],
-        ) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(prefix) = prefix.as_deref() {
-            if let Some(reason) = refuse_unknown_prefix(path, prefix) {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        }
-        let texts = match crate::embed::read_texts(input) {
-            Ok(t) => t,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        match crate::embed::run(
-            path,
-            arch,
-            &texts,
-            prefix.as_deref(),
-            crate::embed::wants_out_file(args).as_deref(),
-            allow_truncation,
-            root,
-            args,
-            choice.ops,
-        ) {
-            Ok(_) => 0,
-            Err(refusal) => {
-                eprintln!("error: {}", refusal.message);
-                refusal.code
-            }
-        }
-    })
-}
 
 /// The refusal for a `--prefix` this model does not have, if it is one.
 ///
@@ -133,7 +51,7 @@ pub fn embed(args: &Args, root: &Path) -> Outcome {
 /// The names are listed in SORTED order, and not in the table's order: a
 /// list that a reader has to scan is more useful sorted, and the table's
 /// order is the order the checkpoint happened to write them in.
-fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String> {
+pub(crate) fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String> {
     let container = npum_format::Container::open(path).ok()?;
     let config = container.config();
     let Some(prompts) = config.get_object("prompts") else {
@@ -161,7 +79,7 @@ fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String> {
 /// about -- weights that NOTHING checks -- is a property of the model and
 /// not of the run. A run that goes quietly is how an unverified model
 /// ends up in production.
-fn warn_if_unpinned(name: &str) {
+pub(crate) fn warn_if_unpinned(name: &str) {
     let Some(entry) = npum_families::catalogue::find(name) else {
         return;
     };
@@ -184,7 +102,7 @@ fn warn_if_unpinned(name: &str) {
 /// because what an architecture has is the architecture's business: the
 /// same code is valid for one family and not for another, and the
 /// refusal has to say which.
-fn refuse_op_not_in_arch(args: &Args, family: npum_families::Family) -> Option<String> {
+pub(crate) fn refuse_op_not_in_arch(args: &Args, family: npum_families::Family) -> Option<String> {
     let listing = args.value("--npu-ops")?;
     // The codes were checked against the ones this build knows when the
     // command line was parsed; a failure here would be a different bug.
@@ -209,14 +127,18 @@ fn refuse_op_not_in_arch(args: &Args, family: npum_families::Family) -> Option<S
 /// The conv families have their own refusals, in their own words, because
 /// their question is a different one: they have exactly one array-able op,
 /// and their message is about what that op would move.
-fn refuse_array_not_ported(
+pub(crate) fn refuse_array_not_ported(
     family: npum_families::Family,
     args: &Args,
     honoured: &[&str],
 ) -> Option<String> {
     let listing = args.value("--npu-ops")?;
     let codes = crate::flags::parse_npu_ops(listing).ok()?;
-    let refused: Vec<&str> = codes.iter().copied().filter(|c| !honoured.contains(c)).collect();
+    let refused: Vec<&str> = codes
+        .iter()
+        .copied()
+        .filter(|c| !honoured.contains(c))
+        .collect();
     if refused.is_empty() {
         return None;
     }
@@ -245,6 +167,28 @@ fn refuse_array_not_ported(
     ))
 }
 
+/// The refusal for `--npu-ops` on GTE.
+///
+/// GTE has its own forward pass and no seam that would route projections,
+/// attention or elementwise work to the array, so every requested code must
+/// be refused with that specific cause rather than the generic "no array-able
+/// operation in this runtime yet" wording.
+pub(crate) fn refuse_gte_array_ops(args: &Args, arch: &str) -> Option<String> {
+    let listing = args.value("--npu-ops")?;
+    let codes = crate::flags::parse_npu_ops(listing).ok()?;
+    if codes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "--npu-ops {}: --npu-ops is not yet implemented for GTE models ({}). \
+         The array/eltwise dispatch seam is missing from the GTE forward pass, \
+         so accepting the flag would run on the host while reporting array work. \
+         Remove --npu-ops to run on the host.",
+        codes.join(", "),
+        arch,
+    ))
+}
+
 /// `add`.
 ///
 /// The sha256 is checked BEFORE anything else, and a pin that can never
@@ -270,68 +214,14 @@ pub fn add(args: &Args) -> Outcome {
 }
 
 /// `tokenize`.
-pub fn tokenize(args: &Args, root: &Path) -> Outcome {
-    let Some((model, file)) = args.positional.first().zip(args.positional.get(1)) else {
-        return crate::needs_a_model("tokenize");
-    };
-    let max_len = args.value_i64("--max-len").unwrap_or(64).max(0) as usize;
-    with_model(model, npum_families::Family::Embed, root, |path, arch| {
-        let container = match npum_format::Container::open(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: {}: {e}", path.display());
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let tokenizer = match load_tokenizer(&container, arch) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("error: {}: {e}", path.display());
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let text = match std::fs::read_to_string(file) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("error: cannot open {file}: {e}");
-                return crate::EXIT_REFUSED;
-            }
-        };
 
-        let mut lines = 0usize;
-        let mut cut = 0usize;
-        for line in text.lines() {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let (encoding, truncated) = match tokenizer.encode_padded(line, max_len) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            lines += 1;
-            if truncated {
-                cut += 1;
-            }
-            let ids: Vec<String> = encoding.ids.iter().map(|id| id.to_string()).collect();
-            println!("{}", ids.join(" "));
-        }
-        if cut > 0 {
-            eprintln!(
-                "  NOTE  {cut} of {lines} lines exceeded max_len={max_len} and were truncated."
-            );
-        }
-        0
-    })
-}
-
-enum TokenizeTokenizer {
+pub(crate) enum TokenizeTokenizer {
     WordPiece(npum_tokenizers::wordpiece::WordPiece),
     Xlmr(npum_tokenizers::xlmr::XlmrTokenizer),
 }
 
 impl TokenizeTokenizer {
-    fn encode_padded(
+    pub(crate) fn encode_padded(
         &self,
         text: &str,
         max_len: usize,
@@ -346,7 +236,7 @@ impl TokenizeTokenizer {
 /// The tokenizer a container holds.
 ///
 /// The ARCH decides, not the file name.
-fn load_tokenizer(
+pub(crate) fn load_tokenizer(
     container: &npum_format::Container,
     arch: &str,
 ) -> std::result::Result<TokenizeTokenizer, String> {
@@ -359,7 +249,9 @@ fn load_tokenizer(
     if arch.contains("gte_new_rope") || (arch.contains("gte") && arch.contains("rope")) {
         let blob = container
             .tensor_bytes("tokenizer.xlmr_table")
-            .map_err(|_| "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string())?;
+            .map_err(|_| {
+                "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string()
+            })?;
         return Ok(TokenizeTokenizer::Xlmr(
             npum_tokenizers::xlmr::XlmrTokenizer::from_table_bytes(blob)?,
         ));
@@ -375,363 +267,10 @@ fn load_tokenizer(
 }
 
 /// `transcribe`.
-pub fn transcribe(args: &Args, root: &Path) -> Outcome {
-    let Some((model, audio)) = args.positional.first().zip(args.positional.get(1)) else {
-        return crate::needs_a_model("transcribe");
-    };
-    with_model(model, npum_families::Family::Stt, root, |path, arch| {
-        if !Path::new(audio).exists() {
-            eprintln!("error: the audio file {audio} does not exist.");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Stt) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Stt) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Stt, args, &[]) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        let _ = arch;
-        crate::stt::run(path, audio, args, root)
-    })
-}
 
 /// `classify`.
-pub fn classify(args: &Args, root: &Path) -> Outcome {
-    let Some(model) = args.positional.first() else {
-        return crate::needs_a_model("classify");
-    };
-    // Every leading non-flag argument after the model is an image, so
-    // `classify <model> a.png b.png --top-k` classifies both.
-    let images: Vec<&String> = args.positional.iter().skip(1).collect();
-    if images.is_empty() {
-        eprintln!("error: `classify` needs an image:");
-        eprintln!("    npuimage classify <model> <image.png> [more.png ...]");
-        eprintln!("    npuimage serve <model>            (POST /v1/classify)");
-        eprintln!(
-            "  (PNG and JPEG; anything else is refused rather than guessed at. \
-             --top-k prints the runners-up to stderr, --json to stdout)"
-        );
-        return crate::EXIT_REFUSED;
-    }
-    with_model(model, npum_families::Family::Cls, root, |path, arch| {
-        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Cls) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Cls) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_array_not_ported(npum_families::Family::Cls, args, &[]) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        // The ViT's own block, on the stderr: the geometry, the design set,
-        // and where every operation runs.
-        let started = std::time::Instant::now();
-        let container = match npum_format::Container::open(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: {}: {e}", path.display());
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let Some(geometry) = crate::vit::read_geometry(&container, path) else {
-            eprintln!(
-                "error: {}: the container does not carry the ViT's geometry",
-                path.display()
-            );
-            return crate::EXIT_REFUSED;
-        };
-        let designs = crate::vit::find_designs(root, &geometry.model_name)
-            .unwrap_or_else(|| root.join("runtime").join("artifacts").join(&geometry.model_name));
-        // The setup is the weights arriving: the container is open, and the
-        // head and the stack are read before the block is printed, because
-        // the block reports how long that took.
-        let vit = match npum_cpu::vit::Vit::open(path) {
-            Ok(v) => v,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        crate::vit::print_block(&geometry, &designs, started.elapsed().as_secs_f64());
-        let _ = arch;
-
-        let json = args.switch("--json");
-        let top_k = args.value_i64("--top-k").unwrap_or(0) > 0;
-        let mut out = String::from("[\n");
-        for (i, image) in images.iter().enumerate() {
-            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
-                Ok(d) => d,
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            let front = std::time::Instant::now();
-            let patches = match npum_cpu::vit_image::preprocess(&decoded, &geometry) {
-                Ok(p) => p,
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            let front_end_s = front.elapsed().as_secs_f64();
-
-            let enc = std::time::Instant::now();
-            let hidden = vit.encode(&patches);
-            let encoder_s = enc.elapsed().as_secs_f64();
-
-            let head = std::time::Instant::now();
-            let d = geometry.hidden as usize;
-            let logits = vit.classify(&hidden[..d]);
-            let prediction = match npum_cpu::vit::predict(&logits, vit.labels()) {
-                Ok(p) => p,
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            let head_s = head.elapsed().as_secs_f64();
-
-            if json {
-                out.push_str("  ");
-                out.push_str(&crate::vit::prediction_json(
-                    &prediction,
-                    image,
-                    front_end_s,
-                    encoder_s,
-                    head_s,
-                ));
-                out.push_str(if i + 1 < images.len() { ",\n" } else { "\n" });
-            } else {
-                eprintln!(
-                    "  {:<40} {:.2} s  0 dispatches",
-                    image,
-                    front_end_s + encoder_s + head_s
-                );
-                if top_k {
-                    // A ranking of the whole row, not the top two: the
-                    // argmax is on stdout alone and the runners-up are a
-                    // status detail, so the full sort is printed rather than
-                    // a truncated one that would read as "there is nothing
-                    // else close".
-                    let mut order: Vec<usize> = (0..prediction.logits.len()).collect();
-                    order.sort_by(|a, b| {
-                        prediction.logits[*b]
-                            .partial_cmp(&prediction.logits[*a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    for (k, index) in order.iter().take(10).enumerate() {
-                        eprintln!(
-                            "    {:2}  {:<40} logit {:+.4}",
-                            k + 1,
-                            vit.labels().get(*index).cloned().unwrap_or_default(),
-                            prediction.logits[*index]
-                        );
-                    }
-                }
-                println!("{}", prediction.name);
-            }
-        }
-        if json {
-            out.push_str("]\n");
-            print!("{out}");
-        }
-        0
-    })
-}
 
 /// `pose`.
-pub fn pose(args: &Args, root: &Path) -> Outcome {
-    let Some(model) = args.positional.first() else {
-        return crate::needs_a_model("pose");
-    };
-    // Every leading non-flag argument after the model is an image, so
-    // `pose <model> a.png b.png --text` runs both.
-    let images: Vec<&String> = args.positional.iter().skip(1).collect();
-    if images.is_empty() {
-        eprintln!("error: `pose` needs an image:");
-        eprintln!("    npuimage pose <model> <image.png> [more.png ...]");
-        eprintln!("    npuimage serve <model>            (POST /v1/pose)");
-        eprintln!(
-            "  (PNG and JPEG; anything else is refused rather than guessed at. \
-             --text prints a human summary instead of the JSON object, \
-             --conf/--iou/--kpt/--max-det move the thresholds, --pose-dump FILE \
-             writes every graph node's output)"
-        );
-        return crate::EXIT_REFUSED;
-    }
-    with_model(model, npum_families::Family::Pose, root, |path, arch| {
-        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Pose) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Pose) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        // `--npu-ops conv` moves the convolutions to the array, and the
-        // refusal for a container that cannot do it is the array's own:
-        // a container packed without the panels says so, and the message
-        // says how to pack it.
-        let started = std::time::Instant::now();
-        let network = match npum_cpu::pose::Network::open(path) {
-            Ok(n) => n,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let setup_s = started.elapsed().as_secs_f64();
-        let geometry = network.geometry().clone();
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| arch.to_string());
-        let params = crate::pose::params_from(args);
-        // THE ARRAY, OR THE HOST.
-        //
-        // The flag is a question about where the run happens, and it is
-        // answered here and nowhere else: the convolutions go to the array
-        // and the run says how many it dispatched. A container that cannot
-        // do it is refused HERE, before the first image, with the reason.
-        let mut array = if crate::ocr::wants_conv(args) {
-            let specs = npum_cpu::pose::array_specs(&geometry);
-            match crate::arrayconv::open(path, &specs, args, root) {
-                Ok(backend) => Some(backend),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        } else {
-            None
-        };
-        let array_info = array.as_ref().map(|backend| crate::pose::ArrayInfo {
-            streams: backend.stream_count(),
-            // THE DESIGN'S OWN PATH, or nothing at all: a container that
-            // carries its own set needs nothing beside it, and there is no
-            // path to print.
-            designs: args
-                .value("--artifacts")
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
-            rows: backend.rows_per_dispatch(),
-        });
-        crate::pose::print_block(&name, &geometry, network.threads(), setup_s, array_info.as_ref());
-        let _ = arch;
-
-        let text = args.switch("--text");
-        let dump = args.value("--pose-dump").map(std::path::PathBuf::from);
-        for image in images {
-            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
-                Ok(d) => d,
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            let all = std::time::Instant::now();
-            let front = std::time::Instant::now();
-            let (input, letterbox) =
-                match npum_cpu::pose_decode::letterbox_normalise(&decoded, &geometry) {
-                    Ok(v) => v,
-                    Err(reason) => {
-                        eprintln!("error: {reason}");
-                        return crate::EXIT_REFUSED;
-                    }
-                };
-            let front_end_s = front.elapsed().as_secs_f64();
-
-            if let Some(dump) = dump.as_deref() {
-                if let Err(reason) =
-                    crate::pose::write_dump(dump, &network, &input, array.as_deref_mut())
-                {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-
-            let net = std::time::Instant::now();
-            let (head, timings) = match network.run_timed_on_array(&input, array.as_deref_mut())
-            {
-                Ok(h) => h,
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            let network_s = net.elapsed().as_secs_f64();
-
-            let dec = std::time::Instant::now();
-            let people = match npum_cpu::pose_decode::decode(&head, &geometry, &letterbox, &params) {
-                Ok(p) => p,
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            };
-            let decode_s = dec.elapsed().as_secs_f64();
-
-            let run = crate::pose::Run {
-                people,
-                width: letterbox.src_w,
-                height: letterbox.src_h,
-                total_s: all.elapsed().as_secs_f64(),
-                front_end_s,
-                network_s,
-                decode_s,
-                timings,
-            };
-            crate::pose::print_run(image, &run, &geometry);
-            if text {
-                print!("{}", crate::pose::text_summary(image, &run));
-            } else {
-                let detection = npum_cpu::pose_decode::Detection {
-                    people: run.people,
-                    front_end_s,
-                    network_s,
-                    decode_s,
-                    total_s: run.total_s,
-                    width: run.width,
-                    height: run.height,
-                    scale: letterbox.scale,
-                    pad_x: letterbox.pad_x,
-                    pad_y: letterbox.pad_y,
-                    // WHERE THE CONVOLUTIONS RAN. The JSON says it as well as
-                    // the status block does, because the JSON is what a
-                    // program reads: a reader that asked for the array and
-                    // got a host's numbers would have no way to tell.
-                    dispatches: timings.dispatches,
-                    convs_host: if timings.convs_array > 0 {
-                        0
-                    } else {
-                        geometry.convs.len().saturating_sub(1) as i64
-                    },
-                };
-                print!(
-                    "{}",
-                    npum_cpu::pose_decode::result_json(
-                        &detection,
-                        &geometry,
-                        &params,
-                        image,
-                        timings.convs_array > 0
-                    )
-                );
-            }
-        }
-        0
-    })
-}
 
 /// `hands`.
 ///
@@ -739,204 +278,6 @@ pub fn pose(args: &Args, root: &Path) -> Outcome {
 /// between the two stages is where the whole of this family's subtlety lives,
 /// and it is in `npum_cpu::hands_decode`; this function is the block, the
 /// per-image lines and the loop.
-pub fn hands(args: &Args, root: &Path) -> Outcome {
-    let Some(model) = args.positional.first() else {
-        return crate::needs_a_model("hands");
-    };
-    let images: Vec<&String> = args.positional.iter().skip(1).collect();
-    if images.is_empty() {
-        eprintln!("error: this is a hands model, so say whose hands to find:");
-        eprintln!("    npuimage hands <model> <image.png> [more.png ...]");
-        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
-        eprintln!("  --max-hands 1     run the second stage on at most N detections");
-        eprintln!("  --text            a human summary instead of JSON");
-        eprintln!("  --hands-dump FILE every graph node's output, for the gate");
-        eprintln!(
-            "  (the score and NMS thresholds come from the container, not from a\n   \
-             flag: they are part of the checkpoint -- see the refusal above)"
-        );
-        return crate::EXIT_REFUSED;
-    }
-    with_model(model, npum_families::Family::Hands, root, |path, arch| {
-        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Hands) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Hands) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        // pose's own flags are REFUSED rather than ignored: they read as
-        // "thresholds for the detection" on a mode that also has a detector,
-        // and silently dropping them would produce a run whose boxes differ
-        // from the one that was asked for with nothing in the output saying so.
-        for f in [
-            "--conf",
-            "--iou",
-            "--kpt",
-            "--max-det",
-            "--pose",
-            "--pose-dump",
-            "--bo-mode",
-        ] {
-            if args.value(f).is_some() || args.switch(f) {
-                eprintln!(
-                    "error: {f}: not a flag of `hands`. The score, NMS and crop \
-                     thresholds are read from the container (score_threshold, \
-                     nms_threshold, the two enlarge factors and the two shifts), \
-                     because they are part of how this checkpoint was trained and the \
-                     OpenCV zoo demo that recorded the golden used the container's \
-                     values, not a command line's. For --pose: use `pose`, which is a \
-                     different model with different flags. The two dumps are separate \
-                     because they record different graphs, and one reader cannot read \
-                     the other's file."
-                );
-                return crate::EXIT_REFUSED;
-            }
-        }
-        // --max-hands: a CAP on how many detections reach the second stage, not
-        // a score threshold. Every hand is an independent crop of the original
-        // frame, so the only lever is how many to run. A cap of 0 is a typo and
-        // a cap of -1 is the session's own "all of them".
-        let mut max_hands = -1i64;
-        if let Some(v) = args.value("--max-hands") {
-            match v.parse::<i64>() {
-                Ok(n) if (1..=10000).contains(&n) => max_hands = n,
-                _ => {
-                    eprintln!(
-                        "error: --max-hands '{v}': expected an integer in 1..10000, or \
-                         omit it to run the second stage on every detection"
-                    );
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        }
-        let text = args.switch("--text");
-        let started = std::time::Instant::now();
-        let network = match crate::hands::open(path) {
-            Ok(n) => n,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let setup_s = started.elapsed().as_secs_f64();
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| arch.to_string());
-        // THE ARRAY, OR THE HOST.
-        //
-        // The flag is a question about where the run happens, and it is
-        // answered here and nowhere else: the DENSE convolutions go to the
-        // array and the depthwise ones stay on the host -- a depthwise
-        // filter reduces WITHIN one channel and has no [M, N] product in it
-        // at all. A container that cannot do it is refused HERE, before the
-        // first image, with the reason.
-        let mut array = if crate::ocr::wants_conv(args) {
-            let specs = npum_cpu::hands::array_specs(network.geometry());
-            match crate::arrayconv::open(path, &specs, args, root) {
-                Ok(backend) => Some(backend),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        } else {
-            None
-        };
-        let array_info = array.as_ref().map(|backend| crate::hands::ArrayInfo {
-            streams: backend.stream_count(),
-            // THE DESIGN'S OWN PATH, or nothing at all: a container that
-            // carries its own set needs nothing beside it, and there is no
-            // path to print.
-            designs: args
-                .value("--artifacts")
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
-            rows: backend.rows_per_dispatch(),
-            // The panels the container carries, staged once, at load.
-            staged_bytes: backend.staged_bytes(),
-        });
-        crate::hands::print_block(
-            &name,
-            network.geometry(),
-            setup_s,
-            array_info.as_ref(),
-        );
-        let _ = arch;
-
-        let dump_path = args.value("--hands-dump").map(std::path::PathBuf::from);
-        let mut dump = match dump_path.as_deref() {
-            Some(p) => match crate::hands::Dump::create(p) {
-                Ok(d) => Some(d),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            },
-            None => None,
-        };
-        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
-            crate::hands::print_dump_header(p, network.geometry());
-        }
-
-        let mut exit = 0;
-        for image in images {
-            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
-                Ok(d) => d,
-                Err(reason) => {
-                    eprintln!("  {image}: {reason}");
-                    exit = 1;
-                    continue;
-                }
-            };
-            let run = {
-                let mut hook = |net: &str, node: usize, t: &npum_cpu::pose::Tensor| {
-                    if let Some(d) = dump.as_mut() {
-                        d.record(net, node, t);
-                    }
-                };
-                npum_cpu::hands_decode::detect(
-                    &network,
-                    &decoded,
-                    max_hands,
-                    &mut hook,
-                    array.as_deref_mut(),
-                )
-            };
-            let run = match run {
-                Ok(r) => r,
-                Err(reason) => {
-                    eprintln!("  {image}: {reason}");
-                    exit = 1;
-                    continue;
-                }
-            };
-            if let Some(d) = dump.as_mut() {
-                d.image += 1;
-            }
-            crate::hands::print_run(image, &run);
-            if text {
-                print!("{}", npum_cpu::hands_decode::text_summary(image, &run));
-                continue;
-            }
-            crate::hands::print_crop(&run);
-            print!("{}", npum_cpu::hands_decode::result_json(&run, image));
-        }
-
-        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
-            match d.finish(p) {
-                Ok(n) => eprintln!("             {n} node tensors written"),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        }
-        exit
-    })
-}
 
 /// `mppose`.
 ///
@@ -944,207 +285,6 @@ pub fn hands(args: &Args, root: &Path) -> Outcome {
 /// between the two stages is where the whole of this family's subtlety lives,
 /// and it is in `npum_cpu::mppose_decode`; this function is the block, the
 /// per-image lines and the loop.
-pub fn mppose(args: &Args, root: &Path) -> Outcome {
-    let Some(model) = args.positional.first() else {
-        return crate::needs_a_model("mppose");
-    };
-    let images: Vec<&String> = args.positional.iter().skip(1).collect();
-    if images.is_empty() {
-        eprintln!("error: this is a MediaPipe Pose model, so say whose body to find:");
-        eprintln!("    npuimage mppose <model> <image.png> [more.png ...]");
-        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
-        eprintln!("  --max-people 1    run the landmark network on at most N detections");
-        eprintln!("  --text            a human summary instead of JSON");
-        eprintln!("  --mppose-dump FILE  every graph node's output, for the gate");
-        eprintln!(
-            "  (every threshold comes from the container, not from a flag: they are\n   \
-             part of the checkpoint -- see the refusal above)"
-        );
-        return crate::EXIT_REFUSED;
-    }
-    with_model(model, npum_families::Family::MpPose, root, |path, arch| {
-        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::MpPose) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::MpPose) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        // The other architectures' own flags are REFUSED rather than ignored: they
-        // read as "thresholds for the detection" on a mode that also has a
-        // detector, and silently dropping them would produce a run whose people
-        // differ from the one that was asked for with nothing in the output
-        // saying so.
-        for f in [
-            "--conf",
-            "--iou",
-            "--kpt",
-            "--max-det",
-            "--pose",
-            "--pose-dump",
-            "--bo-mode",
-            "--max-hands",
-            "--hands-dump",
-        ] {
-            if args.value(f).is_some() || args.switch(f) {
-                eprintln!(
-                    "error: {f}: not a flag of `mppose`. The detector's score and NMS \
-                     thresholds and the landmark net's confidence threshold are read from the \
-                     container (score_threshold, nms_threshold, top_k, pose_conf_threshold, \
-                     person_box_pre_enlarge, person_box_enlarge), because they are part of how \
-                     this checkpoint was trained and the OpenCV zoo demo that recorded the \
-                     golden used the container's values, not a command line's. For --pose: use \
-                     `pose`, which is a different model with different flags. The three dumps \
-                     are separate because they record different graphs, and one reader cannot \
-                     read another's file."
-                );
-                return crate::EXIT_REFUSED;
-            }
-        }
-        // --max-people: a CAP on how many detections reach the second stage, not a
-        // score threshold. Every person is an independent rotated crop of the
-        // original frame, so there is no way to batch them and the only lever is
-        // how many to run.
-        let mut max_people = -1i64;
-        if let Some(v) = args.value("--max-people") {
-            match v.parse::<i64>() {
-                Ok(n) if (1..=10000).contains(&n) => max_people = n,
-                _ => {
-                    eprintln!(
-                        "error: --max-people '{v}': expected an integer in 1..10000, or omit \
-                         it to run the landmark network on every detection"
-                    );
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        }
-        let text = args.switch("--text");
-        let started = std::time::Instant::now();
-        let network = match crate::mppose::open(path) {
-            Ok(n) => n,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let setup_s = started.elapsed().as_secs_f64();
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| arch.to_string());
-        // THE ARRAY, OR THE HOST.
-        //
-        // The flag is a question about where the run happens, and it is
-        // answered here and nowhere else: the DENSE convolutions go to the
-        // array and the depthwise ones stay on the host -- a depthwise
-        // filter reduces WITHIN one channel and has no [M, N] product in it
-        // at all. A container that cannot do it is refused HERE, before the
-        // first image, with the reason.
-        let mut array = if crate::ocr::wants_conv(args) {
-            let specs = npum_cpu::mppose::array_specs(network.geometry());
-            match crate::arrayconv::open(path, &specs, args, root) {
-                Ok(backend) => Some(backend),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        } else {
-            None
-        };
-        let array_info = array.as_ref().map(|backend| crate::mppose::ArrayInfo {
-            streams: backend.stream_count(),
-            // THE DESIGN'S OWN PATH, or nothing at all: a container that
-            // carries its own set needs nothing beside it, and there is no
-            // path to print.
-            designs: args
-                .value("--artifacts")
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
-            rows: backend.rows_per_dispatch(),
-            // The panels the container carries, staged once, at load.
-            staged_bytes: backend.staged_bytes(),
-        });
-        crate::mppose::print_block(
-            &name,
-            network.geometry(),
-            setup_s,
-            array_info.as_ref(),
-        );
-        let _ = arch;
-
-        let dump_path = args.value("--mppose-dump").map(std::path::PathBuf::from);
-        let mut dump = match dump_path.as_deref() {
-            Some(p) => match crate::mppose::Dump::create(p) {
-                Ok(d) => Some(d),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            },
-            None => None,
-        };
-        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
-            crate::mppose::print_dump_header(p, network.geometry());
-        }
-
-        let mut exit = 0;
-        for image in images {
-            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
-                Ok(d) => d,
-                Err(reason) => {
-                    eprintln!("  {image}: {reason}");
-                    exit = 1;
-                    continue;
-                }
-            };
-            let run = {
-                let mut hook = |net: &str, node: usize, t: &npum_cpu::pose::Tensor| {
-                    if let Some(d) = dump.as_mut() {
-                        d.record(net, node, t);
-                    }
-                };
-                npum_cpu::mppose_decode::detect(
-                    &network,
-                    &decoded,
-                    max_people,
-                    &mut hook,
-                    array.as_deref_mut(),
-                )
-            };
-            let run = match run {
-                Ok(r) => r,
-                Err(reason) => {
-                    eprintln!("  {image}: {reason}");
-                    exit = 1;
-                    continue;
-                }
-            };
-            if let Some(d) = dump.as_mut() {
-                d.image += 1;
-            }
-            crate::mppose::print_run(image, &run);
-            if text {
-                print!("{}", npum_cpu::mppose_decode::text_summary(image, &run));
-                continue;
-            }
-            crate::mppose::print_crop(&run);
-            print!("{}", npum_cpu::mppose_decode::result_json(&run, image));
-        }
-
-        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
-            match d.finish(p) {
-                Ok(n) => eprintln!("             {n} node tensors written"),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        }
-        exit
-    })
-}
 
 /// `ocr`.
 ///
@@ -1153,197 +293,14 @@ pub fn mppose(args: &Args, root: &Path) -> Outcome {
 /// decode between the two stages is where this family's subtlety lives; it is
 /// in `npum_cpu::ocr_decode`. This function is the block, the per-image lines
 /// and the loop.
-pub fn ocr(args: &Args, root: &Path) -> Outcome {
-    let Some(model) = args.positional.first() else {
-        return crate::needs_a_model("ocr");
-    };
-    let images: Vec<&String> = args.positional.iter().skip(1).collect();
-    if images.is_empty() {
-        eprintln!("error: this is an OCR model, so say what to read:");
-        eprintln!("    npuimage ocr <model> <image.png> [more.png ...]");
-        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
-        eprintln!("  --max-boxes 1      read at most N boxes");
-        eprintln!("  --text             a human summary instead of JSON");
-        eprintln!("  --ocr-dump FILE    every graph node's output, for the gate");
-        eprintln!(
-            "  (every threshold comes from the container, not from a flag: they are\n   \
-             part of the checkpoint -- see the refusal above)"
-        );
-        return crate::EXIT_REFUSED;
-    }
-    with_model(model, npum_families::Family::Ocr, root, |path, arch| {
-        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Ocr) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) = refuse_op_not_in_arch(args, npum_families::Family::Ocr) {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        // The other architectures' own flags are REFUSED rather than ignored: they
-        // read as "thresholds for the detection" on a mode that also has a detector,
-        // and silently dropping them would produce a run whose boxes differ from the
-        // one that was asked for with nothing in the output saying so.
-        for f in [
-            "--conf",
-            "--iou",
-            "--kpt",
-            "--max-det",
-            "--pose",
-            "--pose-dump",
-            "--bo-mode",
-            "--max-hands",
-            "--hands-dump",
-            "--max-people",
-            "--mppose-dump",
-        ] {
-            if args.value(f).is_some() || args.switch(f) {
-                eprintln!(
-                    "error: {f}: not a flag of `ocr`. The detector's thresholds and the \
-                     recogniser's are read from the container (det_thresh, det_box_thresh, \
-                     det_unclip_ratio, det_max_candidates, det_min_size), because they are \
-                     part of how this checkpoint was trained and the demo that recorded the \
-                     golden used the container's values, not a command line's. For --pose: use \
-                     `pose`, which is a different model with different flags; for \
-                     --max-people: use `mppose`, whose second stage is a landmark network \
-                     and not a recogniser. The dumps are separate because they record \
-                     different graphs, and one reader cannot read another's file."
-                );
-                return crate::EXIT_REFUSED;
-            }
-        }
-        // --max-boxes: a CAP on how many boxes reach the recogniser, not a score
-        // threshold. Every box is an independent crop of the original frame, so there
-        // is no way to batch them and the only lever is how many to read.
-        let mut max_boxes = -1i64;
-        if let Some(v) = args.value("--max-boxes") {
-            match v.parse::<i64>() {
-                Ok(n) if (1..=10000).contains(&n) => max_boxes = n,
-                _ => {
-                    eprintln!(
-                        "error: --max-boxes '{v}': expected an integer in 1..10000, or omit it \
-                         to read every box the detector found"
-                    );
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        }
-        let text = args.switch("--text");
-        let started = std::time::Instant::now();
-        let mut session = match crate::ocr::open(path) {
-            Ok(s) => s,
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        // THE ARRAY, OR THE HOST.
-        //
-        // The flag is a question about where the run happens, and it is
-        // answered here and nowhere else: the convolutions go to the array,
-        // the depthwise and the transposed ones stay on the host, and the
-        // run says how many it dispatched.
-        let array = if crate::ocr::wants_conv(args) {
-            match crate::ocr::open_array(path, session.geometry(), args, root) {
-                Ok(backend) => Some(backend),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        } else {
-            None
-        };
-        session.set_array(array);
-        let setup_s = started.elapsed().as_secs_f64();
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| arch.to_string());
-        let geometry = session.geometry().clone();
-        crate::ocr::print_block(&name, &geometry, setup_s, session.array());
-        let _ = arch;
-
-        let dump_path = args.value("--ocr-dump").map(std::path::PathBuf::from);
-        let mut dump = match dump_path.as_deref() {
-            Some(p) => match crate::ocr::Dump::create(p) {
-                Ok(d) => Some(d),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            },
-            None => None,
-        };
-        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
-            crate::ocr::print_dump_header(p, &geometry);
-        }
-
-        let mut exit = 0;
-        for image in images {
-            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
-                Ok(d) => d,
-                Err(reason) => {
-                    eprintln!("  {image}: {reason}");
-                    exit = 1;
-                    continue;
-                }
-            };
-            let run = {
-                let mut hook = |net: &str, node: i64, t: &npum_cpu::ocr::Tensor| {
-                    if let Some(d) = dump.as_mut() {
-                        d.record(net, node, t);
-                    }
-                };
-                session.read(&decoded, max_boxes, &mut hook)
-            };
-            let run = match run {
-                Ok(r) => r,
-                Err(reason) => {
-                    eprintln!("  {image}: {reason}");
-                    exit = 1;
-                    continue;
-                }
-            };
-            if let Some(d) = dump.as_mut() {
-                d.image += 1;
-            }
-            crate::ocr::print_run(image, &run);
-            crate::ocr::print_split(
-                session.det_cost(),
-                session.rec_cost(),
-                geometry.det_depthwise(),
-                geometry.det_transposed(),
-                // The recogniser's counters accumulate over EVERY box, so the
-                // split reports the multiplication the oracle's does: the
-                // recogniser runs once per box, and its 24 dense and 14
-                // depthwise convolutions are counted once per crop.
-                geometry.rec_depthwise() * run.boxes_read,
-                geometry.rec_transposed() * run.boxes_read,
-                session.array(),
-            );
-            if text {
-                print!("{}", npum_cpu::ocr_decode::text_summary(image, &run));
-                continue;
-            }
-            print!("{}", npum_cpu::ocr_decode::result_json(&run, image));
-        }
-
-        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
-            match d.finish(p) {
-                Ok(n) => eprintln!("             {n} node tensors written"),
-                Err(reason) => {
-                    eprintln!("error: {reason}");
-                    return crate::EXIT_REFUSED;
-                }
-            }
-        }
-        exit
-    })
-}
 
 /// Resolve the model, check the family, and run the family's body.
-fn with_model<F>(model: &str, wanted: npum_families::Family, root: &Path, body: F) -> Outcome
+pub(crate) fn with_model<F>(
+    model: &str,
+    wanted: npum_families::Family,
+    root: &Path,
+    body: F,
+) -> Outcome
 where
     F: FnOnce(&PathBuf, &str) -> Outcome,
 {
@@ -1415,6 +372,50 @@ pub fn resolve_model(model: &str, root: &Path) -> Result<PathBuf, String> {
         }
     }
 
+    // Phase 10 layout: `weights/<family>/<model>/` (and flat files inside it).
+    // The family is not known from the name alone, so search one level of
+    // family directories under `weights/`.
+    let weights = root.join("weights");
+    if let Ok(families) = std::fs::read_dir(&weights) {
+        for fam in families.flatten() {
+            let fam_path = fam.path();
+            if !fam_path.is_dir() {
+                continue;
+            }
+            for ext in ["npue", "npum"] {
+                let direct = fam_path.join(format!("{model}.{ext}"));
+                if direct.is_file() {
+                    return Ok(direct);
+                }
+            }
+            let named = fam_path.join(model);
+            if named.is_dir() {
+                for ext in ["npue", "npum"] {
+                    for name in ["model", model] {
+                        let candidate = named.join(format!("{name}.{ext}"));
+                        if candidate.is_file() {
+                            return Ok(candidate);
+                        }
+                    }
+                }
+                // As a fallback, take any single container in that model directory.
+                if let Ok(entries) = std::fs::read_dir(&named) {
+                    let mut found = None;
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_file() && looks_like_container_path(&p.to_string_lossy()) {
+                            found = Some(p);
+                            break;
+                        }
+                    }
+                    if let Some(p) = found {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+    }
+
     if npum_families::catalogue::find(model).is_some() {
         // It IS a model this build knows. It is not installed, and
         // fetching it is a network operation the runtime does when it is
@@ -1433,13 +434,54 @@ pub fn resolve_model(model: &str, root: &Path) -> Result<PathBuf, String> {
     Err(format!(
         "'{model}' is not installed and is not a model this build knows how to \
          fetch. Known models:{known}\n  \
-         A container you packed yourself is used by name once it is in models/."
+         A container you packed yourself is used by name once it is in models/ \
+         or weights/<family>/<model>/."
     ))
 }
 
 /// Whether the argument looks like a path to a container.
 ///
 /// A path has a separator or a suffix; a name has neither.
-fn looks_like_container_path(arg: &str) -> bool {
+pub(crate) fn looks_like_container_path(arg: &str) -> bool {
     arg.contains('/') || arg.contains('\\') || arg.ends_with(".npue") || arg.ends_with(".npum")
+}
+
+/// Delegates to the embed command handler.
+pub fn embed(args: &Args, root: &Path) -> Outcome {
+    crate::embed::command(args, root)
+}
+
+/// Delegates to the embed command handler.
+pub fn tokenize(args: &Args, root: &Path) -> Outcome {
+    crate::embed::tokenize_command(args, root)
+}
+
+/// Delegates to the stt command handler.
+pub fn transcribe(args: &Args, root: &Path) -> Outcome {
+    crate::stt::command(args, root)
+}
+
+/// Delegates to the vit command handler.
+pub fn classify(args: &Args, root: &Path) -> Outcome {
+    crate::vit::command(args, root)
+}
+
+/// Delegates to the pose command handler.
+pub fn pose(args: &Args, root: &Path) -> Outcome {
+    crate::pose::command(args, root)
+}
+
+/// Delegates to the hands command handler.
+pub fn hands(args: &Args, root: &Path) -> Outcome {
+    crate::hands::command(args, root)
+}
+
+/// Delegates to the mppose command handler.
+pub fn mppose(args: &Args, root: &Path) -> Outcome {
+    crate::mppose::command(args, root)
+}
+
+/// Delegates to the ocr command handler.
+pub fn ocr(args: &Args, root: &Path) -> Outcome {
+    crate::ocr::command(args, root)
 }

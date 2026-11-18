@@ -26,11 +26,13 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-from encoder import MiniLMReference, read_pooling          # noqa: E402
-from npz_io import load as load_goldens                    # noqa: E402
-from onnx_io import MODEL_ONNX, load as load_ckpt, model_digest  # noqa: E402
+from reference.encoder import MiniLMReference, read_pooling          # noqa: E402
+from reference.npz_io import load as load_goldens                    # noqa: E402
+from reference.onnx_io import MODEL_ONNX, load as load_ckpt, model_digest  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 

@@ -69,8 +69,8 @@ pub use geometry::Geometry;
 pub use manifest::DesignInfo;
 pub use transport::{BufferFlags, Transport, TransportError};
 
-use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 use npum_model::caps::Precision as CapsPrecision;
+use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 
 /// The NPU backend.
 pub struct XdnaBackend {
@@ -132,7 +132,13 @@ impl Backend for XdnaBackend {
         Ok(self.plan.clone())
     }
 
-    fn gemm(&mut self, a: &Tensor, b: &Tensor, c: &mut Tensor, acc: Option<&mut Tensor>) -> Result<()> {
+    fn gemm(
+        &mut self,
+        a: &Tensor,
+        b: &Tensor,
+        c: &mut Tensor,
+        acc: Option<&mut Tensor>,
+    ) -> Result<()> {
         dispatch::gemm(self, a, b, c, acc)
     }
 

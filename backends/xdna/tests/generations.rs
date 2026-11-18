@@ -21,7 +21,7 @@
 //! and the tests below would fail if someone added a second source of truth.
 
 use npum_format::layout::{Generation, OperandDtype};
-use npum_xdna::design::{design_fits, Design, DesignSet};
+use npum_xdna::design::{Design, DesignSet, design_fits};
 use npum_xdna::geometry::Geometry;
 
 /// The names the CLI and the exporter use for the generations.
@@ -51,12 +51,18 @@ fn the_geometry_differs_where_the_plan_says_it_does() {
     assert_eq!(npu2.columns, 8, "npu2 presents eight AIE columns");
 
     assert_eq!(
-        (npu1.mac_for(OperandDtype::I8).s, npu1.mac_for(OperandDtype::I8).t),
+        (
+            npu1.mac_for(OperandDtype::I8).s,
+            npu1.mac_for(OperandDtype::I8).t
+        ),
         (8, 8),
         "int8 is (8, 8) on npu1"
     );
     assert_eq!(
-        (npu2.mac_for(OperandDtype::I8).s, npu2.mac_for(OperandDtype::I8).t),
+        (
+            npu2.mac_for(OperandDtype::I8).s,
+            npu2.mac_for(OperandDtype::I8).t
+        ),
         (8, 8),
         "int8 is (8, 8) on npu2"
     );
@@ -121,14 +127,26 @@ fn a_design_set_from_the_other_board_is_refused() {
     let wrong = npu1_set
         .fits(Generation::Npu2, OperandDtype::Bf16)
         .expect_err("an npu1 set on an npu2 device is refused");
-    assert!(wrong.contains("npu1"), "the refusal names the design: {wrong}");
-    assert!(wrong.contains("npu2"), "the refusal names the device: {wrong}");
+    assert!(
+        wrong.contains("npu1"),
+        "the refusal names the design: {wrong}"
+    );
+    assert!(
+        wrong.contains("npu2"),
+        "the refusal names the device: {wrong}"
+    );
 
     let wrong = npu2_set
         .fits(Generation::Npu1, OperandDtype::Bf16)
         .expect_err("an npu2 set on an npu1 device is refused");
-    assert!(wrong.contains("npu2"), "the refusal names the design: {wrong}");
-    assert!(wrong.contains("npu1"), "the refusal names the device: {wrong}");
+    assert!(
+        wrong.contains("npu2"),
+        "the refusal names the design: {wrong}"
+    );
+    assert!(
+        wrong.contains("npu1"),
+        "the refusal names the device: {wrong}"
+    );
 
     // The single-design check refuses the same way, and also refuses a set
     // whose GEOMETRY happens to agree: the generation stamp is what is

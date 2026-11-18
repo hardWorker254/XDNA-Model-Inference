@@ -118,8 +118,9 @@ fn run(path: &Path, model: &npum_cpu::bert::BertModel, recorder: &mut Recorder) 
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .expect("the container holds a vocabulary");
-    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-        .expect("the vocabulary is usable");
+    let tokenizer =
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+            .expect("the vocabulary is usable");
     let (encoding, truncated) = tokenizer
         .encode_padded("a golden transcript is a contract", SEQ)
         .expect("the text encodes");
@@ -288,8 +289,9 @@ fn run_dense(path: &Path, model: &npum_cpu::bert::BertModel, dense: &mut Dense) 
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .expect("the container holds a vocabulary");
-    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-        .expect("the vocabulary is usable");
+    let tokenizer =
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+            .expect("the vocabulary is usable");
     let (encoding, truncated) = tokenizer
         .encode_padded("a golden transcript is a contract", SEQ)
         .expect("the text encodes");

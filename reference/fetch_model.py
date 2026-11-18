@@ -26,7 +26,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MODELS = REPO / "models"
-sys.path.append(str(REPO))
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 from npue_tools.weights import SAFETENSORS_NAME  # noqa: E402
 

@@ -85,8 +85,8 @@ DOCS = (REPO / "NPU_OPS.md", REPO / "NPU_OPS.ru.md")
 # cell's reason in the registry). Changing one means a cell's status changed,
 # which is a behaviour change -- so this gate should have to be edited on purpose
 # rather than a number quietly moving under a document that still says 14.
-EXPECTED_COUNTS = {"honours": 27, "on_array": 0, "unimplemented": 0,
-                   "blocked": 3, "absent": 42}
+EXPECTED_COUNTS = {"honours": 27, "on_array": 0, "unimplemented": 1,
+                   "blocked": 2, "absent": 42}
 # 9 codes x 8 rows = 72, and the tally moved from 56 in three steps:
 #
 #   +7   one cell per row for the code `gemm`: honours for the four
@@ -102,16 +102,22 @@ EXPECTED_COUNTS = {"honours": 27, "on_array": 0, "unimplemented": 0,
 # is recorded. A tally that silently dropped to zero without being pinned would
 # look exactly like a tally nobody had filled in.
 #
-# WHAT THE THREE REMAINING `blocked` CELLS ARE, because they are not the same kind
-# of blocked and the word does not say so:
-#   embeddinggemma-300m/layn   needs RMSNorm -- a different kernel body, not a
-#                               flag; the set already carries nine codes
-#   embeddinggemma-300m/gelu   needs GeGLU taken out of a gated path, which has no
-#                               standalone pass to hand a hw_context
-#   vit-base-patch16-224/logit needs a vocabulary projection, which has no code
-# So all three are "this is a new operation", which is a different piece of work
-# from "this is the existing operation and there is nowhere to put it" -- and the
-# difference is the whole reason they are still blocked rather than dishonoured.
+# WHAT THE `blocked` AND `unimplemented` CELLS ARE, because the words do not say
+# so on their own:
+#   embeddinggemma-300m/gelu   blocked -- needs GeGLU taken out of a gated path,
+#                               which has no standalone pass to hand a hw_context
+#   vit-base-patch16-224/logit blocked -- needs a vocabulary projection, which
+#                               has no code (its width, 1000, is not a
+#                               multiple of tile_n*cols = 192 and no legal B
+#                               panel of that width exists on this array)
+#   embeddinggemma-300m/layn   unimplemented -- RMSNorm kernels/design export
+#                               exists, but no Gemma runtime forward path in
+#                               this tree dispatches EltOp::RmsNorm yet.
+# The blocked cases are "this is a new operation/fusion or an inexpressible
+# shape", a different piece of work from "this is the existing operation and
+# there is nowhere to put it" -- and that is why they are still blocked rather
+# than dishonoured. The unimplemented case is "the operation exists and the
+# kernel/design exists, but the runtime branch is not wired".
 # honours went 19 -> 20 when arch=8's conv cell stopped being `blocked` and became
 # `honours`: a design set was built for its twenty-two padded (K, N) shapes and
 # `--npu-ops conv` now dispatches its 99 dense convolutions. `blocked` went 5 -> 4

@@ -485,7 +485,15 @@ def export_arch(args: argparse.Namespace, arch: str) -> int:
     # tensor in chunks of whatever the design holds.
     if stream_set != "stt":
         report_eltwise_plan(extra, args)
-        if extra:
+        build_ops = set(extra)
+        target = getattr(args, "target", None)
+        # Gemma's `layn` is RMSNorm (no mean/beta, different epsilon semantics
+        # handled by the model), so the exported eltwise design must be the
+        # RMSNorm kernel rather than LayerNorm.
+        if target == "embeddinggemma-300m" and "layn" in build_ops:
+            build_ops.discard("layn")
+            build_ops.add("rmsnorm")
+        if build_ops:
             # Same generation root, alongside gemm_rtp: the runtime's --npu-ops
             # resolves these directories by the op's code, which IS the directory
             # name (see tools/lib/npu_ops.py). Built in the same invocation so the
@@ -498,13 +506,13 @@ def export_arch(args: argparse.Namespace, arch: str) -> int:
                 args.elt_cols, args.gelu_tile, args.ln_variant, args.sm_variant,
                 args.cache_root, args.per_arch_cache,
                 gelu_variant=args.gelu_variant,
-                # The LayerNorm design is built for THIS model: its row width is
-                # d_model and its epsilon is the checkpoint's layer_norm_eps, both
-                # of which the runtime then checks against the container it is
-                # holding. A design exported with the wrong pair is refused by name
-                # rather than silently normalising with the other model's numbers.
+                # The LayerNorm/RMSNorm design is built for THIS model: its row
+                # width is d_model and its epsilon is the checkpoint's norm
+                # epsilon, both of which the runtime checks against the container
+                # it is holding. A design exported with the wrong pair is refused
+                # by name rather than silently normalising with the wrong numbers.
                 ln_cols=args.ln_cols, ln_eps=args.ln_eps, sm_cols=args.sm_cols,
-                ops=extra)
+                ops=build_ops)
 
     return 0
 

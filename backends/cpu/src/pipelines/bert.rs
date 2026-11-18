@@ -27,9 +27,9 @@
 use crate::kernels;
 use crate::kernels::Isa;
 use crate::ops::CpuOps;
+use npum_model::Ops;
 use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape};
 use npum_model::dispatcher::Placement;
-use npum_model::Ops;
 use std::path::Path;
 
 /// What can go wrong while running a BERT container.
@@ -61,10 +61,14 @@ pub enum Error {
         implemented: &'static str,
     },
 
-    #[error("the hidden size {hidden} is not a multiple of eight, and the host kernels read eight floats at a time")]
+    #[error(
+        "the hidden size {hidden} is not a multiple of eight, and the host kernels read eight floats at a time"
+    )]
     UnalignedHidden { hidden: usize },
 
-    #[error("the head size {head_dim} is not a multiple of eight, and the host kernels read eight floats at a time")]
+    #[error(
+        "the head size {head_dim} is not a multiple of eight, and the host kernels read eight floats at a time"
+    )]
     UnalignedHead { head_dim: usize },
 
     #[error("the input is {found} ids for {batch} sequences of {seq}, and it should be {expected}")]
@@ -81,15 +85,19 @@ pub enum Error {
     #[error("the array refused the projection: {0}")]
     Array(#[from] npum_model::array::ArrayError),
 
-    #[error("the softmax design was built with cols {cols}, but this container's sequence is {seq} \
+    #[error(
+        "the softmax design was built with cols {cols}, but this container's sequence is {seq} \
              wide. The design normalises whatever row width it was compiled for and cannot be \
              handed a longer one, so the scores would be computed at the wrong length. Re-export \
-             it with sm_cols >= seq.")]
+             it with sm_cols >= seq."
+    )]
     SoftmaxTooNarrow { cols: usize, seq: usize },
 
-    #[error("the softmax design's rows are {softmax} wide, and the attention's score row is {attn} \
+    #[error(
+        "the softmax design's rows are {softmax} wide, and the attention's score row is {attn} \
              wide. The softmax design reduces along the whole row, so it has to be the width of \
-             the score row it is handed.")]
+             the score row it is handed."
+    )]
     SoftmaxWidthMismatch { softmax: usize, attn: usize },
 
     #[error(transparent)]
@@ -202,9 +210,7 @@ impl BertSpec {
     /// Read the shapes from a container's config.
     pub fn from_config(config: &npum_format::directory::Config) -> Result<Self> {
         let get = |key: &'static str| -> Result<i64> {
-            config
-                .get_i64(key)
-                .ok_or(Error::NoConfig { key })
+            config.get_i64(key).ok_or(Error::NoConfig { key })
         };
         let layers = get("num_layers")? as usize;
         let heads = get("num_heads")? as usize;
@@ -283,10 +289,7 @@ fn read_operand(
                     "{name}: logical [{},{}] but padded [{},{}]. The host builds [K,N] from the \
                      padded shape and the caller indexes it with the logical one, so the two \
                      must agree.",
-                    entry.logical_shape[0],
-                    entry.logical_shape[1],
-                    shape[0],
-                    shape[1]
+                    entry.logical_shape[0], entry.logical_shape[1], shape[0], shape[1]
                 ));
             }
             let (k, n) = (shape[0] as usize, shape[1] as usize);
@@ -413,7 +416,9 @@ impl BertModel {
         }
         let spec = BertSpec::from_config(container.config())?;
         if spec.hidden % 8 != 0 {
-            return Err(Error::UnalignedHidden { hidden: spec.hidden });
+            return Err(Error::UnalignedHidden {
+                hidden: spec.hidden,
+            });
         }
         if spec.head_dim % 8 != 0 {
             return Err(Error::UnalignedHead {
@@ -453,7 +458,11 @@ impl BertModel {
         let ffn = spec.ffn;
         let three_hidden = 3 * hidden;
 
-        let word = expect("embeddings.word", read("embeddings.word")?, spec.vocab * hidden)?;
+        let word = expect(
+            "embeddings.word",
+            read("embeddings.word")?,
+            spec.vocab * hidden,
+        )?;
         let position = expect(
             "embeddings.position",
             read("embeddings.position")?,
@@ -464,14 +473,22 @@ impl BertModel {
             read("embeddings.token_type")?,
             2 * hidden,
         )?;
-        let ln_gamma = expect("embeddings.ln.weight", read("embeddings.ln.weight")?, hidden)?;
+        let ln_gamma = expect(
+            "embeddings.ln.weight",
+            read("embeddings.ln.weight")?,
+            hidden,
+        )?;
         let ln_beta = expect("embeddings.ln.bias", read("embeddings.ln.bias")?, hidden)?;
 
         let mut layers = Vec::with_capacity(spec.layers);
         for l in 0..spec.layers {
             let p = format!("layer.{l}");
             layers.push(LayerWeights {
-                qkv: expect(&format!("{p}.qkv"), read_operand(&format!("{p}.qkv"))?, hidden * three_hidden)?,
+                qkv: expect(
+                    &format!("{p}.qkv"),
+                    read_operand(&format!("{p}.qkv"))?,
+                    hidden * three_hidden,
+                )?,
                 qkv_bias: expect(
                     &format!("{p}.qkv.bias"),
                     read(&format!("{p}.qkv.bias"))?,
@@ -487,9 +504,21 @@ impl BertModel {
                     read(&format!("{p}.attn_out.bias"))?,
                     hidden,
                 )?,
-                ln1_gamma: expect(&format!("{p}.ln1.weight"), read(&format!("{p}.ln1.weight"))?, hidden)?,
-                ln1_beta: expect(&format!("{p}.ln1.bias"), read(&format!("{p}.ln1.bias"))?, hidden)?,
-                ffn_up: expect(&format!("{p}.ffn_up"), read_operand(&format!("{p}.ffn_up"))?, hidden * ffn)?,
+                ln1_gamma: expect(
+                    &format!("{p}.ln1.weight"),
+                    read(&format!("{p}.ln1.weight"))?,
+                    hidden,
+                )?,
+                ln1_beta: expect(
+                    &format!("{p}.ln1.bias"),
+                    read(&format!("{p}.ln1.bias"))?,
+                    hidden,
+                )?,
+                ffn_up: expect(
+                    &format!("{p}.ffn_up"),
+                    read_operand(&format!("{p}.ffn_up"))?,
+                    hidden * ffn,
+                )?,
                 ffn_up_bias: expect(
                     &format!("{p}.ffn_up.bias"),
                     read(&format!("{p}.ffn_up.bias"))?,
@@ -505,8 +534,16 @@ impl BertModel {
                     read(&format!("{p}.ffn_down.bias"))?,
                     hidden,
                 )?,
-                ln2_gamma: expect(&format!("{p}.ln2.weight"), read(&format!("{p}.ln2.weight"))?, hidden)?,
-                ln2_beta: expect(&format!("{p}.ln2.bias"), read(&format!("{p}.ln2.bias"))?, hidden)?,
+                ln2_gamma: expect(
+                    &format!("{p}.ln2.weight"),
+                    read(&format!("{p}.ln2.weight"))?,
+                    hidden,
+                )?,
+                ln2_beta: expect(
+                    &format!("{p}.ln2.bias"),
+                    read(&format!("{p}.ln2.bias"))?,
+                    hidden,
+                )?,
             });
         }
 
@@ -678,7 +715,14 @@ impl BertModel {
 
         // 3. The forward pass.
         let h = self.forward(
-            ops, &mut x, &add_mask, batch, seq, timings, array, eltwise.as_deref_mut(),
+            ops,
+            &mut x,
+            &add_mask,
+            batch,
+            seq,
+            timings,
+            array,
+            eltwise.as_deref_mut(),
         )?;
 
         // 4. The pooling.
@@ -764,10 +808,7 @@ impl BertModel {
         // handle and no panels -- and the projections stay on the host.
         let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
         if attn_on {
-            let attn_cols = array
-                .as_deref()
-                .and_then(|a| a.score_cols())
-                .unwrap_or(seq);
+            let attn_cols = array.as_deref().and_then(|a| a.score_cols()).unwrap_or(seq);
             if let Some(cols) = eltwise.as_deref().and_then(|e| e.softmax_cols()) {
                 if cols != attn_cols {
                     return Err(Error::SoftmaxWidthMismatch {
@@ -786,7 +827,13 @@ impl BertModel {
             // THE ARRAY'S TIME, IN THE ARRAY'S ROW.
             timings.array_gemm += t0.elapsed().as_secs_f64();
         } else {
-            ops.layernorm_rows(x, rows, hidden, &self.weights.ln_gamma, &self.weights.ln_beta)?;
+            ops.layernorm_rows(
+                x,
+                rows,
+                hidden,
+                &self.weights.ln_gamma,
+                &self.weights.ln_beta,
+            )?;
             let spent = t0.elapsed().as_secs_f64();
             match ops.place() {
                 Placement::Host => timings.host_layernorm += spent,
@@ -812,21 +859,28 @@ impl BertModel {
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
-                    array
-                        .gemm(
-                            &format!("layer.{index}.qkv"),
-                            x,
-                            rows,
-                            hidden,
-                            three_hidden,
-                            Some(&layer.qkv_bias),
-                            &mut qkv,
-                        )?;
+                    array.gemm(
+                        &format!("layer.{index}.qkv"),
+                        x,
+                        rows,
+                        hidden,
+                        three_hidden,
+                        Some(&layer.qkv_bias),
+                        &mut qkv,
+                    )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
                     let t = std::time::Instant::now();
-                    ops.gemm_nt(x, rows, &layer.qkv, hidden, three_hidden, &layer.qkv_bias, &mut qkv)?;
+                    ops.gemm_nt(
+                        x,
+                        rows,
+                        &layer.qkv,
+                        hidden,
+                        three_hidden,
+                        &layer.qkv_bias,
+                        &mut qkv,
+                    )?;
                     // The host's own GEMM has NO row in the C++'s split --
                     // the row that holds the projections' time is the
                     // array's -- so the host's projection time is not
@@ -947,16 +1001,15 @@ impl BertModel {
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
-                    array
-                        .gemm(
-                            &format!("layer.{index}.attn_out"),
-                            &ctx,
-                            rows,
-                            hidden,
-                            hidden,
-                            Some(&layer.attn_out_bias),
-                            &mut proj,
-                        )?;
+                    array.gemm(
+                        &format!("layer.{index}.attn_out"),
+                        &ctx,
+                        rows,
+                        hidden,
+                        hidden,
+                        Some(&layer.attn_out_bias),
+                        &mut proj,
+                    )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
@@ -996,21 +1049,28 @@ impl BertModel {
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
-                    array
-                        .gemm(
-                            &format!("layer.{index}.ffn_up"),
-                            x,
-                            rows,
-                            hidden,
-                            spec.ffn,
-                            Some(&layer.ffn_up_bias),
-                            &mut up,
-                        )?;
+                    array.gemm(
+                        &format!("layer.{index}.ffn_up"),
+                        x,
+                        rows,
+                        hidden,
+                        spec.ffn,
+                        Some(&layer.ffn_up_bias),
+                        &mut up,
+                    )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
                     let t = std::time::Instant::now();
-                    ops.gemm_nt(x, rows, &layer.ffn_up, hidden, spec.ffn, &layer.ffn_up_bias, &mut up)?;
+                    ops.gemm_nt(
+                        x,
+                        rows,
+                        &layer.ffn_up,
+                        hidden,
+                        spec.ffn,
+                        &layer.ffn_up_bias,
+                        &mut up,
+                    )?;
                     if ops.place() != Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
                     }
@@ -1031,16 +1091,15 @@ impl BertModel {
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
-                    array
-                        .gemm(
-                            &format!("layer.{index}.ffn_down"),
-                            &up,
-                            rows,
-                            spec.ffn,
-                            hidden,
-                            Some(&layer.ffn_down_bias),
-                            &mut down,
-                        )?;
+                    array.gemm(
+                        &format!("layer.{index}.ffn_down"),
+                        &up,
+                        rows,
+                        spec.ffn,
+                        hidden,
+                        Some(&layer.ffn_down_bias),
+                        &mut down,
+                    )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
@@ -1093,14 +1152,7 @@ impl BertModel {
     /// sequence are not keys -- they are the padding, and they are filled
     /// with -1e30 so that the softmax's exponentials underflow them to
     /// zero. A zero there would be a key attending to everything.
-    fn qk(
-        &self,
-        qkv: &[f32],
-        scores: &mut [f32],
-        batch: usize,
-        seq: usize,
-        sc_cols: usize,
-    ) {
+    fn qk(&self, qkv: &[f32], scores: &mut [f32], batch: usize, seq: usize, sc_cols: usize) {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let head_dim = spec.head_dim;
@@ -1170,7 +1222,8 @@ impl BertModel {
                 // the order is the answer.
                 let mut acc = vec![0.0f32; head_dim];
                 for (j, &aj) in a.iter().enumerate() {
-                    let v = &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..][..head_dim];
+                    let v =
+                        &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..][..head_dim];
                     for lane in 0..nv {
                         for l in 0..8 {
                             acc[lane * 8 + l] = aj.mul_add(v[lane * 8 + l], acc[lane * 8 + l]);
@@ -1261,4 +1314,3 @@ fn layernorm_params(gamma: &[f32], beta: &[f32]) -> Vec<f32> {
     params.extend_from_slice(beta);
     params
 }
-

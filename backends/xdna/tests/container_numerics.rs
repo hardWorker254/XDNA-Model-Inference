@@ -28,11 +28,11 @@
 //! the array's MMAC multiplies bf16 and int8. The recipe for making one is
 //! in the comment below.
 
-use npum_format::tiling::{untile_b, TileOrder};
-use npum_xdna::array::ArrayDesign;
-use npum_xdna::transport::Transport;
-use npum_xdna::transport::SelectedTransport as Board;
 use npum_format::Container;
+use npum_format::tiling::{TileOrder, untile_b};
+use npum_xdna::array::ArrayDesign;
+use npum_xdna::transport::SelectedTransport as Board;
+use npum_xdna::transport::Transport;
 
 /// bf16 carries 8 significand bits, so one output rounding is at most half an
 /// ulp = 2^-9 relative. Anything beyond that is not a rounding artefact.
@@ -67,11 +67,7 @@ const MAX_ONE_MINUS_COS: f64 = 2e-3;
 fn container_path() -> Option<std::path::PathBuf> {
     let path = std::env::var("NPU_BF16_CONTAINER").ok()?;
     let path = std::path::PathBuf::from(path);
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 /// f32 to bf16, round to nearest even.
@@ -107,8 +103,8 @@ fn the_container_s_own_weights_go_through_the_array() {
         }
     };
 
-    let mut design =
-        ArrayDesign::open_from_container(&path, "gemm_rtp", transport).expect("the container's design loads");
+    let mut design = ArrayDesign::open_from_container(&path, "gemm_rtp", transport)
+        .expect("the container's design loads");
     let info = design.info().clone();
 
     // THE STREAM: the qkv one, at the smallest batch tier.
@@ -138,7 +134,10 @@ fn the_container_s_own_weights_go_through_the_array() {
     );
 
     // THE PANEL DE-TILED, WITH ITS OWN RECORDED LAYOUT.
-    let layout = info.b_layout.as_ref().expect("the manifest records the B layout");
+    let layout = info
+        .b_layout
+        .as_ref()
+        .expect("the manifest records the B layout");
     let (tile_k, tile_n) = (layout.tile_k as usize, layout.tile_n as usize);
     let (s, t) = (layout.mac_s as usize, layout.mac_t as usize);
     let weights = untile_b(

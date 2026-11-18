@@ -134,9 +134,8 @@ impl<T: Transport> ArrayDesign<T> {
         set: &str,
         transport: T,
     ) -> Result<Self, ArrayError> {
-        let file = Container::open(container).map_err(|e| {
-            ArrayError::Design(format!("cannot open {}: {e}", container.display()))
-        })?;
+        let file = Container::open(container)
+            .map_err(|e| ArrayError::Design(format!("cannot open {}: {e}", container.display())))?;
         let prefix = format!("design/{set}");
         let read = |name: &str| -> Result<Vec<u8>, ArrayError> {
             let key = format!("{prefix}/{name}");
@@ -197,11 +196,7 @@ impl<T: Transport> ArrayDesign<T> {
         let mut instr_words = Vec::new();
         for bytes in instr_blobs {
             let group = transport.group_id(GROUP_INSTRUCTION)?;
-            let buffer = transport.alloc(
-                bytes.len() as u64,
-                BufferFlags::Cacheable,
-                group,
-            )?;
+            let buffer = transport.alloc(bytes.len() as u64, BufferFlags::Cacheable, group)?;
             T::write(&buffer, &bytes, 0)?;
             T::sync_to_device(&buffer, bytes.len() as u64, 0)?;
             instr_words.push((bytes.len() / 4) as u32);
@@ -257,12 +252,10 @@ impl<T: Transport> ArrayDesign<T> {
     /// The dispatch uses the slot each buffer is bound to, so a weight panel
     /// is staged once and bound before the call that uses it.
     pub fn bind(&mut self, index: usize, slot: usize) -> Result<(), ArrayError> {
-        let slots = self.slots.get(index).ok_or_else(|| {
-            ArrayError::Design(format!(
-                "{}: no data buffer {index}",
-                self.label
-            ))
-        })?;
+        let slots = self
+            .slots
+            .get(index)
+            .ok_or_else(|| ArrayError::Design(format!("{}: no data buffer {index}", self.label)))?;
         if slot >= slots.len() {
             return Err(ArrayError::Design(format!(
                 "{}: data buffer {index} has no slot {slot}",
@@ -280,12 +273,10 @@ impl<T: Transport> ArrayDesign<T> {
     /// a fixed shape, and staging fewer bytes than it will read is a stale
     /// tail, not a shorter answer.
     pub fn stage(&mut self, index: usize, data: &[u8]) -> Result<usize, ArrayError> {
-        let capacity = self.info.buffers.get(index).copied().ok_or_else(|| {
-            ArrayError::Design(format!(
-                "{}: no data buffer {index}",
-                self.label
-            ))
-        })?;
+        let capacity =
+            self.info.buffers.get(index).copied().ok_or_else(|| {
+                ArrayError::Design(format!("{}: no data buffer {index}", self.label))
+            })?;
         if data.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
                 "{}: {} bytes for data buffer {index}, and the design allows {capacity}",
@@ -311,12 +302,10 @@ impl<T: Transport> ArrayDesign<T> {
     /// design's own A buffer, every time, and a slot per operand would leave
     /// the design's memory budget one operand short per dispatch.
     pub fn write_bound(&mut self, index: usize, data: &[u8]) -> Result<(), ArrayError> {
-        let capacity = self.info.buffers.get(index).copied().ok_or_else(|| {
-            ArrayError::Design(format!(
-                "{}: no data buffer {index}",
-                self.label
-            ))
-        })?;
+        let capacity =
+            self.info.buffers.get(index).copied().ok_or_else(|| {
+                ArrayError::Design(format!("{}: no data buffer {index}", self.label))
+            })?;
         if data.len() as u64 > capacity {
             return Err(ArrayError::Design(format!(
                 "{}: {} bytes for data buffer {index}, and the design allows {capacity}",
@@ -338,10 +327,7 @@ impl<T: Transport> ArrayDesign<T> {
     /// plausible tensor.
     pub fn dispatch(&mut self, slot: usize) -> Result<(), ArrayError> {
         let instr = self.instr.get(slot).ok_or_else(|| {
-            ArrayError::Design(format!(
-                "{}: no instruction slot {slot}",
-                self.label
-            ))
+            ArrayError::Design(format!("{}: no instruction slot {slot}", self.label))
         })?;
         let args: Vec<&T::Buffer> = self
             .slots

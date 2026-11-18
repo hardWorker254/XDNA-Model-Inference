@@ -57,10 +57,12 @@ impl Datapath {
     /// computing a number with the scales missing.
     pub fn of<T: Transport>(design: &ArrayDesign<T>) -> Result<Self, ArrayError> {
         let info = design.info();
-        let a_bytes = elem_bytes(&info.a_dtype)
-            .ok_or_else(|| ArrayError::Design(format!("the design's A dtype is {:?}", info.a_dtype)))?;
-        let c_bytes = elem_bytes(&info.c_dtype)
-            .ok_or_else(|| ArrayError::Design(format!("the design's C dtype is {:?}", info.c_dtype)))?;
+        let a_bytes = elem_bytes(&info.a_dtype).ok_or_else(|| {
+            ArrayError::Design(format!("the design's A dtype is {:?}", info.a_dtype))
+        })?;
+        let c_bytes = elem_bytes(&info.c_dtype).ok_or_else(|| {
+            ArrayError::Design(format!("the design's C dtype is {:?}", info.c_dtype))
+        })?;
         if a_bytes != 2 || c_bytes != 2 {
             return Err(ArrayError::Design(format!(
                 "this runtime dispatches the bf16 datapath only, and the design's \
@@ -183,10 +185,7 @@ pub(crate) fn dispatch<T: Transport>(
     let mut row = vec![0f32; n];
     for r in 0..n_real {
         let src = r * n * dp.c_bytes;
-        npum_format::bf16::bf16_to_f32_bytes(
-            &c_packed[src..src + n * dp.c_bytes],
-            &mut row[..n],
-        );
+        npum_format::bf16::bf16_to_f32_bytes(&c_packed[src..src + n * dp.c_bytes], &mut row[..n]);
         match bias {
             Some(bias) => {
                 for j in 0..n {

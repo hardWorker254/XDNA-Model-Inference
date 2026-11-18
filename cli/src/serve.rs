@@ -22,8 +22,8 @@
 //! so: "the model id is what a client sees, and naming a host-only server
 //! after the array is exactly the silent mislabel".
 
-use npuembeddings_server::routes::ServerState;
 use npuembeddings_server::Result;
+use npuembeddings_server::routes::ServerState;
 
 /// Serve one model.
 ///
@@ -66,7 +66,8 @@ pub fn serve(
     // THE SERVER RUNS ON THE HOST, except the embedding endpoint which can
     // use the Vulkan Ops seam (like the CLI's embed). Other families'
     // engines are host-only.
-    let wants_vulkan = args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some();
+    let wants_vulkan =
+        args.value("--backend") == Some("vulkan") || args.value("--vk-ops").is_some();
     if wants_vulkan && family != npum_families::Family::Embed {
         eprintln!("error: {}", crate::backend::refuse_server());
         return crate::EXIT_REFUSED;
@@ -131,13 +132,12 @@ pub fn serve(
                 );
                 return crate::EXIT_REFUSED;
             };
-            let designs = crate::vit::find_designs(root, &geometry.model_name).unwrap_or_else(
-                || {
+            let designs =
+                crate::vit::find_designs(root, &geometry.model_name).unwrap_or_else(|| {
                     root.join("runtime")
                         .join("artifacts")
                         .join(&geometry.model_name)
-                },
-            );
+                });
             let started = std::time::Instant::now();
             let classifier = match npuembeddings_server::Classifier::open(&path) {
                 Ok(c) => c,
@@ -165,13 +165,12 @@ pub fn serve(
                 );
                 return crate::EXIT_REFUSED;
             };
-            let designs = crate::stt::find_designs(root, &geometry.model_name).unwrap_or_else(
-                || {
+            let designs =
+                crate::stt::find_designs(root, &geometry.model_name).unwrap_or_else(|| {
                     root.join("runtime")
                         .join("artifacts")
                         .join(&geometry.model_name)
-                },
-            );
+                });
             let encoder_design = crate::stt::read_design(&designs, false);
             let decoder_design = crate::stt::read_design(&designs, true);
             let started = std::time::Instant::now();
@@ -265,7 +264,9 @@ pub fn serve(
     }
     let status = crate::status::read_container(&container, &path);
 
-    let mut state = match build_state(binary, &path, &arch, family, &container, &status, root, args) {
+    let mut state = match build_state(
+        binary, &path, &arch, family, &container, &status, root, args,
+    ) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -290,7 +291,10 @@ pub fn serve(
         state.pose = Some(std::sync::Arc::new(detector));
     }
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: the async runtime could not be started: {e}");
@@ -313,24 +317,22 @@ pub fn serve(
 
         // The stop path: the C++'s handler sets a flag, the accept loop
         // notices it, and the message goes to stderr on the way out.
-        let mut terminate = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: the signal handler could not be installed: {e}");
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let mut interrupt = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: the signal handler could not be installed: {e}");
-                return crate::EXIT_REFUSED;
-            }
-        };
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: the signal handler could not be installed: {e}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+        let mut interrupt =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: the signal handler could not be installed: {e}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
         tokio::select! {
             result = axum::serve(listener, app) => {
                 if let Err(e) = result {
@@ -374,7 +376,9 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 "\n  serving http://{address}/v1/classify   (model {})",
                 state.model_id
             );
-            println!("  POST multipart/form-data: image (required, PNG or JPEG), top_k (default 1)");
+            println!(
+                "  POST multipart/form-data: image (required, PNG or JPEG), top_k (default 1)"
+            );
             let (labels, size) = state
                 .classifier
                 .as_ref()
@@ -387,7 +391,9 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 "\n  serving http://{address}/v1/pose   (model {})",
                 state.model_id
             );
-            println!("  POST multipart/form-data: image (required, PNG or JPEG), conf, iou, kpt, max_det");
+            println!(
+                "  POST multipart/form-data: image (required, PNG or JPEG), conf, iou, kpt, max_det"
+            );
             let size = state
                 .pose
                 .as_ref()
@@ -402,7 +408,9 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 state.model_id,
                 state.encoder.as_ref().map(|e| e.seq()).unwrap_or(0)
             );
-            println!("  POST {{\"input\": \"text\" | [\"a\",\"b\"], \"encoding_format\": \"float\"|\"base64\"}}");
+            println!(
+                "  POST {{\"input\": \"text\" | [\"a\",\"b\"], \"encoding_format\": \"float\"|\"base64\"}}"
+            );
             println!();
         }
     }
@@ -410,13 +418,14 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
 }
 
 /// Parse Vulkan op selection for the embed server (implies Vulkan).
-fn vulkan_ops_mask(args: &crate::flags::Args) -> std::result::Result<(bool, bool, bool, bool), String> {
+fn vulkan_ops_mask(
+    args: &crate::flags::Args,
+) -> std::result::Result<(bool, bool, bool, bool), String> {
     if let Some(list) = args.value("--vk-ops") {
         let codes = crate::flags::parse_vk_ops(list)?;
         if codes.is_empty() {
             return Err(
-                "--vk-ops: no Vulkan op named. Valid codes: [gemm, layn, gelu, softm]."
-                    .to_string(),
+                "--vk-ops: no Vulkan op named. Valid codes: [gemm, layn, gelu, softm].".to_string(),
             );
         }
         Ok((
@@ -561,10 +570,7 @@ fn build_state(
 ///
 /// A NAME is looked up in `models/`; a PATH is used as given and never
 /// re-resolved by name.
-pub fn resolve_model(
-    model: &str,
-    root: &std::path::Path,
-) -> Option<std::path::PathBuf> {
+pub fn resolve_model(model: &str, root: &std::path::Path) -> Option<std::path::PathBuf> {
     crate::families::resolve_model(model, root).ok()
 }
 

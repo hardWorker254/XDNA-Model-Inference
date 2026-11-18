@@ -56,6 +56,12 @@ fn main() {
     };
     print!(
         "{}",
-        pose_decode::result_json(&result, &geometry, &params, &image.display().to_string(), false)
+        pose_decode::result_json(
+            &result,
+            &geometry,
+            &params,
+            &image.display().to_string(),
+            false
+        )
     );
 }

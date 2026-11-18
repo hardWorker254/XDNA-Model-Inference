@@ -38,7 +38,7 @@
 //! norm, and the difference is not a rounding one.
 
 use crate::kernels;
-use crate::whisper_features::{gelu_erf_exact, MelSpec};
+use crate::whisper_features::{MelSpec, gelu_erf_exact};
 use npum_format::Container;
 use std::path::Path;
 
@@ -138,8 +138,12 @@ impl Encoder {
     /// Read the encoder's weights out of a container.
     pub fn open(path: &Path) -> Result<Encoder, String> {
         let container = Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let geometry = Geometry::read(&container)
-            .ok_or_else(|| format!("{}: the container does not carry the geometry", path.display()))?;
+        let geometry = Geometry::read(&container).ok_or_else(|| {
+            format!(
+                "{}: the container does not carry the geometry",
+                path.display()
+            )
+        })?;
         let mut layers = Vec::with_capacity(geometry.enc_layers);
         for l in 0..geometry.enc_layers {
             let p = format!("encoder.layers.{l}.");
@@ -208,7 +212,15 @@ impl Encoder {
                 layernorm_row(row, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
             }
             let mut qkv = vec![0.0f32; n_src * 3 * d];
-            kernels::gemm_nt(&norm, n_src, &layer.qkv, d, 3 * d, &layer.qkv_bias, &mut qkv);
+            kernels::gemm_nt(
+                &norm,
+                n_src,
+                &layer.qkv,
+                d,
+                3 * d,
+                &layer.qkv_bias,
+                &mut qkv,
+            );
             let mut ctx = vec![0.0f32; n_src * d];
             attention(
                 &qkv,
@@ -224,7 +236,15 @@ impl Encoder {
                 &mut ctx,
             );
             let mut proj = vec![0.0f32; n_src * d];
-            kernels::gemm_nt(&ctx, n_src, &layer.attn_out, d, d, &layer.attn_out_bias, &mut proj);
+            kernels::gemm_nt(
+                &ctx,
+                n_src,
+                &layer.attn_out,
+                d,
+                d,
+                &layer.attn_out_bias,
+                &mut proj,
+            );
             for i in 0..n_src * d {
                 x[i] += proj[i];
             }
@@ -338,8 +358,12 @@ impl Decoder {
     /// Read the decoder's weights out of a container.
     pub fn open(path: &Path) -> Result<Decoder, String> {
         let container = Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let geometry = Geometry::read(&container)
-            .ok_or_else(|| format!("{}: the container does not carry the geometry", path.display()))?;
+        let geometry = Geometry::read(&container).ok_or_else(|| {
+            format!(
+                "{}: the container does not carry the geometry",
+                path.display()
+            )
+        })?;
         let mut layers = Vec::with_capacity(geometry.dec_layers);
         for l in 0..geometry.dec_layers {
             let p = format!("decoder.layers.{l}.");
@@ -429,7 +453,15 @@ impl Decoder {
         self.n_src = n_src;
         for (l, layer) in self.layers.iter().enumerate() {
             let mut cache = vec![0.0f32; n_src * 2 * d];
-            kernels::gemm_nt(enc, n_src, &layer.cross_kv, d, 2 * d, &layer.cross_kv_bias, &mut cache);
+            kernels::gemm_nt(
+                enc,
+                n_src,
+                &layer.cross_kv,
+                d,
+                2 * d,
+                &layer.cross_kv_bias,
+                &mut cache,
+            );
             self.cross_kv[l] = cache;
         }
         self.reset();
@@ -510,7 +542,15 @@ impl Decoder {
             // ---- self-attention over the cache, one new row ----
             let mut norm = h.clone();
             layernorm_row(&mut norm, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
-            kernels::gemm_nt(&norm, 1, &layer.self_qkv, d, 3 * d, &layer.self_qkv_bias, &mut qkv);
+            kernels::gemm_nt(
+                &norm,
+                1,
+                &layer.self_qkv,
+                d,
+                3 * d,
+                &layer.self_qkv_bias,
+                &mut qkv,
+            );
             // The K|V half of the fused QKV joins the cache; the Q half is
             // this step's query.
             let cache = &mut self.self_kv[l];
@@ -528,7 +568,15 @@ impl Decoder {
                 scale,
                 &mut ctx,
             );
-            kernels::gemm_nt(&ctx, 1, &layer.self_attn_out, d, d, &layer.self_attn_out_bias, &mut proj);
+            kernels::gemm_nt(
+                &ctx,
+                1,
+                &layer.self_attn_out,
+                d,
+                d,
+                &layer.self_attn_out_bias,
+                &mut proj,
+            );
             for j in 0..d {
                 h[j] += proj[j];
             }
@@ -536,7 +584,15 @@ impl Decoder {
             // ---- cross-attention over the encoder output ----
             let mut norm = h.clone();
             layernorm_row(&mut norm, &layer.ln2_gamma, &layer.ln2_beta, g.ln_eps);
-            kernels::gemm_nt(&norm, 1, &layer.cross_q, d, d, &layer.cross_q_bias, &mut qkv);
+            kernels::gemm_nt(
+                &norm,
+                1,
+                &layer.cross_q,
+                d,
+                d,
+                &layer.cross_q_bias,
+                &mut qkv,
+            );
             // The Q row is all this step needs from cross_q: its K|V half was
             // folded into a separate operand precisely so the two could be
             // fed from different A operands.
@@ -553,7 +609,15 @@ impl Decoder {
                 scale,
                 &mut ctx,
             );
-            kernels::gemm_nt(&ctx, 1, &layer.cross_attn_out, d, d, &layer.cross_attn_out_bias, &mut proj);
+            kernels::gemm_nt(
+                &ctx,
+                1,
+                &layer.cross_attn_out,
+                d,
+                d,
+                &layer.cross_attn_out_bias,
+                &mut proj,
+            );
             for j in 0..d {
                 h[j] += proj[j];
             }
@@ -561,11 +625,27 @@ impl Decoder {
             // ---- feed-forward ----
             let mut norm = h.clone();
             layernorm_row(&mut norm, &layer.ln3_gamma, &layer.ln3_beta, g.ln_eps);
-            kernels::gemm_nt(&norm, 1, &layer.ffn_up, d, g.dec_intermediate, &layer.ffn_up_bias, &mut up);
+            kernels::gemm_nt(
+                &norm,
+                1,
+                &layer.ffn_up,
+                d,
+                g.dec_intermediate,
+                &layer.ffn_up_bias,
+                &mut up,
+            );
             for v in up.iter_mut() {
                 *v = gelu_erf_exact(*v);
             }
-            kernels::gemm_nt(&up, 1, &layer.ffn_down, g.dec_intermediate, d, &layer.ffn_down_bias, &mut down);
+            kernels::gemm_nt(
+                &up,
+                1,
+                &layer.ffn_down,
+                g.dec_intermediate,
+                d,
+                &layer.ffn_down_bias,
+                &mut down,
+            );
             for j in 0..d {
                 h[j] += down[j];
             }
@@ -637,7 +717,12 @@ impl Decoder {
     /// compared against this with ITS max_new_tokens, and a 31 s tone makes
     /// the model emit the same token until it runs out of positions, so an
     /// uncapped chain and a capped reference are not the same string.
-    pub fn greedy(&mut self, prompt: &[i32], stop_id: i32, max_new: usize) -> Result<Vec<i32>, String> {
+    pub fn greedy(
+        &mut self,
+        prompt: &[i32],
+        stop_id: i32,
+        max_new: usize,
+    ) -> Result<Vec<i32>, String> {
         if prompt.is_empty() {
             return Err("whisper decoder: greedy() needs at least one prompt token (the control tokens are the model's own)".into());
         }
@@ -661,7 +746,9 @@ impl Decoder {
             && self.n_cached < self.geometry.max_target
             && (max_new == 0 || out.len() < max_new)
         {
-            let token = *out.last().unwrap();
+            let Some(&token) = out.last() else {
+                break;
+            };
             let position = self.n_cached;
             out.push(self.step(token, position, None, None)?);
         }
@@ -845,7 +932,10 @@ fn int_list(container: &Container, name: &str) -> Result<Vec<i32>, String> {
         .tensor_bytes(name)
         .map_err(|e| format!("{name}: {e}"))?;
     if bytes.len() % 4 != 0 {
-        return Err(format!("{name}: {} bytes is not a whole number of int32", bytes.len()));
+        return Err(format!(
+            "{name}: {} bytes is not a whole number of int32",
+            bytes.len()
+        ));
     }
     Ok(bytes
         .chunks_exact(4)
@@ -864,4 +954,3 @@ pub fn front_end(
 ) -> Vec<f32> {
     crate::whisper_features::conv_front_end(mel, w1, b1, w2, b2, hidden)
 }
-

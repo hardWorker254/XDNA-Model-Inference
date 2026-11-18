@@ -109,6 +109,7 @@ pub fn available_isas() -> Vec<Isa> {
     let mut out = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(has_stable_avx512)]
         if std::is_x86_feature_detected!("avx512f") {
             out.push(Isa::Avx512);
         }
@@ -133,9 +134,20 @@ pub fn has_avx2_fma() -> bool {
 }
 
 /// Whether this host has AVX-512F.
+///
+/// Compiled AVX-512 kernels require stable AVX-512 intrinsics (Rust 1.89+);
+/// on older toolchains this reports false so dispatch stays on the AVX2 or
+/// portable paths.
 #[cfg(target_arch = "x86_64")]
 pub fn has_avx512f() -> bool {
-    std::is_x86_feature_detected!("avx512f")
+    #[cfg(has_stable_avx512)]
+    {
+        std::is_x86_feature_detected!("avx512f")
+    }
+    #[cfg(not(has_stable_avx512))]
+    {
+        false
+    }
 }
 
 /// Whether this host has AVX-512F.
@@ -299,12 +311,7 @@ pub fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32]) -> Result<()>
 /// The eight-lane structure is the C++'s and it is the same on every ISA:
 /// AVX-512 would fold sixteen lanes and fold them differently, so the row
 /// kernels do not take the wider path. See the plan's 5.1a.
-pub fn layernorm_row_on(
-    isa: Isa,
-    row: &mut [f32],
-    gamma: &[f32],
-    beta: &[f32],
-) -> Result<()> {
+pub fn layernorm_row_on(isa: Isa, row: &mut [f32], gamma: &[f32], beta: &[f32]) -> Result<()> {
     let n = row.len();
     if n == 0 {
         return Ok(());
@@ -356,7 +363,11 @@ pub fn gemm_isa() -> Isa {
 /// and the softmax sum a row in eight lanes and fold them with a fixed
 /// tree, and a sixteen-lane tree is a different number.
 pub fn row_isa() -> Isa {
-    if has_avx2_fma() { Isa::Avx2 } else { Isa::Portable }
+    if has_avx2_fma() {
+        Isa::Avx2
+    } else {
+        Isa::Portable
+    }
 }
 
 /// The LayerNorm body, written once and shared by both builds.
@@ -505,15 +516,7 @@ fn softmax_row_impl(row: &mut [f32]) {
 /// a scalar FMA tail -- and it is why the port is not `acc += a * b`.
 ///
 /// The bias is added AFTER the whole reduction, in a plain addition.
-pub fn gemm_nt(
-    a: &[f32],
-    m: usize,
-    b: &[f32],
-    k: usize,
-    n: usize,
-    bias: &[f32],
-    out: &mut [f32],
-) {
+pub fn gemm_nt(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32], out: &mut [f32]) {
     gemm_nt_dispatch(a, m, b, k, n, bias, out)
 }
 
@@ -632,6 +635,7 @@ fn gemm_nt_dispatch(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(has_stable_avx512)]
         if has_avx512f() && n % 16 == 0 {
             // SAFETY: the function is only called when the host has the
             // features it is compiled for, and it upholds no extra invariant.
@@ -689,7 +693,7 @@ const PAGE_FLOATS: usize = 4096 / 4;
 ///
 /// The reduction is over K, in order, one column at a time, with an FMA per
 /// step -- the same sequence, and so the same bytes.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", has_stable_avx512))]
 #[target_feature(enable = "avx512f")]
 unsafe fn gemm_nt_avx512_rows(
     a: &[f32],
@@ -814,7 +818,7 @@ pub fn gemm_nt_on(
             }
         }
         Isa::Avx512 => {
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", has_stable_avx512))]
             {
                 if !has_avx512f() {
                     return false;
@@ -823,7 +827,7 @@ pub fn gemm_nt_on(
                 unsafe { gemm_nt_avx512(a, m, b, k, n, bias, out) };
                 true
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(not(all(target_arch = "x86_64", has_stable_avx512)))]
             {
                 false
             }
@@ -946,7 +950,15 @@ unsafe fn gemm_nt_avx2(
     if full < m {
         // SAFETY: as above.
         unsafe {
-            gemm_nt_avx2_rows(&a[full * k..], m - full, b, k, n, bias, &mut out[full * n..])
+            gemm_nt_avx2_rows(
+                &a[full * k..],
+                m - full,
+                b,
+                k,
+                n,
+                bias,
+                &mut out[full * n..],
+            )
         };
     }
 }
@@ -957,7 +969,7 @@ unsafe fn gemm_nt_avx2(
 /// width of the vector is not the order of the additions, and the order is
 /// the answer. This is why the 512-bit path is bit-identical to the 256-bit
 /// one and the sixteen-lane LayerNorm would not have been.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", has_stable_avx512))]
 #[target_feature(enable = "avx512f")]
 unsafe fn gemm_nt_avx512(
     a: &[f32],
@@ -1025,7 +1037,15 @@ unsafe fn gemm_nt_avx512(
         // SAFETY: as above -- the slices are the caller's and the kernel
         // keeps to them.
         unsafe {
-            gemm_nt_avx512_rows(&a[full * k..], m - full, b, k, n, bias, &mut out[full * n..])
+            gemm_nt_avx512_rows(
+                &a[full * k..],
+                m - full,
+                b,
+                k,
+                n,
+                bias,
+                &mut out[full * n..],
+            )
         };
     }
 }
@@ -1127,12 +1147,7 @@ pub fn softmax_(x: &mut Tensor) -> Result<()> {
 ///
 /// This is the TRAIT's generic multiply, and it is the exact one: the same
 /// FMA accumulation in the same order as `gemm_nt`.
-pub fn gemm(
-    a: &Tensor,
-    b: &Tensor,
-    c: &mut Tensor,
-    acc: Option<&mut Tensor>,
-) -> Result<()> {
+pub fn gemm(a: &Tensor, b: &Tensor, c: &mut Tensor, acc: Option<&mut Tensor>) -> Result<()> {
     let ash = a.shape();
     let bsh = b.shape();
     if ash.len() != 2 || bsh.len() != 2 {
@@ -1240,13 +1255,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor) -> Result
 ///
 /// `x` is `[n, cin, l]`, `w` is `[cout, cin, k]`, and the output is
 /// `[n, cout, l_out]`.
-pub fn conv1d(
-    x: &mut Tensor,
-    w: &Tensor,
-    b: Option<&Tensor>,
-    stride: i64,
-    pad: i64,
-) -> Result<()> {
+pub fn conv1d(x: &mut Tensor, w: &Tensor, b: Option<&Tensor>, stride: i64, pad: i64) -> Result<()> {
     let xv = x.to_f32();
     let wv = w.to_f32();
     let xs = x.shape();
@@ -1277,8 +1286,8 @@ pub fn conv1d(
                         if pos < 0 || pos >= l as i64 {
                             continue;
                         }
-                        sum += xv[(bi * cin + ci) * l + pos as usize]
-                            * wv[(co * cin + ci) * k + ki];
+                        sum +=
+                            xv[(bi * cin + ci) * l + pos as usize] * wv[(co * cin + ci) * k + ki];
                     }
                 }
                 out[(bi * cout + co) * l_out + oi] = sum;
@@ -1343,7 +1352,8 @@ pub fn conv2d(
                                 if iw < 0 || iw >= width as i64 {
                                     continue;
                                 }
-                                sum += xv[((bi * cin + ci) * h + ih as usize) * width + iw as usize]
+                                sum += xv
+                                    [((bi * cin + ci) * h + ih as usize) * width + iw as usize]
                                     * wv[((co * cin + ci) * kh + ki) * kw + kwi];
                             }
                         }

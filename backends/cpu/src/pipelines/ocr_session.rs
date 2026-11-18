@@ -12,13 +12,13 @@
 //! and the sort is a READING convenience rather than part of the model -- so
 //! the caller that wants the reading order sorts them.
 
-use crate::ocr::{read_geometry, Cost, Geometry, Network, Tensor};
-use npum_model::array::ArrayConvs;
+use crate::ocr::{Cost, Geometry, Network, Tensor, read_geometry};
 use crate::ocr_decode::{
-    ctc_decode, ctc_logits, db_postprocess, det_input, rec_input, DbBox, OcrResult, Quad, TextBox,
+    DbBox, OcrResult, Quad, TextBox, ctc_decode, ctc_logits, db_postprocess, det_input, rec_input,
 };
 use crate::vit_image::Image;
 use npum_format::Container;
+use npum_model::array::ArrayConvs;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -197,7 +197,11 @@ impl Ocr {
 
         // -- stage 2: one recogniser per box
         let n = found.len() as i64;
-        let run = if max_boxes < 0 || n < max_boxes { n } else { max_boxes };
+        let run = if max_boxes < 0 || n < max_boxes {
+            n
+        } else {
+            max_boxes
+        };
         r.boxes_read = run;
         for i in 0..run {
             let b = &found[i as usize];
@@ -228,7 +232,12 @@ impl Ocr {
             // and the space.
             let logits = rnodes.last().ok_or("the recogniser produced no output")?;
             let (frames, classes) = ctc_logits(logits)?;
-            let cr = ctc_decode(&logits.d, frames as i64, classes as i64, &self.geometry.dict)?;
+            let cr = ctc_decode(
+                &logits.d,
+                frames as i64,
+                classes as i64,
+                &self.geometry.dict,
+            )?;
 
             r.boxes.push(TextBox {
                 q: b.q,

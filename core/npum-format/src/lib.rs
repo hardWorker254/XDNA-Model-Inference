@@ -53,10 +53,10 @@ pub mod layout;
 pub mod tiling;
 pub mod writer;
 
-pub use directory::{Directory, TensorEntry};
 pub use digest::{model_digest, sha256_bytes, sha256_file};
-pub use header::{ContainerFormat, Header, MAGIC_LEGACY, MAGIC_CURRENT, VERSION};
-pub use layout::{gemm_b_layout, layout_hash, BLayout, MacGeom};
+pub use directory::{Directory, TensorEntry};
+pub use header::{ContainerFormat, Header, MAGIC_CURRENT, MAGIC_LEGACY, VERSION};
+pub use layout::{BLayout, MacGeom, gemm_b_layout, layout_hash};
 pub use writer::Writer;
 
 use std::path::Path;
@@ -138,7 +138,9 @@ impl Container {
                 path: path_str.clone(),
                 magic,
             },
-            Error::VersionMismatch { found, expected, .. } => Error::VersionMismatch {
+            Error::VersionMismatch {
+                found, expected, ..
+            } => Error::VersionMismatch {
                 path: path_str.clone(),
                 found,
                 expected,
@@ -218,7 +220,11 @@ impl Container {
 
     /// Every tensor's name, in directory order.
     pub fn tensor_names(&self) -> Vec<&str> {
-        self.directory.tensors().iter().map(|t| t.name.as_str()).collect()
+        self.directory
+            .tensors()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect()
     }
 }
 

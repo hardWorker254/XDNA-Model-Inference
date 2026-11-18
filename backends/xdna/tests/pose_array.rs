@@ -54,17 +54,12 @@ fn container() -> Option<PathBuf> {
     }
     let home = std::env::var("HOME").ok()?;
     let p = PathBuf::from(home).join("xdna-fixtures/yolov8n-pose.npue");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.is_file() { Some(p) } else { None }
 }
 
 /// The image the front end reads.
 fn image() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/parity/fixtures/bus.jpg")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixtures/bus.jpg")
 }
 
 /// The measured width of the difference between the two runs.
@@ -111,11 +106,11 @@ fn the_array_path_is_the_host_path_with_coarser_weights() {
         Ok(d) => d,
         Err(e) => panic!("{}: {e}", image.display()),
     };
-    let (input, _letterbox) =
-        match npum_cpu::pose_decode::letterbox_normalise(&decoded, &geometry) {
-            Ok(v) => v,
-            Err(e) => panic!("{}: {e}", image.display()),
-        };
+    let (input, _letterbox) = match npum_cpu::pose_decode::letterbox_normalise(&decoded, &geometry)
+    {
+        Ok(v) => v,
+        Err(e) => panic!("{}: {e}", image.display()),
+    };
 
     // THE HOST.
     let (host, host_timings) = network.run_timed(&input).expect("the host run failed");

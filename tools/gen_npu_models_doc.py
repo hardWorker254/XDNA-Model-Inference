@@ -247,15 +247,17 @@ RU_GATED_BODY = [
     "флаг операции вообще — это свойство одного кодера, а не семейства, и "
     "делать из него пятый kind значило бы заявить семейство, которого нет.",
     "",
-    "Цена этого решения: `layn` для gemma **заблокирован** — нужен RMSNorm, а "
-    "`kernels/layernorm.cc` параметризован только `-DLN_COLS/-DLN_EPS/"
-    "-DLN_ROWS`, то есть это другое тело ядра и код отдельный, поскольку набор уже "
-    "на девяти. Намеренно не "
-    "сделано: набор кодов стал бы больше и менее однородным. Подробности — в "
+    "Цена этого решения видна в матрице: `layn` для gemma сейчас **нет кода** "
+    "(статус `unimplemented`). Gemma нормализует через RMSNorm, и ядра/"
+    "eltwise-дизайн `rmsnorm/` уже существуют, но в этом рантайме ещё нет "
+    "Gemma forward-path, который диспатчил бы нормализацию через "
+    "`EltOp::RmsNorm` / `ArrayEltwise::rmsnorm`. Пока эта ветка не проведена, "
+    "код `layn` нельзя честно объявить исполняемым для gemma. Подробности — в "
     "ячейке `embeddinggemma-300m/layn` файла NPU_OPS.ru.md.",
     "",
-    "Итог по gemma: `buildable_codes()` возвращает **пустое множество** — "
-    "экспортёр не компилирует для неё ни одного соседнего дизайна.",
+    "Итог по gemma: `buildable_codes()` по-прежнему возвращает **пустое "
+    "множество** — экспортёр не компилирует для неё ни одного соседнего "
+    "eltwise-дизайна, который бы выбирался этим реестром.",
     "",
     "### nomic и gte — ГЕЙТЕД FFN, и из-за этого нет `gelu`",
     "",
@@ -372,6 +374,7 @@ def matrix_table(ru=False):
     # needs a separate column is a status the table would rather not have: `уже`
     # and `невозможно` are rarer than `есть`, and putting them inline says that.
     suffix = {npu_ops.BLOCKED: "невозможно" if ru else "impossible",
+              npu_ops.UNIMPLEMENTED: "нет кода" if ru else "no code",
               npu_ops.ON_ARRAY: "уже" if ru else "already",
               GATED: "гейт" if ru else "gated"}
     # The header says "дополнительно" on purpose. The nine codes are the
@@ -619,15 +622,16 @@ EN_GATED_BODY = [
     "it another kind would claim a family that does not exist.",
     "",
     "The price of that decision is visible in the matrix: gemma's `layn` is "
-    "**blocked** -- it needs RMSNorm, and `kernels/layernorm.cc` is "
-    "parameterised only by `-DLN_COLS/-DLN_EPS/-DLN_ROWS`, so this is a "
-    "different kernel body and a code of its own, since the set is at nine already. "
-    "Deliberately not done: the code "
-    "set would grow and lose its uniformity. The full argument is the "
-    "`embeddinggemma-300m/layn` cell in NPU_OPS.md.",
+    "**no code** (`unimplemented`). Gemma normalises with RMSNorm, and the "
+    "RMSNorm kernel / `rmsnorm/` eltwise design exist, but this runtime does "
+    "not yet have a Gemma forward path that dispatches normalisation through "
+    "`EltOp::RmsNorm` / `ArrayEltwise::rmsnorm`. Until that branch is wired, "
+    "the `layn` code cannot be honestly reported as executable for gemma. The "
+    "full argument is the `embeddinggemma-300m/layn` cell in NPU_OPS.md.",
     "",
-    "So `buildable_codes()` returns the **empty set** for gemma: the exporter "
-    "compiles no sibling design at all for it.",
+    "So `buildable_codes()` still returns the **empty set** for gemma: the "
+    "exporter compiles no sibling eltwise design selected by this registry for "
+    "it.",
     "",
     "### nomic and gte -- a GATED FFN, and therefore no `gelu`",
     "",

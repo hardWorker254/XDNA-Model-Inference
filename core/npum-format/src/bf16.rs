@@ -90,34 +90,34 @@ unsafe fn f32_to_bf16_avx2(src: &[f32], dst: &mut [u8], n: usize) {
     // inside the slice it was given: the loop reads 8 values and writes 16
     // bytes only while 8 values are left in both.
     unsafe {
-    let rounding = _mm256_set1_epi32(0x7fff);
-    let one = _mm256_set1_epi32(1);
-    let mut index = 0usize;
-    while index + 8 <= n {
-        let values = _mm256_loadu_ps(src.as_ptr().add(index));
-        let bits = _mm256_castps_si256(values);
-        // Round to nearest even: add 0x7FFF plus the low bit of the
-        // mantissa, then truncate. The same three steps as the scalar's,
-        // eight lanes at a time.
-        let lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 16), one);
-        let bias = _mm256_add_epi32(rounding, lsb);
-        let rounded = _mm256_add_epi32(bits, bias);
-        let high = _mm256_srli_epi32(rounded, 16);
+        let rounding = _mm256_set1_epi32(0x7fff);
+        let one = _mm256_set1_epi32(1);
+        let mut index = 0usize;
+        while index + 8 <= n {
+            let values = _mm256_loadu_ps(src.as_ptr().add(index));
+            let bits = _mm256_castps_si256(values);
+            // Round to nearest even: add 0x7FFF plus the low bit of the
+            // mantissa, then truncate. The same three steps as the scalar's,
+            // eight lanes at a time.
+            let lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 16), one);
+            let bias = _mm256_add_epi32(rounding, lsb);
+            let rounded = _mm256_add_epi32(bits, bias);
+            let high = _mm256_srli_epi32(rounded, 16);
 
-        // THE PACK, ACROSS THE LANES.
-        //
-        // `_mm256_packus_epi32` packs WITHIN each 128-bit lane, so the low
-        // four values would land in the low lane and the high four in the
-        // high one -- and the two 128-bit halves are then packed into the
-        // eight u16 the caller asked for. The SSE2 pack takes one operand
-        // from each, which is the order the caller wants.
-        let low = _mm256_castsi256_si128(high);
-        let high_half = _mm256_extracti128_si256(high, 1);
-        let packed = _mm_packus_epi32(low, high_half);
-        _mm_storeu_si128(dst.as_mut_ptr().add(index * 2) as *mut __m128i, packed);
+            // THE PACK, ACROSS THE LANES.
+            //
+            // `_mm256_packus_epi32` packs WITHIN each 128-bit lane, so the low
+            // four values would land in the low lane and the high four in the
+            // high one -- and the two 128-bit halves are then packed into the
+            // eight u16 the caller asked for. The SSE2 pack takes one operand
+            // from each, which is the order the caller wants.
+            let low = _mm256_castsi256_si128(high);
+            let high_half = _mm256_extracti128_si256(high, 1);
+            let packed = _mm_packus_epi32(low, high_half);
+            _mm_storeu_si128(dst.as_mut_ptr().add(index * 2) as *mut __m128i, packed);
 
-        index += 8;
-    }
+            index += 8;
+        }
     }
 }
 
@@ -131,17 +131,17 @@ unsafe fn bf16_to_f32_avx2(src: &[u8], dst: &mut [f32], n: usize) {
     // inside the slice it was given: the loop reads 16 bytes and writes 8
     // floats only while 8 values are left in both.
     unsafe {
-    let mut index = 0usize;
-    while index + 8 <= n {
-        let packed = _mm_loadu_si128(src.as_ptr().add(index * 2) as *const __m128i);
-        // The widening is a zero-extend and a shift left by sixteen: a bf16
-        // is the high half of an f32.
-        let widened = _mm256_cvtepu16_epi32(packed);
-        let shifted = _mm256_slli_epi32(widened, 16);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(index), _mm256_castsi256_ps(shifted));
+        let mut index = 0usize;
+        while index + 8 <= n {
+            let packed = _mm_loadu_si128(src.as_ptr().add(index * 2) as *const __m128i);
+            // The widening is a zero-extend and a shift left by sixteen: a bf16
+            // is the high half of an f32.
+            let widened = _mm256_cvtepu16_epi32(packed);
+            let shifted = _mm256_slli_epi32(widened, 16);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(index), _mm256_castsi256_ps(shifted));
 
-        index += 8;
-    }
+            index += 8;
+        }
     }
 }
 

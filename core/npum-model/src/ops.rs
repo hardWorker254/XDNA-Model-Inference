@@ -13,6 +13,13 @@
 //! kernels (the ISA-selected ones, which are the reference), and
 //! `npum_vulkan` implements it with the GPU.
 //!
+//! # When this is the canonical layer
+//!
+//! Use [`Ops`] for family/reference forward passes that operate on flat host or
+//! device-backed buffers with explicit dimensions and need truthful placement/
+//! dispatch reporting (`place`, `device`, `dispatches`). Use [`crate::Backend`]
+//! for tensor/graph-oriented backend execution and planning.
+//!
 //! # What the trait does NOT decide
 //!
 //! * **The arithmetic.** Each implementation is free to compute the same

@@ -52,7 +52,7 @@
 //! output rows past the chunk are not read.
 
 use crate::array::{ArrayDesign, ArrayError};
-use crate::gemm::{dispatch, Datapath};
+use crate::gemm::{Datapath, dispatch};
 use crate::transport::Transport;
 
 /// A convolution's own shape, and the design's padded one.

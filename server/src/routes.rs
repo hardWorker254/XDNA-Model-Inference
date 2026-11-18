@@ -26,11 +26,11 @@
 //! on a Whisper container gets a 404 that says which endpoint to use, and
 //! not a transcription.
 
+use axum::Router;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -103,12 +103,7 @@ pub fn router(state: ServerState) -> Router {
 
 /// A JSON answer, as the C++'s server sends it.
 fn json(status: StatusCode, body: String) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// The 404 that names the right endpoint.
@@ -178,14 +173,17 @@ pub fn format_g(value: f32, precision: usize) -> String {
         // once. C's printf rounds the exact value, and so does Rust's
         // formatter.
         let text = format!("{:.*e}", precision - 1, value);
-        let (mantissa, exp) = text.split_once('e').expect("Rust's exponential form");
-        let exp: i32 = exp.parse().expect("Rust's exponential form");
-        format!(
-            "{}e{}{:02}",
-            trim_zeros(mantissa),
-            if exp < 0 { '-' } else { '+' },
-            exp.abs()
-        )
+        if let Some((mantissa, exp)) = text.split_once('e') {
+            if let Ok(exp) = exp.parse::<i32>() {
+                return format!(
+                    "{}e{}{:02}",
+                    trim_zeros(mantissa),
+                    if exp < 0 { '-' } else { '+' },
+                    exp.abs()
+                );
+            }
+        }
+        text
     } else {
         let decimals = (precision as i32 - 1 - exponent).max(0) as usize;
         trim_zeros(&format!("{value:.decimals$}"))
@@ -237,7 +235,7 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
             return json(
                 StatusCode::BAD_REQUEST,
                 error_body(&e.to_string(), "invalid_request_error"),
-            )
+            );
         }
     };
     let texts: Vec<String> = match &request["input"] {
@@ -253,7 +251,7 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
                     "`input` must be a string or an array of strings",
                     "invalid_request_error",
                 ),
-            )
+            );
         }
     };
     if texts.is_empty() {
@@ -375,7 +373,7 @@ async fn classify(
             return json(
                 StatusCode::BAD_REQUEST,
                 error_body(&format!("multipart: {reason}"), "invalid_request_error"),
-            )
+            );
         }
     };
 
@@ -563,7 +561,7 @@ async fn pose(
             return json(
                 StatusCode::BAD_REQUEST,
                 error_body(&format!("multipart: {reason}"), "invalid_request_error"),
-            )
+            );
         }
     };
     let mut image = None;
@@ -619,12 +617,7 @@ async fn pose(
     // per request: a request that names none gets the defaults, and naming
     // them changes nothing outside this request.
     let mut params = npum_cpu::pose_decode::DecodeParams::default();
-    for (name, slot) in [
-        ("conf", 0usize),
-        ("iou", 1),
-        ("kpt", 2),
-        ("max_det", 3),
-    ] {
+    for (name, slot) in [("conf", 0usize), ("iou", 1), ("kpt", 2), ("max_det", 3)] {
         let want = field(name);
         if want.trim().is_empty() {
             continue;
@@ -639,7 +632,7 @@ async fn pose(
                         &format!("max_det='{want}' is not an integer of at least 1"),
                         "invalid_request_error",
                     ),
-                )
+                );
             }
             (_, Ok(v)) => match slot {
                 0 => params.conf = v,
@@ -653,7 +646,7 @@ async fn pose(
                         &format!("{name}='{want}' is not a number"),
                         "invalid_request_error",
                     ),
-                )
+                );
             }
         }
     }
@@ -667,11 +660,10 @@ async fn pose(
     let engine = detector.clone();
     let name = label.clone();
     let request_params = params.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        engine.detect_bytes(&data, &name, &request_params)
-    })
-        .await
-        .unwrap_or_else(|e| Err(format!("the detection task failed: {e}")));
+    let outcome =
+        tokio::task::spawn_blocking(move || engine.detect_bytes(&data, &name, &request_params))
+            .await
+            .unwrap_or_else(|e| Err(format!("the detection task failed: {e}")));
 
     match outcome {
         Ok(result) => {
@@ -775,7 +767,7 @@ async fn transcriptions(
             return json(
                 StatusCode::BAD_REQUEST,
                 error_body(&format!("multipart: {reason}"), "invalid_request_error"),
-            )
+            );
         }
     };
 
@@ -910,21 +902,17 @@ async fn transcriptions(
     };
     let data = audio.data.clone();
     let engine = transcriber.clone();
-    let transcript = tokio::task::spawn_blocking(move || {
-        engine.transcribe_bytes(&data, &name, &options)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("the transcription task failed: {e}")));
+    let transcript =
+        tokio::task::spawn_blocking(move || engine.transcribe_bytes(&data, &name, &options))
+            .await
+            .unwrap_or_else(|e| Err(format!("the transcription task failed: {e}")));
 
     match transcript {
         Ok(transcript) => {
             if format == "text" {
                 (
                     StatusCode::OK,
-                    [(
-                        header::CONTENT_TYPE,
-                        "text/plain; charset=utf-8",
-                    )],
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
                     format!("{}\n", transcript.text),
                 )
                     .into_response()
@@ -1013,8 +1001,7 @@ fn error_body(message: &str, kind: &str) -> String {
 /// endpoint's `encoding_format: "base64"` carries the float32 BYTES, and
 /// that is the only way a client can get the exact numbers.
 pub fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;

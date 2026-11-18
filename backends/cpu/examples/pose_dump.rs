@@ -32,7 +32,8 @@ fn main() {
         pose_decode::letterbox_normalise(&decoded, &geometry).expect("the front end runs");
 
     let mut file = std::fs::File::create(out_path).expect("the dump opens");
-    file.write_all(&vec![b' '; HEADER]).expect("the header area is reserved");
+    file.write_all(&vec![b' '; HEADER])
+        .expect("the header area is reserved");
     let mut index: Vec<String> = Vec::new();
     {
         let mut hook = |i: usize, t: &pose::Tensor| {
@@ -47,11 +48,7 @@ fn main() {
                 t.d.len(),
                 off
             ));
-            let bytes: Vec<u8> = t
-                .d
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = t.d.iter().flat_map(|v| v.to_le_bytes()).collect();
             file.write_all(&bytes).expect("the tensor is written");
         };
         network
@@ -68,7 +65,9 @@ fn main() {
     header.push_str("\n  ]\n}\n");
     assert!(header.len() <= HEADER, "the header needs more than 64 KiB");
     header.push_str(&" ".repeat(HEADER - header.len()));
-    file.seek(SeekFrom::Start(0)).expect("the header is rewritten");
-    file.write_all(header.as_bytes()).expect("the header is written");
+    file.seek(SeekFrom::Start(0))
+        .expect("the header is rewritten");
+    file.write_all(header.as_bytes())
+        .expect("the header is written");
     eprintln!("{} node tensors written", index.len());
 }

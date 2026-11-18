@@ -57,12 +57,10 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
-
-import conv_quant                                        # noqa: E402
-from npue import (ARCH_PADDLEOCR_DB_SVTR_CTC, Writer,   # noqa: E402
-                   cols_for_device, gemm_b_layout, mac_for_device, tile_b,
-                   to_bf16_bits)
+from tools.lib import conv_quant                                        # noqa: E402
+from tools.lib.npue import (ARCH_PADDLEOCR_DB_SVTR_CTC, Writer,   # noqa: E402
+                            cols_for_device, gemm_b_layout, mac_for_device, tile_b,
+                            to_bf16_bits)
 
 # Kept as a literal and compared against the C++ header by
 # tools/verify/verify_ocr_geometry.py, because the two must agree and a test
@@ -1948,7 +1946,7 @@ def pack_ocr(det_onnx, rec_onnx, dict_path, out_path, dry_run=False,
 def _embed(w, model_name, datapath, npue_args, where):
     if npue_args is None or getattr(npue_args, "no_embed_artifacts", False):
         return None
-    from design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
+    from tools.lib.design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
     explicit = getattr(npue_args, "embed_artifacts", None)
     here = os.path.abspath(__file__)
     for _ in range(4):

@@ -1000,16 +1000,17 @@ MODEL_REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
                  "printed the ARRAY line for a design it never opened, and "
                  "returned vectors at relfro 0.000e+00 against its own host "
                  "path (6.1e-03 for the ungated bge-base, same flag)."),
-        "layn": (BLOCKED,
-                 "gemma normalises with RMSNorm, not LayerNorm: no mean pass, no "
-                 "beta, its own rms_norm_eps. kernels/layernorm.cc is "
-                 "parameterised only by -DLN_COLS/-DLN_EPS/-DLN_ROWS, so this is "
-                 "a different kernel body, a new design kind and a code of "
-                 "its own, since the set is at nine already. "
-                 "It is deliberately not done: that would make the code set "
-                 "larger and less uniform -- three of the four transformer "
-                 "architectures would carry a norm code and one would not. "
-                 "Refused rather than quietly meaning two different operations."),
+        "layn": (UNIMPLEMENTED,
+                 "Gemma normalises with RMSNorm, not LayerNorm. RMSNorm kernels "
+                 "and the `rmsnorm/` eltwise design exist and can be built for "
+                 "this model's width and epsilon, but the runtime does not yet "
+                 "dispatch Gemma normalisation through the eltwise seam "
+                 "(EltOp::RmsNorm / ArrayEltwise::rmsnorm). There is no Gemma "
+                 "(`gemma3_mqa_rope_geglu`) forward path in this tree, and the "
+                 "BERT-family path only checks/calls LayerNorm, so accepting "
+                 "`--npu-ops layn` here would claim array work that cannot be "
+                 "executed. Kept unimplemented until a Gemma-capable forward "
+                 "path wires RMSNorm dispatch."),
         "softm": (HONOURS,
                   "GemmaNpuEncoder::attention reads the same per-op flag the "
                   "gemm_rtp row does -- the enc dispatch set is built from this "

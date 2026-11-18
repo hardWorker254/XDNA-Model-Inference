@@ -64,10 +64,7 @@ pub struct Budget {
 /// is what a B panel has to be padded UP to -- so a packer needs the column
 /// count and cannot get it from the sub-tile, which knows about the MMAC and
 /// not about the array's width.
-const COLUMNS: [(Generation, i64); 2] = [
-    (Generation::Npu1, 4),
-    (Generation::Npu2, 8),
-];
+const COLUMNS: [(Generation, i64); 2] = [(Generation::Npu1, 4), (Generation::Npu2, 8)];
 
 impl Geometry {
     /// The geometry of one generation.

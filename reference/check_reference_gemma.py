@@ -19,11 +19,13 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-from encoder_gemma import GemmaEmbeddingReference   # noqa: E402
-from npz_io import load as load_goldens            # noqa: E402
-from onnx_io import (EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP,  # noqa: E402
+from reference.encoder_gemma import GemmaEmbeddingReference   # noqa: E402
+from reference.npz_io import load as load_goldens            # noqa: E402
+from reference.onnx_io import (EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP,  # noqa: E402
                      MODEL_ONNX, load, model_digest)
 
 REPO = Path(__file__).resolve().parent.parent

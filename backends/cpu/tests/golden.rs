@@ -75,8 +75,9 @@ fn the_embedding_matches_the_golden() {
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .expect("the container holds a vocabulary");
-    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-        .expect("the vocabulary is usable");
+    let tokenizer =
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+            .expect("the vocabulary is usable");
 
     let (encoding, truncated) = tokenizer
         .encode_padded("a golden transcript is a contract", SEQ)

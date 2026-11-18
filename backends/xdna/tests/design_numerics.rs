@@ -28,8 +28,8 @@
 use std::path::PathBuf;
 
 use npum_xdna::array::ArrayDesign;
-use npum_xdna::transport::Transport;
 use npum_xdna::transport::SelectedTransport as Board;
+use npum_xdna::transport::Transport;
 
 /// bf16 carries 8 significand bits, so one output rounding is at most half an
 /// ulp = 2^-9 relative. Anything beyond that is not a rounding artefact.
@@ -264,7 +264,10 @@ fn the_op_layer_gemm_matches_the_reference() {
         .find(|s| s.op == "qkv" && s.m > 0)
         .expect("the design set has a qkv stream with a shape");
     let (m, k, n) = (stream.m as usize, stream.k as usize, stream.n as usize);
-    let layout = info.b_layout.as_ref().expect("the manifest records the B layout");
+    let layout = info
+        .b_layout
+        .as_ref()
+        .expect("the manifest records the B layout");
     let (tile_k, tile_n) = (layout.tile_k as usize, layout.tile_n as usize);
     let (s, t) = (layout.mac_s as usize, layout.mac_t as usize);
 
@@ -276,7 +279,7 @@ fn the_op_layer_gemm_matches_the_reference() {
     let n_real = 128usize;
 
     let mut state = 0x1319_8a2e_0370_7344u64;
-    let (a_bytes, a_values) = operand(n_real, k, &mut state);
+    let (_a_bytes, a_values) = operand(n_real, k, &mut state);
     let (b_bytes, b_values) = operand(k, n, &mut state);
     let b_panel = npum_format::tiling::tile_b(
         &b_bytes,

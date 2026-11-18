@@ -32,6 +32,7 @@ use npum_cpu::pose_decode::Person;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::flags::Args;
 /// The reference the split line compares against, in milliseconds.
 ///
 /// A CONSTANT, and the only honest thing it can be: it is torch's time for
@@ -179,21 +180,15 @@ pub fn print_block(
     );
     eprintln!(
         "             {:<26} {:<5} {}",
-        "concat, add",
-        "host",
-        "channel joins and the C2f residual, memory-bound"
+        "concat, add", "host", "channel joins and the C2f residual, memory-bound"
     );
     eprintln!(
         "             {:<26} {:<5} {}",
-        "maxpool (SPPF)",
-        "host",
-        "size-preserving 5x5/1, pad 2"
+        "maxpool (SPPF)", "host", "size-preserving 5x5/1, pad 2"
     );
     eprintln!(
         "             {:<26} {:<5} {}",
-        "upsample",
-        "host",
-        "nearest x2, the neck's up path"
+        "upsample", "host", "nearest x2, the neck's up path"
     );
     eprintln!(
         "             {:<26} {:<5} {}",
@@ -448,4 +443,195 @@ pub fn write_dump(
     file.write_all(header.as_bytes())
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(())
+}
+
+pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some(model) = args.positional.first() else {
+        return crate::needs_a_model("pose");
+    };
+    // Every leading non-flag argument after the model is an image, so
+    // `pose <model> a.png b.png --text` runs both.
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: `pose` needs an image:");
+        eprintln!("    npuimage pose <model> <image.png> [more.png ...]");
+        eprintln!("    npuimage serve <model>            (POST /v1/pose)");
+        eprintln!(
+            "  (PNG and JPEG; anything else is refused rather than guessed at. \
+             --text prints a human summary instead of the JSON object, \
+             --conf/--iou/--kpt/--max-det move the thresholds, --pose-dump FILE \
+             writes every graph node's output)"
+        );
+        return crate::EXIT_REFUSED;
+    }
+    crate::families::with_model(model, npum_families::Family::Pose, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Pose) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) =
+            crate::families::refuse_op_not_in_arch(args, npum_families::Family::Pose)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        // `--npu-ops conv` moves the convolutions to the array, and the
+        // refusal for a container that cannot do it is the array's own:
+        // a container packed without the panels says so, and the message
+        // says how to pack it.
+        let started = std::time::Instant::now();
+        let network = match npum_cpu::pose::Network::open(path) {
+            Ok(n) => n,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let setup_s = started.elapsed().as_secs_f64();
+        let geometry = network.geometry().clone();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        let params = crate::pose::params_from(args);
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the convolutions go to the array
+        // and the run says how many it dispatched. A container that cannot
+        // do it is refused HERE, before the first image, with the reason.
+        let mut array = if crate::ocr::wants_conv(args) {
+            let specs = npum_cpu::pose::array_specs(&geometry);
+            match crate::arrayconv::open(path, &specs, args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        let array_info = array.as_ref().map(|backend| crate::pose::ArrayInfo {
+            streams: backend.stream_count(),
+            // THE DESIGN'S OWN PATH, or nothing at all: a container that
+            // carries its own set needs nothing beside it, and there is no
+            // path to print.
+            designs: args
+                .value("--artifacts")
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            rows: backend.rows_per_dispatch(),
+        });
+        crate::pose::print_block(
+            &name,
+            &geometry,
+            network.threads(),
+            setup_s,
+            array_info.as_ref(),
+        );
+        let _ = arch;
+
+        let text = args.switch("--text");
+        let dump = args.value("--pose-dump").map(std::path::PathBuf::from);
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let all = std::time::Instant::now();
+            let front = std::time::Instant::now();
+            let (input, letterbox) =
+                match npum_cpu::pose_decode::letterbox_normalise(&decoded, &geometry) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        eprintln!("error: {reason}");
+                        return crate::EXIT_REFUSED;
+                    }
+                };
+            let front_end_s = front.elapsed().as_secs_f64();
+
+            if let Some(dump) = dump.as_deref() {
+                if let Err(reason) =
+                    crate::pose::write_dump(dump, &network, &input, array.as_deref_mut())
+                {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+
+            let net = std::time::Instant::now();
+            let (head, timings) = match network.run_timed_on_array(&input, array.as_deref_mut()) {
+                Ok(h) => h,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let network_s = net.elapsed().as_secs_f64();
+
+            let dec = std::time::Instant::now();
+            let people = match npum_cpu::pose_decode::decode(&head, &geometry, &letterbox, &params)
+            {
+                Ok(p) => p,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let decode_s = dec.elapsed().as_secs_f64();
+
+            let run = crate::pose::Run {
+                people,
+                width: letterbox.src_w,
+                height: letterbox.src_h,
+                total_s: all.elapsed().as_secs_f64(),
+                front_end_s,
+                network_s,
+                decode_s,
+                timings,
+            };
+            crate::pose::print_run(image, &run, &geometry);
+            if text {
+                print!("{}", crate::pose::text_summary(image, &run));
+            } else {
+                let detection = npum_cpu::pose_decode::Detection {
+                    people: run.people,
+                    front_end_s,
+                    network_s,
+                    decode_s,
+                    total_s: run.total_s,
+                    width: run.width,
+                    height: run.height,
+                    scale: letterbox.scale,
+                    pad_x: letterbox.pad_x,
+                    pad_y: letterbox.pad_y,
+                    // WHERE THE CONVOLUTIONS RAN. The JSON says it as well as
+                    // the status block does, because the JSON is what a
+                    // program reads: a reader that asked for the array and
+                    // got a host's numbers would have no way to tell.
+                    dispatches: timings.dispatches,
+                    convs_host: if timings.convs_array > 0 {
+                        0
+                    } else {
+                        geometry.convs.len().saturating_sub(1) as i64
+                    },
+                };
+                print!(
+                    "{}",
+                    npum_cpu::pose_decode::result_json(
+                        &detection,
+                        &geometry,
+                        &params,
+                        image,
+                        timings.convs_array > 0
+                    )
+                );
+            }
+        }
+        0
+    })
 }

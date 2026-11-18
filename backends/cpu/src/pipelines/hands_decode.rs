@@ -808,7 +808,9 @@ pub fn landmark_stage(img: &Image, g: &Geometry, det: &Detection) -> Result<Land
     let p1 = pl[g.palm_lm_wrist as usize];
     let p2 = pl[g.palm_lm_middle_base as usize];
     let mut rad = std::f64::consts::FRAC_PI_2 - (-(p2[1] - p1[1])).atan2(p2[0] - p1[0]);
-    rad -= 2.0 * std::f64::consts::PI * ((rad + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)).floor();
+    rad -= 2.0
+        * std::f64::consts::PI
+        * ((rad + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)).floor();
     s.angle = rad * 180.0 / std::f64::consts::PI;
 
     let b2 = [
@@ -876,9 +878,7 @@ pub fn postprocess(g: &Geometry, lm_out: &LmOut, s: &LandmarkStage) -> Result<Ha
         ));
     }
     if lm_out.outs[1].len() != 1 || lm_out.outs[2].len() != 1 {
-        return Err(
-            "postprocess: presence and handedness are scalars, not vectors".to_string(),
-        );
+        return Err("postprocess: presence and handedness are scalars, not vectors".to_string());
     }
 
     // One scale for x, y AND z, and it is the LARGER of the crop's two axis
@@ -1082,7 +1082,8 @@ pub fn detect(
     let t1 = std::time::Instant::now();
     let mut cost = crate::hands::Cost::default();
     let mut on_node = |i: usize, t: &Tensor| hook("palm", i, t);
-    let pnodes = model.run_palm_costed_on_array(&palm_in, &mut on_node, array.as_deref_mut(), &mut cost)?;
+    let pnodes =
+        model.run_palm_costed_on_array(&palm_in, &mut on_node, array.as_deref_mut(), &mut cost)?;
     r.palm_s = t1.elapsed().as_secs_f64();
     // THE ARRAY'S COUNTERS, over both networks.
     //
@@ -1104,7 +1105,11 @@ pub fn detect(
 
     // -- stage 2, once per surviving detection ------------------------------
     let n = r.detections.len() as i64;
-    let run = if max_hands < 0 || n < max_hands { n } else { max_hands };
+    let run = if max_hands < 0 || n < max_hands {
+        n
+    } else {
+        max_hands
+    };
     r.hands_run = run;
     for i in 0..run {
         let t3 = std::time::Instant::now();
@@ -1287,7 +1292,11 @@ pub fn result_json(r: &Run, image_label: &str) -> String {
         }
         out.push_str("]}");
     }
-    out.push_str(if r.hands.is_empty() { "]}\n" } else { "\n  ]}\n" });
+    out.push_str(if r.hands.is_empty() {
+        "]}\n"
+    } else {
+        "\n  ]}\n"
+    });
     out
 }
 

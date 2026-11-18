@@ -87,11 +87,8 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "..", "lib"))
-
-import conv_quant                                            # noqa: E402
-from npue import ARCH_MEDIAPIPE_HANDS_PALM_SSD_LM_HEATMAP, Writer  # noqa: E402
+from tools.lib import conv_quant                                            # noqa: E402
+from tools.lib.npue import ARCH_MEDIAPIPE_HANDS_PALM_SSD_LM_HEATMAP, Writer  # noqa: E402
 
 ARCH_STRING = "mediapipe_hands_palm_ssd_lm_heatmap"
 
@@ -888,7 +885,7 @@ def npu_panels(pfx, ops, weights, device):
 def _embed(w, model_name, datapath, npue_args, where):
     if npue_args is None or getattr(npue_args, "no_embed_artifacts", False):
         return None
-    from design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
+    from tools.lib.design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
     import os
     explicit = getattr(npue_args, "embed_artifacts", None)
     # FOUR levels up, not three: this file is <root>/tools/pack/packers/<x>.py,

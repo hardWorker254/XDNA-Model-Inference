@@ -13,7 +13,7 @@
 //! oracle's output by the parity harness, so a divergence is a failing gate
 //! and not a thing a reader has to notice.
 
-use npum_families::registry::{owns, verbs_of, ROSTER};
+use npum_families::registry::{ROSTER, owns, verbs_of};
 
 /// The one worked example in `--help`, per family.
 ///

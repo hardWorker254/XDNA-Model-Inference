@@ -95,8 +95,9 @@ fn the_vector_is_bit_identical_to_the_oracles() {
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .expect("the container holds a vocabulary");
-    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-        .expect("the vocabulary is usable");
+    let tokenizer =
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+            .expect("the vocabulary is usable");
 
     let (encoding, truncated) = tokenizer
         .encode_padded("a golden transcript is a contract", SEQ)
@@ -128,7 +129,12 @@ fn the_vector_is_bit_identical_to_the_oracles() {
             if differing <= 8 {
                 let element = i / 4;
                 let got = f32::from_le_bytes([got[i], got[i + 1], got[i + 2], got[i + 3]]);
-                let want = f32::from_le_bytes([expected[i], expected[i + 1], expected[i + 2], expected[i + 3]]);
+                let want = f32::from_le_bytes([
+                    expected[i],
+                    expected[i + 1],
+                    expected[i + 2],
+                    expected[i + 3],
+                ]);
                 eprintln!(
                     "element {element}: the runtime says {got:?} ({:08x}), the oracle says {want:?} ({:08x})",
                     got.to_bits(),
@@ -138,7 +144,8 @@ fn the_vector_is_bit_identical_to_the_oracles() {
         }
     }
     assert_eq!(
-        differing, 0,
+        differing,
+        0,
         "{differing} of {} bytes differ from the oracle's",
         got.len()
     );

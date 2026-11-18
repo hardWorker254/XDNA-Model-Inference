@@ -172,10 +172,7 @@ pub struct Person {
 /// differ by up to one 8-bit level on a downscale, and after /255 and 200
 /// convolutions that is a pixel of keypoint drift nobody would attribute to
 /// the resampler.
-pub fn letterbox_normalise(
-    src: &Image,
-    g: &Geometry,
-) -> Result<(Tensor, Letterbox), String> {
+pub fn letterbox_normalise(src: &Image, g: &Geometry) -> Result<(Tensor, Letterbox), String> {
     if src.empty() {
         return Err("pose front end: the image decoded to nothing".into());
     }
@@ -253,8 +250,7 @@ pub fn letterbox_normalise(
                 // The SCALED image's width, not the source's: the row being
                 // read is the scaled raster's.
                 let v = scaled.rgb[(y as usize * rw as usize + x) * 3 + c] as f64 / 255.0;
-                out.d[base + py * side as usize + x + lb.pad_x as usize] =
-                    ((v - mu) / sd) as f32;
+                out.d[base + py * side as usize + x + lb.pad_x as usize] = ((v - mu) / sd) as f32;
             }
         }
     }
@@ -357,7 +353,11 @@ pub fn decode(
     // NMS, greedy by score. The sort is STABLE on the score, so that two
     // anchors with the same score suppress each other in ANCHOR order rather
     // than in whatever order the sort happened to produce.
-    cand.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    cand.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut kept: Vec<Person> = Vec::new();
     let mut dead = vec![false; cand.len()];
     let mut i = 0usize;
@@ -455,7 +455,11 @@ pub fn result_json(
         out.push_str(if i > 0 { ",\n    " } else { "\n    " });
         out.push_str(&person_json(person, i as i64));
     }
-    out.push_str(if r.people.is_empty() { "],\n" } else { "\n  ],\n" });
+    out.push_str(if r.people.is_empty() {
+        "],\n"
+    } else {
+        "\n  ],\n"
+    });
     // The 17 names as 17 STRINGS, not one comma-joined line: the array form
     // is the one a client can index, and the CSV exists for humans reading
     // stderr. Both come from the same table, so the two cannot spell the

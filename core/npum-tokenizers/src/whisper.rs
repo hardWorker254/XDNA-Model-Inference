@@ -23,7 +23,7 @@
 //! differently on the rare codepoints, and the tokens -- and therefore the
 // ids -- differ.
 
-use crate::tables::{WhisperTables, WHISPER};
+use crate::tables::{WHISPER, WhisperTables};
 use crate::{Encoding, Error, Result, Tokenizer};
 use std::collections::HashMap;
 
@@ -124,10 +124,18 @@ impl Tokenizer for Whisper {
                 // The longest match in the vocabulary, over the buffer so far.
                 let mut matched = false;
                 for len in (1..=buffer.chars().count()).rev() {
-                    let candidate: String = buffer.chars().rev().take(len).collect::<Vec<_>>().into_iter().rev().collect();
+                    let candidate: String = buffer
+                        .chars()
+                        .rev()
+                        .take(len)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     if let Some(id) = self.vocab.get(&candidate) {
                         ids.push(*id);
-                        let rest: String = buffer.chars().take(buffer.chars().count() - len).collect();
+                        let rest: String =
+                            buffer.chars().take(buffer.chars().count() - len).collect();
                         buffer = rest;
                         matched = true;
                         break;

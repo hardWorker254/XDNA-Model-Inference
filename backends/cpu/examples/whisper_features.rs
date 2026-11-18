@@ -37,19 +37,19 @@ fn main() {
     println!("samples {} {}", samples.len(), to_hex(&samples));
 
     let (mel, _used) = whisper_features::log_mel_30s(&samples, n_mels);
-    println!(
-        "mel {} {} {}",
-        mel.n_mels,
-        mel.frames,
-        to_hex(&mel.data)
-    );
+    println!("mel {} {} {}", mel.n_mels, mel.frames, to_hex(&mel.data));
 
     let w1 = tensor_f32(&container, "frontend.conv1.weight");
     let b1 = tensor_f32(&container, "frontend.conv1.bias");
     let w2 = tensor_f32(&container, "frontend.conv2.weight");
     let b2 = tensor_f32(&container, "frontend.conv2.bias");
     let emb = whisper_features::conv_front_end(&mel, &w1, &b1, &w2, &b2, d_model);
-    println!("conv {} {} {}", whisper_features::ENCODER_POSITIONS, d_model, to_hex(&emb));
+    println!(
+        "conv {} {} {}",
+        whisper_features::ENCODER_POSITIONS,
+        d_model,
+        to_hex(&emb)
+    );
 }
 
 /// A tensor's bytes, as f32.

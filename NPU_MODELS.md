@@ -20,8 +20,8 @@ Tally over the 171 cells:
 
 - **100** **yes** -- runs on the array today
 - **0** already -- the work is already dispatched without a code, and the code is refused
-- **0** no code -- the model has the operation, no array branch reaches it
-- **3** impossible -- cannot be moved on this board; the reason is in NPU_OPS.md
+- **1** no code -- the model has the operation, no array branch reaches it
+- **2** impossible -- cannot be moved on this board; the reason is in NPU_OPS.md
 - **66** no -- the model has no such operation
 - **2** **gated** -- this model's FFN has no standalone activation pass -- see below
 
@@ -43,7 +43,7 @@ A list per model, not a grid of models against operations. In a 171-cell grid, 6
 | `bge-base-en-v1.5` | `gemm`, `gelu`, `layn`, `softm`, `attn` |
 | `bge-large-en-v1.5` | `gemm`, `gelu`, `layn`, `softm`, `attn` |
 | `nomic-embed-text-v1.5` | `gemm`, `gelu` (gated), `layn`, `softm`, `attn` |
-| `embeddinggemma-300m` | `gemm`, `gelu` (impossible), `layn` (impossible), `softm`, `attn` |
+| `embeddinggemma-300m` | `gemm`, `gelu` (impossible), `layn` (no code), `softm`, `attn` |
 | `gte-multilingual-base` | `gemm`, `gelu` (gated), `layn`, `softm`, `attn` |
 | `whisper-tiny` | `gemm`, `gelu`, `layn`, `softm`, `conv`, `attn`, `mproj`, `fft`, `logit` |
 | `whisper-base` | `gemm`, `gelu`, `layn`, `softm`, `conv`, `attn`, `mproj`, `fft`, `logit` |
@@ -63,9 +63,9 @@ A list per model, not a grid of models against operations. In a 171-cell grid, 6
 
 Every other model takes its kind's row wholesale. gemma does not: its row lives in `MODEL_REGISTRY`, because `GemmaNpuEncoder` reads no per-op flag at all. That is a property of one encoder and not of a family, and making it another kind would claim a family that does not exist.
 
-The price of that decision is visible in the matrix: gemma's `layn` is **blocked** -- it needs RMSNorm, and `kernels/layernorm.cc` is parameterised only by `-DLN_COLS/-DLN_EPS/-DLN_ROWS`, so this is a different kernel body and a code of its own, since the set is at nine already. Deliberately not done: the code set would grow and lose its uniformity. The full argument is the `embeddinggemma-300m/layn` cell in NPU_OPS.md.
+The price of that decision is visible in the matrix: gemma's `layn` is **no code** (`unimplemented`). Gemma normalises with RMSNorm, and the RMSNorm kernel / `rmsnorm/` eltwise design exist, but this runtime does not yet have a Gemma forward path that dispatches normalisation through `EltOp::RmsNorm` / `ArrayEltwise::rmsnorm`. Until that branch is wired, the `layn` code cannot be honestly reported as executable for gemma. The full argument is the `embeddinggemma-300m/layn` cell in NPU_OPS.md.
 
-So `buildable_codes()` returns the **empty set** for gemma: the exporter compiles no sibling design at all for it.
+So `buildable_codes()` still returns the **empty set** for gemma: the exporter compiles no sibling eltwise design selected by this registry for it.
 
 ### nomic and gte -- a GATED FFN, and therefore no `gelu`
 

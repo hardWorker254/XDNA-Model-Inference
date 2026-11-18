@@ -147,16 +147,13 @@ impl<T: Transport> ArrayGemms<T> {
             })?;
 
             // THE SHAPE, FROM THE CONTAINER.
-            let entry = file
-                .directory()
-                .tensor(&spec.weight)
-                .ok_or_else(|| {
-                    DesignError::Design(format!(
-                        "{}: the container's directory does not list {}.",
-                        container.display(),
-                        spec.weight
-                    ))
-                })?;
+            let entry = file.directory().tensor(&spec.weight).ok_or_else(|| {
+                DesignError::Design(format!(
+                    "{}: the container's directory does not list {}.",
+                    container.display(),
+                    spec.weight
+                ))
+            })?;
             let shape: Vec<i64> = entry.logical_shape.clone();
             if shape.len() != 2 || shape[0] as usize != spec.k || shape[1] as usize != spec.n {
                 return Err(DesignError::Design(format!(
@@ -309,11 +306,7 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         }
 
         // THE TIER: the smallest one that holds the run's rows.
-        let Some((tier_rows, instr)) = panel
-            .tiers
-            .iter()
-            .find(|(tier, _)| *tier >= rows)
-            .copied()
+        let Some((tier_rows, instr)) = panel.tiers.iter().find(|(tier, _)| *tier >= rows).copied()
         else {
             return Err(npum_model::array::ArrayError(format!(
                 "{weight}: the design's smallest tier computes {} rows, and the run has {rows}. \
@@ -325,18 +318,8 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         self.design
             .bind(BUFFER_WEIGHTS, panel.slot)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
-        gemm(
-            &mut self.design,
-            instr,
-            a,
-            rows,
-            tier_rows,
-            k,
-            bias,
-            n,
-            out,
-        )
-        .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        gemm(&mut self.design, instr, a, rows, tier_rows, k, bias, n, out)
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
         self.dispatches += 1;
         Ok(())
     }
@@ -379,16 +362,8 @@ impl<T: Transport> npum_model::array::ArrayAttention for ArrayGemms<T> {
                 "this run did not ask for the attention to go on the array".to_string(),
             )
         })?;
-        crate::attention::run(
-            &mut self.design,
-            attention,
-            qkv,
-            shape,
-            mask,
-            softmax,
-            ctx,
-        )
-        .map_err(|e| npum_model::array::ArrayError(e.to_string()))
+        crate::attention::run(&mut self.design, attention, qkv, shape, mask, softmax, ctx)
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))
     }
 }
 

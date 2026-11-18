@@ -268,10 +268,7 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
             .get(key)
             .and_then(|v| v.as_array())
             .ok_or_else(|| format!("{label}: the container carries no {key}"))?;
-        Ok(array
-            .iter()
-            .filter_map(|v| v.as_i64())
-            .collect())
+        Ok(array.iter().filter_map(|v| v.as_i64()).collect())
     };
 
     let input_size = get_i64("input_size")?;
@@ -299,7 +296,7 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
                      quadrant and NMS then deletes most of them -- so the \
                      failure presents as an empty result rather than as a \
                      visibly wrong one."
-                ))
+                ));
             }
         },
         score: match config.get_str("head_score") {
@@ -341,7 +338,12 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
         let inputs: Vec<i32> = node
             .get("inputs")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_i64()).map(|v| v as i32).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .collect()
+            })
             .unwrap_or_default();
         let mut layer = Layer {
             op,
@@ -383,35 +385,32 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
                 // is stride 2 and the 1x1s pad nothing, so a default would be
                 // right for most of the network and would silently resize the
                 // two layers that set every resolution below them.
-                layer.stride = node
-                    .get("stride")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        format!(
-                            "{where_}: conv carries no \"stride\". A default of 1 is \
+                layer.stride = node.get("stride").and_then(|v| v.as_i64()).ok_or_else(|| {
+                    format!(
+                        "{where_}: conv carries no \"stride\". A default of 1 is \
                              right for most of this network and wrong for the stem, \
                              which downsamples by 2."
-                        )
-                    })?;
+                    )
+                })?;
                 if layer.stride < 1 {
                     return Err(format!(
                         "{where_}: conv stride {} is not a forward step.",
                         layer.stride
                     ));
                 }
-                let pad = node
-                    .get("pad")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| {
-                        format!(
-                            "{where_}: conv carries no \"pad\". The padding is zero \
+                let pad = node.get("pad").and_then(|v| v.as_array()).ok_or_else(|| {
+                    format!(
+                        "{where_}: conv carries no \"pad\". The padding is zero \
                              on a 1x1 and one on a 3x3, and which is which is the \
                              difference between a 642x642 first layer and a 640x640 \
                              one."
-                        )
-                    })?;
+                    )
+                })?;
                 if pad.len() != 2 {
-                    return Err(format!("{where_}: conv pad has {} entries, not 2.", pad.len()));
+                    return Err(format!(
+                        "{where_}: conv pad has {} entries, not 2.",
+                        pad.len()
+                    ));
                 }
                 layer.pad_h = pad[0].as_i64().unwrap_or(0);
                 layer.pad_w = pad[1].as_i64().unwrap_or(0);
@@ -487,9 +486,9 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Str
         let mut b: Vec<f32> = Vec::new();
         if !bias_free.contains(&(i as i64)) {
             let bname = format!("conv.{i}.b");
-            let bytes = container.tensor_bytes(&bname).map_err(|_| {
-                format!("{label}: the container holds no tensor named {bname}")
-            })?;
+            let bytes = container
+                .tensor_bytes(&bname)
+                .map_err(|_| format!("{label}: the container holds no tensor named {bname}"))?;
             b = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -599,7 +598,11 @@ pub fn array_specs(geometry: &Geometry) -> Vec<ConvSpec> {
             stream: l.stream.clone(),
             k: cw.kin() as usize,
             n: cw.cout as usize,
-            bias: if cw.b.is_empty() { None } else { Some(cw.b.clone()) },
+            bias: if cw.b.is_empty() {
+                None
+            } else {
+                Some(cw.b.clone())
+            },
         });
     }
     specs
@@ -1103,12 +1106,10 @@ impl Network {
                     for k in 0..g.num_keypoints {
                         let o = 4 + g.num_classes + k * 3;
                         let base = (k * 3) as usize * plane + cell;
-                        row[o as usize] = (j as f32 + g.head.kpt_grid_offset
-                            + 2.0 * kpc[base])
-                            * stride;
-                        row[o as usize + 1] = (i as f32 + g.head.kpt_grid_offset
-                            + 2.0 * kpc[base + plane])
-                            * stride;
+                        row[o as usize] =
+                            (j as f32 + g.head.kpt_grid_offset + 2.0 * kpc[base]) * stride;
+                        row[o as usize + 1] =
+                            (i as f32 + g.head.kpt_grid_offset + 2.0 * kpc[base + plane]) * stride;
                         let mut v = kpc[base + 2 * plane];
                         if g.head.kpt_visibility == ScoreKind::Logit {
                             v = 1.0 / (1.0 + (-v).exp());
@@ -1217,11 +1218,7 @@ pub fn transpose_mn_to_nchw(src: &[f32], m: i64, n: i64, dst: &mut [f32], silu: 
             let d = &mut dst[(ch * m) as usize..][..m as usize];
             for mm in m0..m1 {
                 let v = src[(mm * n + ch) as usize];
-                d[mm as usize] = if silu {
-                    v / (1.0 + (-v).exp())
-                } else {
-                    v
-                };
+                d[mm as usize] = if silu { v / (1.0 + (-v).exp()) } else { v };
             }
         }
         m0 = m1;

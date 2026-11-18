@@ -158,7 +158,10 @@ impl Backend for VulkanBackend {
     fn prepare(&mut self, spec: &ModelSpec) -> Result<Plan> {
         let (dispatched, note) = match self.gpu.as_ref() {
             Some(gpu) => (
-                Self::gpu_ops().iter().map(|o| o.as_str().to_string()).collect(),
+                Self::gpu_ops()
+                    .iter()
+                    .map(|o| o.as_str().to_string())
+                    .collect(),
                 format!(
                     "the GPU backend runs gemm, gelu, layernorm, softmax and attn of {} \
                      on {}; conv, mproj, fft and logit stay on the host",
@@ -223,8 +226,7 @@ impl Backend for VulkanBackend {
             return npum_cpu::kernels::gelu_(x);
         };
         let mut values = x.to_f32();
-        gpu.gelu(&mut values)
-            .map_err(|d| Self::failed("gelu", d))?;
+        gpu.gelu(&mut values).map_err(|d| Self::failed("gelu", d))?;
         let mut bytes = Vec::with_capacity(values.len() * 4);
         for v in &values {
             bytes.extend_from_slice(&v.to_le_bytes());
@@ -233,13 +235,7 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
-    fn layernorm(
-        &mut self,
-        x: &mut Tensor,
-        gamma: &Tensor,
-        beta: &Tensor,
-        eps: f32,
-    ) -> Result<()> {
+    fn layernorm(&mut self, x: &mut Tensor, gamma: &Tensor, beta: &Tensor, eps: f32) -> Result<()> {
         if !Self::all_f32(&[x, gamma, beta]) {
             return npum_cpu::kernels::layernorm_(x, gamma, beta, eps);
         }
@@ -293,13 +289,7 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
-    fn attention(
-        &mut self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        out: &mut Tensor,
-    ) -> Result<()> {
+    fn attention(&mut self, q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor) -> Result<()> {
         if !Self::all_f32(&[q, k, v]) {
             return npum_cpu::kernels::attention(q, k, v, out);
         }

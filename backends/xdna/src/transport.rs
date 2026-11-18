@@ -126,7 +126,6 @@ pub trait Transport: Sized {
     /// has ever used.
     fn open(index: u32) -> Result<Self, TransportError>;
 
-
     /// The hardware context for one xclbin.
     ///
     /// The xclbin is handed over as BYTES: a design set that lives inside a
@@ -171,12 +170,10 @@ pub trait Transport: Sized {
     fn read(bo: &Self::Buffer, data: &mut [u8], offset: u64) -> Result<(), TransportError>;
 
     /// Make a buffer's contents visible to the device.
-    fn sync_to_device(bo: &Self::Buffer, bytes: u64, offset: u64)
-        -> Result<(), TransportError>;
+    fn sync_to_device(bo: &Self::Buffer, bytes: u64, offset: u64) -> Result<(), TransportError>;
 
     /// Make the device's writes to a buffer visible to the host.
-    fn sync_from_device(bo: &Self::Buffer, bytes: u64, offset: u64)
-        -> Result<(), TransportError>;
+    fn sync_from_device(bo: &Self::Buffer, bytes: u64, offset: u64) -> Result<(), TransportError>;
 
     /// Start a run: the instruction stream, its length in 32-bit words, and
     /// the design's data buffers.

@@ -51,7 +51,11 @@ fn values(count: usize, seed: u32) -> Vec<f32> {
 
 /// The largest absolute difference.
 fn worst_abs(gpu: &[f32], host: &[f32]) -> f32 {
-    assert_eq!(gpu.len(), host.len(), "the two answers have different sizes");
+    assert_eq!(
+        gpu.len(),
+        host.len(),
+        "the two answers have different sizes"
+    );
     gpu.iter()
         .zip(host)
         .map(|(g, h)| (g - h).abs())
@@ -61,7 +65,11 @@ fn worst_abs(gpu: &[f32], host: &[f32]) -> f32 {
 /// The largest relative difference, with a floor so a zero is not a
 /// division by zero.
 fn worst_rel(gpu: &[f32], host: &[f32]) -> f32 {
-    assert_eq!(gpu.len(), host.len(), "the two answers have different sizes");
+    assert_eq!(
+        gpu.len(),
+        host.len(),
+        "the two answers have different sizes"
+    );
     gpu.iter()
         .zip(host)
         .map(|(g, h)| (g - h).abs() / h.abs().max(1e-3))
@@ -106,7 +114,8 @@ fn the_gemm_is_bit_identical_to_the_host() {
         cpu.gemm_nt(&a, m, &b, k, n, &bias, &mut host).unwrap();
         gpu.gemm_nt(&a, m, &b, k, n, &bias, &mut on_gpu).unwrap();
         assert_eq!(
-            host, on_gpu,
+            host,
+            on_gpu,
             "the GEMM {m}x{k}x{n} differs from the host's by {}",
             worst_abs(&on_gpu, &host)
         );
@@ -127,7 +136,8 @@ fn the_gelu_is_bit_identical_to_the_host() {
     cpu.gelu(&mut host).unwrap();
     gpu.gelu(&mut on_gpu).unwrap();
     assert_eq!(
-        host, on_gpu,
+        host,
+        on_gpu,
         "the GELU differs from the host's by {}",
         worst_abs(&on_gpu, &host)
     );
@@ -199,8 +209,9 @@ fn the_model_on_the_gpu_matches_the_host() {
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .expect("the container holds a vocabulary");
-    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-        .expect("the vocabulary is usable");
+    let tokenizer =
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+            .expect("the vocabulary is usable");
     let (encoding, truncated) = tokenizer
         .encode_padded("a golden transcript is a contract", SEQ)
         .expect("the text encodes");
@@ -218,28 +229,29 @@ fn the_model_on_the_gpu_matches_the_host() {
         )
         .expect("the model runs on the host");
     let on_gpu = model
-        .embed(
-            &encoding.ids,
-            &encoding.mask,
-            1,
-            SEQ,
-            &mut gpu,
-            None,
-            None,
-        )
+        .embed(&encoding.ids, &encoding.mask, 1, SEQ, &mut gpu, None, None)
         .expect("the model runs on the GPU");
 
     // The vectors are L2-normalised, so the cosine is the number that
     // says "the same direction". The bound is the plan's: 2e-3.
-    let dot: f64 = host.iter().zip(&on_gpu).map(|(a, b)| *a as f64 * *b as f64).sum();
-    let host_len: f64 = host.iter().map(|a| (*a as f64) * (*a as f64)).sum::<f64>().sqrt();
-    let gpu_len: f64 = on_gpu.iter().map(|a| (*a as f64) * (*a as f64)).sum::<f64>().sqrt();
+    let dot: f64 = host
+        .iter()
+        .zip(&on_gpu)
+        .map(|(a, b)| *a as f64 * *b as f64)
+        .sum();
+    let host_len: f64 = host
+        .iter()
+        .map(|a| (*a as f64) * (*a as f64))
+        .sum::<f64>()
+        .sqrt();
+    let gpu_len: f64 = on_gpu
+        .iter()
+        .map(|a| (*a as f64) * (*a as f64))
+        .sum::<f64>()
+        .sqrt();
     let cosine = dot / (host_len * gpu_len);
     eprintln!("the vectors' cosine: {cosine:.12}");
-    eprintln!(
-        "the GPU dispatched {} operations",
-        gpu.dispatches()
-    );
+    eprintln!("the GPU dispatched {} operations", gpu.dispatches());
     assert!(
         (1.0 - cosine) <= 2e-3,
         "the GPU's vector differs from the host's: 1 - cos = {:e}",

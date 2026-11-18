@@ -146,7 +146,9 @@ impl Attention {
                 "{}: attn_qk's N is {} and attn_av's K is {}. The score chunk \
                  travels from one to the other as the A operand, so the two are \
                  the same padded key count.",
-                design.info().name, qk.n, av.k
+                design.info().name,
+                qk.n,
+                av.k
             )));
         }
 
@@ -163,7 +165,8 @@ impl Attention {
             return Err(ArrayError::Design(format!(
                 "{}: the B panel layout's order is '{}', and this runtime lays the \
                  attention's panels out in 'k,n,kt,nt'.",
-                design.info().name, layout.order
+                design.info().name,
+                layout.order
             )));
         }
         let tile_k = layout.tile_k as usize;
@@ -180,7 +183,12 @@ impl Attention {
         // against the buffer, here, where the answer can still be a refusal.
         let k_bytes = qk.k * qk.n * 2;
         let v_bytes = av.k * av.n * 2;
-        let capacity = design.info().buffers.get(BUFFER_OPERANDS).copied().unwrap_or(0);
+        let capacity = design
+            .info()
+            .buffers
+            .get(BUFFER_OPERANDS)
+            .copied()
+            .unwrap_or(0);
         if capacity < k_bytes as u64 || capacity < v_bytes as u64 {
             return Err(ArrayError::Design(format!(
                 "{}: the B operands of attn_qk/attn_av are {k_bytes} and {v_bytes} \
@@ -216,10 +224,7 @@ impl Attention {
 }
 
 /// Find one of the attention's streams in a design.
-fn find_stream<T: Transport>(
-    design: &ArrayDesign<T>,
-    op: &str,
-) -> Result<AttnStream, ArrayError> {
+fn find_stream<T: Transport>(design: &ArrayDesign<T>, op: &str) -> Result<AttnStream, ArrayError> {
     let info = design.info();
     let mut tiers: Vec<(usize, usize)> = Vec::new();
     let mut k = 0usize;

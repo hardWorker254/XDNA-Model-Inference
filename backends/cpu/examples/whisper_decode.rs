@@ -18,7 +18,9 @@ use std::path::Path;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: whisper_decode <model.npum> <audio.wav> [--ids a,b,c] [--greedy a,b,c] [--max-new N]");
+        eprintln!(
+            "usage: whisper_decode <model.npum> <audio.wav> [--ids a,b,c] [--greedy a,b,c] [--max-new N]"
+        );
         std::process::exit(2);
     }
     let model = Path::new(&args[1]);
@@ -71,7 +73,9 @@ fn main() {
 
     let n_src = conv.len() / g.d_model;
     let hidden = encoder.run(&conv, n_src);
-    decoder.set_source(&hidden, n_src).expect("the cross-attention cache");
+    decoder
+        .set_source(&hidden, n_src)
+        .expect("the cross-attention cache");
 
     for (pos, &token) in ids.iter().enumerate() {
         let mut h = Vec::new();
@@ -89,7 +93,9 @@ fn main() {
             .expect("the tokenizer's table");
         let tokenizer = Tokenizer::from_table(table).expect("the tokenizer's table");
         let stop = tokenizer.token_id("<|endoftext|>").expect("the stop token");
-        let out = decoder.greedy(&prompt, stop, max_new).expect("the greedy chain");
+        let out = decoder
+            .greedy(&prompt, stop, max_new)
+            .expect("the greedy chain");
         print!("greedy {}", out.len());
         for id in &out {
             print!(" {id}");

@@ -72,7 +72,12 @@ impl Dispatcher {
     /// operation lists the flags carried. An operation in neither list runs
     /// on the host, which is the C++ default and the safe one: a backend
     /// that was not asked to do something is not asked to do it.
-    pub fn new(backend: Box<dyn Backend>, plan: Plan, npu_ops: &[OpKind], vulkan_ops: &[OpKind]) -> Self {
+    pub fn new(
+        backend: Box<dyn Backend>,
+        plan: Plan,
+        npu_ops: &[OpKind],
+        vulkan_ops: &[OpKind],
+    ) -> Self {
         let mut placement = Vec::new();
         for op in OpKind::ALL {
             let where_ = if vulkan_ops.contains(&op) {

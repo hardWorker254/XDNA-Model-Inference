@@ -114,9 +114,7 @@ pub fn context_budget() -> ContextBudget {
     }
     ContextBudget {
         limit: 0,
-        source: format!(
-            "unknown for device '{device}' -- XRT exposes no usable-count query"
-        ),
+        source: format!("unknown for device '{device}' -- XRT exposes no usable-count query"),
     }
 }
 
@@ -179,9 +177,10 @@ fn from_driver() -> Option<ContentionReport> {
 fn from_xrt_smi() -> ContentionReport {
     let mut report = ContentionReport::default();
     let Some(text) = run_capture() else {
-        report.failure = "neither the driver's GET_INFO context query nor `xrt-smi examine -r all` \
+        report.failure =
+            "neither the driver's GET_INFO context query nor `xrt-smi examine -r all` \
              answered"
-            .to_string();
+                .to_string();
         return report;
     };
     report.tool_ran = true;
@@ -236,7 +235,10 @@ pub fn require_context_budget(
     // than collide with a leftover process and surface a raw driver error.
     if !report.tool_ran {
         eprintln!();
-        eprintln!("  !! CANNOT VERIFY THE NPU CONTEXT BUDGET: {}", report.failure);
+        eprintln!(
+            "  !! CANNOT VERIFY THE NPU CONTEXT BUDGET: {}",
+            report.failure
+        );
         eprintln!("     An absent data source is not a negative reading (tasks/0040).");
         if budget.limit > 0 {
             eprintln!(
@@ -255,7 +257,9 @@ pub fn require_context_budget(
             return true;
         }
         eprintln!();
-        eprintln!(            "Refusing to build {requested} hw_context(s) without knowing the device has room. Make `xrt-smi examine -r all` work, close other NPU");
+        eprintln!(
+            "Refusing to build {requested} hw_context(s) without knowing the device has room. Make `xrt-smi examine -r all` work, close other NPU"
+        );
         eprintln!("  processes, or pass --allow-contention to proceed anyway.");
         eprintln!();
         return false;
@@ -293,7 +297,9 @@ pub fn require_context_budget(
         );
     }
     if allow_override {
-        eprintln!("  !! --allow-contention given: continuing anyway. A context construction may still fail with a raw driver error.");
+        eprintln!(
+            "  !! --allow-contention given: continuing anyway. A context construction may still fail with a raw driver error."
+        );
         eprintln!();
         return true;
     }

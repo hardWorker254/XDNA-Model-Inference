@@ -82,10 +82,7 @@ impl Tokenizer {
         // The size the header claims must fit the blob. Every field below is
         // a consequence of these offsets, so this one check is what makes the
         // rest safe to read.
-        let need = HEADER_SIZE
-            + pool_bytes
-            + 12 * n_vocab
-            + 8 * n_merges;
+        let need = HEADER_SIZE + pool_bytes + 12 * n_vocab + 8 * n_merges;
         if need > table.len() {
             return Err(format!(
                 "tokenizer.whisper_table: header describes {need} bytes, tensor holds {}",
@@ -205,9 +202,7 @@ impl Tokenizer {
         let mut raw = Vec::new();
         for &id in ids {
             if id < 0 || id as usize >= self.ids.len() {
-                return Err(format!(
-                    "decode: id {id} is outside the vocabulary"
-                ));
+                return Err(format!("decode: id {id} is outside the vocabulary"));
             }
             let token = &self.tokens[id as usize];
             let mut i = 0;
@@ -241,10 +236,7 @@ fn next_cp(s: &[u8], i: usize) -> (u32, usize) {
     }
     let is_cont = |c: u8| (c & 0xC0) == 0x80;
     if (b0 & 0xE0) == 0xC0 && left >= 2 && is_cont(s[i + 1]) {
-        return (
-            (((b0 & 0x1F) as u32) << 6) | ((s[i + 1] & 0x3F) as u32),
-            2,
-        );
+        return ((((b0 & 0x1F) as u32) << 6) | ((s[i + 1] & 0x3F) as u32), 2);
     }
     if (b0 & 0xF0) == 0xE0 && left >= 3 && is_cont(s[i + 1]) && is_cont(s[i + 2]) {
         return (

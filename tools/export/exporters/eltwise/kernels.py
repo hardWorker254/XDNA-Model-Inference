@@ -73,6 +73,16 @@ def _arrays():
     GELU_ERF_SYMBOLS = {1024: "gelu_erf_bf16", 4096: "gelu_erf_bf16_4k"}
     GELU_SRC = {"poly": "gelu_poly.cc", "erf": "gelu_erf.cc"}
 
+    # -- SiLU (Swish): elementwise, 1024 or 4096 elements per tile -----------
+    #
+    # Standalone activation for models that use SiLU (e.g. YOLOv8-pose, where it
+    # is fused into conv epilogues today, and gated FFNs that compute SiLU as a
+    # separate step). Same program shape as GELU: one input, one output, no
+    # parameters.
+    SILU_SYMBOLS = {1024: "silu_bf16", 4096: "silu_bf16_4k"}
+    SILU_RNE_SYMBOLS = {1024: "silu_rne_bf16", 4096: "silu_rne_bf16_4k"}
+    SILU_SRC = {"base": "silu.cc", "rne": "silu_rne.cc"}
+
     def _gelu_build(dev, n_elem, n_cols, tile, variant="poly"):
         n_rows = 4
         n_cores = n_rows * n_cols
@@ -343,9 +353,158 @@ def _arrays():
         return _sm_build(iron.get_current_device(), rows, n_cols, variant,
                          cols, rows_per_call)
 
+    # -- SiLU: elementwise, 1024 or 4096 elements per tile -------------------
+    def _silu_build(dev, n_elem, n_cols, tile, variant="base"):
+        n_rows = 4
+        n_cores = n_rows * n_cols
+        n_tiles = n_elem // tile
+        assert n_elem % tile == 0, f"{n_elem} is not a multiple of {tile}"
+        assert n_tiles % n_cores == 0, \
+            f"{n_tiles} tiles do not spread over {n_cores} cores"
+        per_core = n_tiles // n_cores
+        syms = SILU_RNE_SYMBOLS if variant == "rne" else SILU_SYMBOLS
+        k = _extern_kernel(
+            iron, syms[tile], SILU_SRC[variant],
+            [np.ndarray[(tile,), np.dtype[bfloat16]]] * 2, tile)
+
+        def core_fn(a, c, silu):
+            for _ in range_(per_core):
+                ea = a.acquire(1)
+                ec = c.acquire(1)
+                silu(ea, ec)
+                a.release(1)
+                c.release(1)
+
+        tile_ty = np.ndarray[(tile,), np.dtype[bfloat16]]
+        buf_ty = np.ndarray[(n_elem,), np.dtype[bfloat16]]
+        l2_ty = np.ndarray[(n_rows * tile,), np.dtype[bfloat16]]
+        offsets = [tile * r for r in range(n_rows)]
+        workers, in_l3l2, out_l2l3 = [], [], []
+        for c in range(n_cols):
+            fin = ObjectFifo(l2_ty, name=f"sin_{c}", depth=2)
+            fout = ObjectFifo(l2_ty, name=f"sout_{c}", depth=2)
+            in_l3l2.append(fin)
+            out_l2l3.append(fout)
+            ins = fin.cons().split(offsets, obj_types=[tile_ty] * n_rows,
+                                   names=[f"sin_{c}_{r}" for r in range(n_rows)])
+            outs = fout.prod().join(offsets, obj_types=[tile_ty] * n_rows,
+                                    names=[f"sout_{c}_{r}" for r in range(n_rows)],
+                                    depths=[2] * n_rows)
+            for r in range(n_rows):
+                workers.append(Worker(core_fn,
+                                      [ins[r].cons(), outs[r].prod(), k],
+                                      tile=Tile(c, r + 2), stack_size=0x2000))
+        taps = TensorTiler2D.simple_tiler((1, n_elem), (1, n_elem // n_cols))
+
+        def sequence(X, Y, in_prods, out_conss):
+            tg = TaskGroup()
+            for c in range(n_cols):
+                in_prods[c].fill(X, tap=taps[c], group=tg)
+                out_conss[c].drain(Y, tap=taps[c], wait=True, group=tg)
+            tg.finish()
+
+        rt = Runtime(sequence, [buf_ty, buf_ty,
+                                [f.prod() for f in in_l3l2],
+                                [f.cons() for f in out_l2l3]])
+        return Program(dev, rt, workers=workers).resolve_program()
+
+    @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+    def silu_array(X: In, Y: Out, *, n_elem: CompileTime[int],
+                   variant: CompileTime[str] = "base",
+                   n_cols: CompileTime[int] = 1,
+                   tile: CompileTime[int] = GELU_TILE):
+        return _silu_build(iron.get_current_device(), n_elem, n_cols, tile,
+                           variant)
+
+    # -- RMSNorm: [rows, cols] -> [rows, cols], weight (no beta) -------------
+    RMS_SYMBOLS = {
+        "base": ("rmsnorm_bf16", "rmsnorm.cc", 0x2000),
+        "il4": ("rmsnorm_il4_bf16", "rmsnorm.cc", 0x2000),
+        "rne": ("rmsnorm_rne_bf16", "rmsnorm_rne.cc", 0x2000),
+        "il4_rne": ("rmsnorm_il4_rne_bf16", "rmsnorm_rne.cc", 0x2000),
+    }
+
+    def _rms_build(dev, rows, n_cols, variant, cols, eps, rows_per_call):
+        symbol, src, stack = RMS_SYMBOLS[variant]
+        n_cores = 4 * n_cols
+        assert rows % (rows_per_call * n_cores) == 0, \
+            f"{rows} rows do not split into {rows_per_call}-row blocks over {n_cores} cores"
+        per_core = rows // (rows_per_call * n_cores)
+        blk = rows_per_call * cols
+        tile_ty = np.ndarray[(blk,), np.dtype[bfloat16]]
+        w_ty = np.ndarray[(cols,), np.dtype[np.float32]]
+        buf_ty = np.ndarray[(rows * cols,), np.dtype[bfloat16]]
+        k = _extern_kernel(iron, symbol, src, [tile_ty, w_ty, tile_ty], None,
+                           compile_flags=[f"-DRN_COLS={cols}",
+                                          f"-DRN_EPS={eps!r}f",
+                                          f"-DRN_ROWS={rows_per_call}"])
+
+        def core_fn(a, pm, c, rn):
+            ep = pm.acquire(1)
+            for _ in range_(per_core):
+                ea = a.acquire(1)
+                ec = c.acquire(1)
+                rn(ea, ep, ec)
+                a.release(1)
+                c.release(1)
+            pm.release(1)
+
+        n_rows_grid = 4
+        l2_ty = np.ndarray[(n_rows_grid * blk,), np.dtype[bfloat16]]
+        offsets = [blk * r for r in range(n_rows_grid)]
+        in_l3l2, out_l2l3, p_l3l2, workers = [], [], [], []
+        for c in range(n_cols):
+            fin = ObjectFifo(l2_ty, name=f"rnin_{c}", depth=2)
+            fout = ObjectFifo(l2_ty, name=f"rnout_{c}", depth=2)
+            fp = ObjectFifo(w_ty, name=f"rnw_{c}", depth=1)
+            fp_l1 = fp.cons().forward(name=f"rnw_l1_{c}", depth=1)
+            in_l3l2.append(fin)
+            out_l2l3.append(fout)
+            p_l3l2.append(fp)
+            ins = fin.cons().split(offsets, obj_types=[tile_ty] * n_rows_grid,
+                                   names=[f"rnin_{c}_{r}" for r in range(n_rows_grid)])
+            outs = fout.prod().join(offsets, obj_types=[tile_ty] * n_rows_grid,
+                                    names=[f"rnout_{c}_{r}" for r in range(n_rows_grid)],
+                                    depths=[2] * n_rows_grid)
+            for r in range(n_rows_grid):
+                workers.append(Worker(core_fn,
+                                      [ins[r].cons(), fp_l1.cons(),
+                                       outs[r].prod(), k],
+                                      tile=Tile(c, r + 2), stack_size=stack))
+        data_taps = TensorTiler2D.simple_tiler((1, rows * cols),
+                                               (1, (rows * cols) // n_cols))
+        param_tap = TensorTiler2D.simple_tiler((1, cols), (1, cols))[0]
+
+        def sequence(X, W, Y, in_prods, p_prods, out_conss):
+            tg = TaskGroup()
+            for c in range(n_cols):
+                p_prods[c].fill(W, tap=param_tap, group=tg)
+                in_prods[c].fill(X, tap=data_taps[c], group=tg)
+                out_conss[c].drain(Y, tap=data_taps[c], wait=True, group=tg)
+            tg.finish()
+
+        rt = Runtime(sequence, [buf_ty, w_ty, buf_ty,
+                                [f.prod() for f in in_l3l2],
+                                [f.prod() for f in p_l3l2],
+                                [f.cons() for f in out_l2l3]])
+        return Program(dev, rt, workers=workers).resolve_program()
+
+    @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+    def rms_array(X: In, W: In, Y: Out, *, rows: CompileTime[int],
+                  n_cols: CompileTime[int] = 1,
+                  variant: CompileTime[str] = "base",
+                  cols: CompileTime[int] = 768,
+                  eps: CompileTime[float] = 1e-6,
+                  rows_per_call: CompileTime[int] = LN_ROWS_PER_CALL):
+        return _rms_build(iron.get_current_device(), rows, n_cols, variant,
+                          cols, eps, rows_per_call)
+
     _arrays._cache = SimpleNamespace(
         iron=iron, from_name=from_name,
         gelu_array=gelu_array, ln_array=ln_array, sm_array=sm_array,
+        silu_array=silu_array, rms_array=rms_array,
         gelu_symbols=GELU_SYMBOLS, gelu_erf_symbols=GELU_ERF_SYMBOLS,
+        silu_symbols=SILU_SYMBOLS, silu_rne_symbols=SILU_RNE_SYMBOLS,
+        rms_symbols=RMS_SYMBOLS,
         ln_symbols=LN_SYMBOLS, sm_symbols=SM_SYMBOLS)
     return _arrays._cache

@@ -162,11 +162,7 @@ impl Xclbin {
                     "the xclbin's section {index} runs past the end of the file"
                 ));
             }
-            sections.push(Section {
-                kind,
-                offset,
-                size,
-            });
+            sections.push(Section { kind, offset, size });
         }
         Ok(Self {
             bytes: bytes.to_vec(),
@@ -219,10 +215,10 @@ impl Xclbin {
             if base + AIE_PDI_SIZE > section.len() {
                 break;
             }
-            let size = u32::from_le_bytes(section[base + 16..base + 20].try_into().unwrap())
-                as usize;
-            let offset = u32::from_le_bytes(section[base + 20..base + 24].try_into().unwrap())
-                as usize;
+            let size =
+                u32::from_le_bytes(section[base + 16..base + 20].try_into().unwrap()) as usize;
+            let offset =
+                u32::from_le_bytes(section[base + 20..base + 24].try_into().unwrap()) as usize;
             let end = offset + size;
             if size > 0 && end <= section.len() {
                 return Ok(&section[offset..end]);
@@ -248,9 +244,7 @@ impl Xclbin {
 /// broken by a namespace or a comment.
 fn parse_kernel(xml: &[u8]) -> Result<Kernel, String> {
     let text = String::from_utf8_lossy(xml);
-    let start = text
-        .find("<kernel")
-        .ok_or("the metadata has no kernel")?;
+    let start = text.find("<kernel").ok_or("the metadata has no kernel")?;
     let tag_end = text[start..]
         .find('>')
         .map(|i| start + i + 1)

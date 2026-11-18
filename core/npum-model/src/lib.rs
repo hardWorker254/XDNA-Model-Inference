@@ -1,7 +1,7 @@
 //! The model graph, the operation dispatcher, and the trait a backend
 //! implements.
 //!
-//! # Where the Backend trait lives, and why it is here
+//! # Where the `Backend` trait lives, and why it is here
 //!
 //! The trait is in this crate and not in `backends/*`. A graph walks itself
 //! and calls a trait, and the trait has to be nameable from both sides: the
@@ -25,6 +25,25 @@
 //! the whole model in hand. A backend that discovered at the middle of a
 //! forward pass that it could not run the model would have done half the work
 //! first, and the user would see the failure after the wait.
+//!
+//! # Two arithmetic abstractions, and when to use which
+//!
+//! This crate exposes two seams on purpose:
+//!
+//! * [`Backend`] is the **tensor-oriented** execution contract
+//!   (`prepare`/`Plan` + tensor ops). Use it for backend implementations and
+//!   tensor/graph-driven execution paths where capabilities, planning, and
+//!   tensor shapes are part of the interface.
+//! * [`ops::Ops`] is the **slice-oriented** arithmetic seam for family/reference
+//!   forward passes that already work on flat buffers and explicit dimensions.
+//!   Use it to route GEMM/LayerNorm/GELU/softmax work to a host/device provider
+//!   without repacking activations into tensors per call, and to report truthful
+//!   placement/dispatch accounting.
+//!
+//! `array`, `caps`, and `dispatcher` support routing and capability decisions
+//! between these paths. Avoid creating parallel implementations of the same
+//! operation semantics across layers; prefer the seam that matches the caller's
+//! data shape and ownership model.
 
 pub mod array;
 pub mod caps;
@@ -62,10 +81,7 @@ pub enum Error {
     Unsupported { model: String, reason: String },
 
     #[error("operation {op} on a tensor of {dtype} is not implemented yet")]
-    NotImplemented {
-        op: &'static str,
-        dtype: String,
-    },
+    NotImplemented { op: &'static str, dtype: String },
 
     #[error(transparent)]
     Tensor(#[from] TensorError),
@@ -124,20 +140,13 @@ pub trait Backend {
     fn gelu(&mut self, x: &mut Tensor) -> Result<()>;
 
     /// Layer normalisation, in place.
-    fn layernorm(&mut self, x: &mut Tensor, gamma: &Tensor, beta: &Tensor, eps: f32)
-    -> Result<()>;
+    fn layernorm(&mut self, x: &mut Tensor, gamma: &Tensor, beta: &Tensor, eps: f32) -> Result<()>;
 
     /// Softmax, in place, along the last axis.
     fn softmax(&mut self, x: &mut Tensor) -> Result<()>;
 
     /// Scaled dot-product attention.
-    fn attention(
-        &mut self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        out: &mut Tensor,
-    ) -> Result<()>;
+    fn attention(&mut self, q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor) -> Result<()>;
 
     /// A one-dimensional convolution.
     fn conv1d(

@@ -47,7 +47,7 @@
 //! crop a whole pixel further out than the zoo does.
 
 use crate::hands_decode::{crop, resize_area, to_nchw_normalised, warp_affine};
-use crate::mppose::{DetOut, Geometry, MpPose, PoseOuts, Cost};
+use crate::mppose::{Cost, DetOut, Geometry, MpPose, PoseOuts};
 use crate::pose::Tensor;
 use crate::vit::format_g;
 use crate::vit_image::Image;
@@ -531,7 +531,12 @@ pub fn decode_det(
         if order.is_empty() {
             break;
         }
-        let bi = [bx[(i * 4) as usize], bx[(i * 4 + 1) as usize], bx[(i * 4 + 2) as usize], bx[(i * 4 + 3) as usize]];
+        let bi = [
+            bx[(i * 4) as usize],
+            bx[(i * 4 + 1) as usize],
+            bx[(i * 4 + 2) as usize],
+            bx[(i * 4 + 3) as usize],
+        ];
         let ai = (bi[2] - bi[0]) * (bi[3] - bi[1]);
         let mut rest = Vec::with_capacity(order.len());
         for j in &order {
@@ -593,8 +598,14 @@ pub fn pose_stage(img: &Image, g: &Geometry, det: &Detection) -> Result<PoseStag
     let dist = (body[0] - hip[0]).hypot(body[1] - hip[1]);
 
     // FIRST TRUNCATION. `np.array([hip - d, hip + d], np.int32)`.
-    let mut f0 = [trunc_i32(hip[0] - dist) as f64, trunc_i32(hip[1] - dist) as f64];
-    let mut f1 = [trunc_i32(hip[0] + dist) as f64, trunc_i32(hip[1] + dist) as f64];
+    let mut f0 = [
+        trunc_i32(hip[0] - dist) as f64,
+        trunc_i32(hip[1] - dist) as f64,
+    ];
+    let mut f1 = [
+        trunc_i32(hip[0] + dist) as f64,
+        trunc_i32(hip[1] + dist) as f64,
+    ];
     // Enlarged about its own centre BY THE TRUNCATED WIDTH, which is an integer
     // number of pixels rather than the float 2d.
     let ctr = [(f0[0] + f1[0]) * 0.5, (f0[1] + f1[1]) * 0.5];
@@ -631,13 +642,7 @@ pub fn pose_stage(img: &Image, g: &Geometry, det: &Detection) -> Result<PoseStag
             p0[0], p0[1], p1[0], p1[1], img.width, img.height
         ));
     }
-    let sub = crop(
-        img,
-        p0[0] as i64,
-        p0[1] as i64,
-        p1[0] as i64,
-        p1[1] as i64,
-    )?;
+    let sub = crop(img, p0[0] as i64, p0[1] as i64, p1[0] as i64, p1[1] as i64)?;
     // Pad back to the unclipped square, so the result is exactly f0..f1's extent --
     // which is what the rest of the geometry is measured against.
     let pad_left = (p0[0] - f0[0]) as i64;
@@ -661,7 +666,9 @@ pub fn pose_stage(img: &Image, g: &Geometry, det: &Detection) -> Result<PoseStag
     // (-pi, pi]. The wrap is not optional: without it the same angle near pi from
     // one atan2 branch and near 0 from the other differs by a full turn.
     let mut rad = std::f64::consts::FRAC_PI_2 - (-(by - hy)).atan2(bx - hx);
-    rad -= 2.0 * std::f64::consts::PI * ((rad + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)).floor();
+    rad -= 2.0
+        * std::f64::consts::PI
+        * ((rad + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)).floor();
     let angle = rad * 180.0 / std::f64::consts::PI;
 
     let mut rot_m = [0.0f64; 6];
@@ -760,11 +767,8 @@ pub fn postprocess(
         ]);
         // The world points take the ROTATION and not the translation: their origin
         // is the hip, in metres.
-        p.world.push([
-            w[0] * m00 + w[1] * m01,
-            w[0] * m10 + w[1] * m11,
-            w[2],
-        ]);
+        p.world
+            .push([w[0] * m00 + w[1] * m01, w[0] * m10 + w[1] * m11, w[2]]);
     }
 
     // The reported box is fitted to the LANDMARKS -- all thirty-nine, the six

@@ -129,11 +129,7 @@ impl Tensor {
                 len: data.len(),
             });
         }
-        Ok(Self {
-            dtype,
-            shape,
-            data,
-        })
+        Ok(Self { dtype, shape, data })
     }
 
     /// The dtype.
@@ -191,21 +187,15 @@ impl Tensor {
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
                 .collect(),
-            DType::I8 => self
-                .data
-                .iter()
-                .map(|b| (*b as i8) as f32)
-                .collect(),
+            DType::I8 => self.data.iter().map(|b| (*b as i8) as f32).collect(),
             DType::I64 => self
                 .data
                 .chunks_exact(8)
-                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+                .map(|c| {
+                    i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
+                })
                 .collect(),
-            DType::U16 | DType::U8 => self
-                .data
-                .iter()
-                .map(|b| *b as f32)
-                .collect(),
+            DType::U16 | DType::U8 => self.data.iter().map(|b| *b as f32).collect(),
         }
     }
 }

@@ -41,6 +41,7 @@ use npum_cpu::pose::Tensor;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::flags::Args;
 /// The 64 KiB the dump reserves for its header.
 const DUMP_HEADER: usize = 1 << 16;
 
@@ -113,11 +114,7 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&ArrayI
         Some(info) => {
             eprintln!(
                 "             {:<26} {:<5} {}",
-                format!(
-                    "{} x conv + {} x dwconv",
-                    g.det_dense(),
-                    g.det_depthwise()
-                ),
+                format!("{} x conv + {} x dwconv", g.det_dense(), g.det_depthwise()),
                 "npu",
                 format!(
                     "person detector, {} nodes, on the array's {} padded (K, N) slots; \
@@ -145,11 +142,7 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&ArrayI
         None => {
             eprintln!(
                 "             {:<26} {:<5} {}",
-                format!(
-                    "{} x conv + {} x dwconv",
-                    g.det_dense(),
-                    g.det_depthwise()
-                ),
+                format!("{} x conv + {} x dwconv", g.det_dense(), g.det_depthwise()),
                 "host",
                 format!(
                     "person detector, {} nodes; dwconv has no [M,N] GEMM to dispatch, so it \
@@ -276,7 +269,11 @@ pub fn print_crop(r: &Run) {
     eprintln!(
         "             crop: angle {:.4} deg, square {:.0}x{:.0}, pad_bias {:.1} {:.1}, crop \
          mean {:.4}",
-        r.angle_deg, r.rot_bbox[2], r.rot_bbox[3], r.crop_pad_bias[0], r.crop_pad_bias[1],
+        r.angle_deg,
+        r.rot_bbox[2],
+        r.rot_bbox[3],
+        r.crop_pad_bias[0],
+        r.crop_pad_bias[1],
         r.crop_mean
     );
 }
@@ -379,4 +376,204 @@ impl Dump {
 /// Open a container and hand back the networks, for the CLI's block.
 pub fn open(path: &Path) -> Result<MpPose, String> {
     MpPose::open(path)
+}
+
+pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some(model) = args.positional.first() else {
+        return crate::needs_a_model("mppose");
+    };
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: this is a MediaPipe Pose model, so say whose body to find:");
+        eprintln!("    npuimage mppose <model> <image.png> [more.png ...]");
+        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
+        eprintln!("  --max-people 1    run the landmark network on at most N detections");
+        eprintln!("  --text            a human summary instead of JSON");
+        eprintln!("  --mppose-dump FILE  every graph node's output, for the gate");
+        eprintln!(
+            "  (every threshold comes from the container, not from a flag: they are\n   \
+             part of the checkpoint -- see the refusal above)"
+        );
+        return crate::EXIT_REFUSED;
+    }
+    crate::families::with_model(model, npum_families::Family::MpPose, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::MpPose)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) =
+            crate::families::refuse_op_not_in_arch(args, npum_families::Family::MpPose)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        // The other architectures' own flags are REFUSED rather than ignored: they
+        // read as "thresholds for the detection" on a mode that also has a
+        // detector, and silently dropping them would produce a run whose people
+        // differ from the one that was asked for with nothing in the output
+        // saying so.
+        for f in [
+            "--conf",
+            "--iou",
+            "--kpt",
+            "--max-det",
+            "--pose",
+            "--pose-dump",
+            "--bo-mode",
+            "--max-hands",
+            "--hands-dump",
+        ] {
+            if args.value(f).is_some() || args.switch(f) {
+                eprintln!(
+                    "error: {f}: not a flag of `mppose`. The detector's score and NMS \
+                     thresholds and the landmark net's confidence threshold are read from the \
+                     container (score_threshold, nms_threshold, top_k, pose_conf_threshold, \
+                     person_box_pre_enlarge, person_box_enlarge), because they are part of how \
+                     this checkpoint was trained and the OpenCV zoo demo that recorded the \
+                     golden used the container's values, not a command line's. For --pose: use \
+                     `pose`, which is a different model with different flags. The three dumps \
+                     are separate because they record different graphs, and one reader cannot \
+                     read another's file."
+                );
+                return crate::EXIT_REFUSED;
+            }
+        }
+        // --max-people: a CAP on how many detections reach the second stage, not a
+        // score threshold. Every person is an independent rotated crop of the
+        // original frame, so there is no way to batch them and the only lever is
+        // how many to run.
+        let mut max_people = -1i64;
+        if let Some(v) = args.value("--max-people") {
+            match v.parse::<i64>() {
+                Ok(n) if (1..=10000).contains(&n) => max_people = n,
+                _ => {
+                    eprintln!(
+                        "error: --max-people '{v}': expected an integer in 1..10000, or omit \
+                         it to run the landmark network on every detection"
+                    );
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        let text = args.switch("--text");
+        let started = std::time::Instant::now();
+        let network = match crate::mppose::open(path) {
+            Ok(n) => n,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let setup_s = started.elapsed().as_secs_f64();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the DENSE convolutions go to the
+        // array and the depthwise ones stay on the host -- a depthwise
+        // filter reduces WITHIN one channel and has no [M, N] product in it
+        // at all. A container that cannot do it is refused HERE, before the
+        // first image, with the reason.
+        let mut array = if crate::ocr::wants_conv(args) {
+            let specs = npum_cpu::mppose::array_specs(network.geometry());
+            match crate::arrayconv::open(path, &specs, args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        let array_info = array.as_ref().map(|backend| crate::mppose::ArrayInfo {
+            streams: backend.stream_count(),
+            // THE DESIGN'S OWN PATH, or nothing at all: a container that
+            // carries its own set needs nothing beside it, and there is no
+            // path to print.
+            designs: args
+                .value("--artifacts")
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            rows: backend.rows_per_dispatch(),
+            // The panels the container carries, staged once, at load.
+            staged_bytes: backend.staged_bytes(),
+        });
+        crate::mppose::print_block(&name, network.geometry(), setup_s, array_info.as_ref());
+        let _ = arch;
+
+        let dump_path = args.value("--mppose-dump").map(std::path::PathBuf::from);
+        let mut dump = match dump_path.as_deref() {
+            Some(p) => match crate::mppose::Dump::create(p) {
+                Ok(d) => Some(d),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            },
+            None => None,
+        };
+        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
+            crate::mppose::print_dump_header(p, network.geometry());
+        }
+
+        let mut exit = 0;
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            let run = {
+                let mut hook = |net: &str, node: usize, t: &npum_cpu::pose::Tensor| {
+                    if let Some(d) = dump.as_mut() {
+                        d.record(net, node, t);
+                    }
+                };
+                npum_cpu::mppose_decode::detect(
+                    &network,
+                    &decoded,
+                    max_people,
+                    &mut hook,
+                    array.as_deref_mut(),
+                )
+            };
+            let run = match run {
+                Ok(r) => r,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_mut() {
+                d.image += 1;
+            }
+            crate::mppose::print_run(image, &run);
+            if text {
+                print!("{}", npum_cpu::mppose_decode::text_summary(image, &run));
+                continue;
+            }
+            crate::mppose::print_crop(&run);
+            print!("{}", npum_cpu::mppose_decode::result_json(&run, image));
+        }
+
+        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
+            match d.finish(p) {
+                Ok(n) => eprintln!("             {n} node tensors written"),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        exit
+    })
 }

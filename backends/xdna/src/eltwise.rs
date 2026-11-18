@@ -56,6 +56,8 @@ pub enum Kind {
     Softmax,
     /// The GELU: the activation, element by element.
     Gelu,
+    /// The RMSNorm: root mean square normalisation with a weight (no mean/beta).
+    RmsNorm,
 }
 
 impl Kind {
@@ -69,6 +71,7 @@ impl Kind {
             "layernorm" => Some(Kind::LayerNorm),
             "softmax" => Some(Kind::Softmax),
             "eltwise" | "gelu" => Some(Kind::Gelu),
+            "rmsnorm" => Some(Kind::RmsNorm),
             _ => None,
         }
     }
@@ -79,6 +82,7 @@ impl Kind {
             Kind::LayerNorm => "a LayerNorm",
             Kind::Softmax => "a softmax",
             Kind::Gelu => "a GELU",
+            Kind::RmsNorm => "an RMSNorm",
         }
     }
 }
@@ -117,13 +121,14 @@ impl<T: Transport> EltwiseDesign<T> {
     ///
     /// The design's own manifest says what it computes and how wide its
     /// rows are, and both are checked here: a design whose kind is not one
-    /// of the three is refused, and so is one with no width -- because a
-    /// pass with no width would read the buffer as one long row.
+    /// of the supported eltwise kinds is refused, and so is one with no
+    /// width -- because a pass with no width would read the buffer as one
+    /// long row.
     pub fn open(design: ArrayDesign<T>) -> Result<Self, ArrayError> {
         let info = design.info();
-        let kind = Kind::of(&info.kind).ok_or_else(|| {
+        let kind = Kind::of(&info.kind).or_else(|| Kind::of(&info.name)).ok_or_else(|| {
             ArrayError::Design(format!(
-                "{}: this design computes '{}', which is not a LayerNorm, a softmax or a GELU.",
+                "{}: this design computes '{}', which is not a LayerNorm, an RMSNorm, a softmax or a GELU.",
                 info.name, info.kind
             ))
         })?;
@@ -219,6 +224,52 @@ impl<T: Transport> EltwiseDesign<T> {
             None => {
                 let slot = self.design.stage(BUFFER_PARAMS, &bytes)?;
                 self.staged_params.push((params.to_vec(), slot));
+                slot
+            }
+        };
+        self.design.bind(BUFFER_PARAMS, slot)?;
+
+        let mut done = 0usize;
+        while done < n_rows {
+            let chunk = (n_rows - done).min(self.rows);
+            let n = chunk * self.cols;
+            self.fill(&x[done * self.cols..done * self.cols + n])?;
+            self.dispatch()?;
+            self.read_back(&mut x[done * self.cols..done * self.cols + n])?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    /// The RMSNorm, over `n_rows` rows.
+    ///
+    /// `weight` is the gain, f32 and `cols` values long.
+    pub fn rmsnorm(
+        &mut self,
+        weight: &[f32],
+        x: &mut [f32],
+        n_rows: usize,
+    ) -> Result<(), ArrayError> {
+        self.require(Kind::RmsNorm)?;
+        if weight.len() != self.cols {
+            return Err(ArrayError::Design(format!(
+                "{}: RMSNorm weight is {} floats, this design's row is {} wide and wants {}. The \
+                 model's hidden size is not the one this design was exported for.",
+                self.design.info().name,
+                weight.len(),
+                self.cols,
+                self.cols
+            )));
+        }
+        let mut bytes = Vec::with_capacity(weight.len() * 4);
+        for value in weight {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let slot = match self.staged_params.iter().find(|(p, _)| p == weight) {
+            Some((_, slot)) => *slot,
+            None => {
+                let slot = self.design.stage(BUFFER_PARAMS, &bytes)?;
+                self.staged_params.push((weight.to_vec(), slot));
                 slot
             }
         };
@@ -339,19 +390,30 @@ pub struct Eltwise<T: Transport> {
     layernorm: Option<EltwiseDesign<T>>,
     gelu: Option<EltwiseDesign<T>>,
     softmax: Option<EltwiseDesign<T>>,
+    rmsnorm: Option<EltwiseDesign<T>>,
 }
 
 impl<T: Transport> Eltwise<T> {
-    /// The three passes, each one optional.
+    /// The passes, each one optional.
     ///
-    /// The designs are checked here and not left to the call: a LayerNorm
-    /// design handed to the GELU's slot is a design that computes the
-    /// wrong thing, and it is better to refuse it at load than to
-    /// dispatch it and read back a plausible number.
+    /// The designs are checked here and not left to the call: a design
+    /// handed to the wrong slot is a design that computes the wrong thing,
+    /// and it is better to refuse it at load than to dispatch it and read
+    /// back a plausible number.
     pub fn new(
         layernorm: Option<EltwiseDesign<T>>,
         gelu: Option<EltwiseDesign<T>>,
         softmax: Option<EltwiseDesign<T>>,
+    ) -> Result<Self, ArrayError> {
+        Self::with_rmsnorm(layernorm, gelu, softmax, None)
+    }
+
+    /// The passes including RMSNorm, each one optional.
+    pub fn with_rmsnorm(
+        layernorm: Option<EltwiseDesign<T>>,
+        gelu: Option<EltwiseDesign<T>>,
+        softmax: Option<EltwiseDesign<T>>,
+        rmsnorm: Option<EltwiseDesign<T>>,
     ) -> Result<Self, ArrayError> {
         if let Some(d) = &layernorm {
             d.require(Kind::LayerNorm)?;
@@ -362,18 +424,23 @@ impl<T: Transport> Eltwise<T> {
         if let Some(d) = &softmax {
             d.require(Kind::Softmax)?;
         }
+        if let Some(d) = &rmsnorm {
+            d.require(Kind::RmsNorm)?;
+        }
         Ok(Self {
             layernorm,
             gelu,
             softmax,
+            rmsnorm,
         })
     }
 
-    /// How many dispatches the three passes have run between them.
+    /// How many dispatches the passes have run between them.
     pub fn dispatches(&self) -> usize {
         self.layernorm.as_ref().map_or(0, |d| d.dispatches())
             + self.gelu.as_ref().map_or(0, |d| d.dispatches())
             + self.softmax.as_ref().map_or(0, |d| d.dispatches())
+            + self.rmsnorm.as_ref().map_or(0, |d| d.dispatches())
     }
 }
 
@@ -383,6 +450,7 @@ impl<T: Transport> npum_model::array::ArrayEltwise for Eltwise<T> {
             npum_model::array::EltOp::LayerNorm => self.layernorm.is_some(),
             npum_model::array::EltOp::Gelu => self.gelu.is_some(),
             npum_model::array::EltOp::Softmax => self.softmax.is_some(),
+            npum_model::array::EltOp::RmsNorm => self.rmsnorm.is_some(),
         }
     }
 
@@ -394,6 +462,17 @@ impl<T: Transport> npum_model::array::ArrayEltwise for Eltwise<T> {
         })?;
         design
             .layernorm(params, x, n_rows)
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))
+    }
+
+    fn rmsnorm(&mut self, weight: &[f32], x: &mut [f32], n_rows: usize) -> SeamResult<()> {
+        let design = self.rmsnorm.as_mut().ok_or_else(|| {
+            npum_model::array::ArrayError(
+                "this run did not ask for RMSNorm to go on the array".to_string(),
+            )
+        })?;
+        design
+            .rmsnorm(weight, x, n_rows)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))
     }
 

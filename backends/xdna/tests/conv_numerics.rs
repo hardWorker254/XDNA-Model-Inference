@@ -34,12 +34,12 @@
 
 use std::path::PathBuf;
 
-use npum_format::tiling::{untile_b, TileOrder};
-use npum_xdna::array::ArrayDesign;
-use npum_xdna::conv::{conv, ConvShape};
-use npum_xdna::transport::Transport;
-use npum_xdna::transport::SelectedTransport as Board;
 use npum_format::Container;
+use npum_format::tiling::{TileOrder, untile_b};
+use npum_xdna::array::ArrayDesign;
+use npum_xdna::conv::{ConvShape, conv};
+use npum_xdna::transport::SelectedTransport as Board;
+use npum_xdna::transport::Transport;
 
 /// bf16 carries 8 significand bits, so one output rounding is at most half an
 /// ulp = 2^-9 relative. Anything beyond that is not a rounding artefact.
@@ -204,7 +204,10 @@ fn the_container_s_own_convolution_panel_goes_through_the_array() {
     );
 
     // THE PANEL DE-TILED, WITH ITS OWN RECORDED LAYOUT.
-    let layout = info.b_layout.as_ref().expect("the manifest records the B layout");
+    let layout = info
+        .b_layout
+        .as_ref()
+        .expect("the manifest records the B layout");
     let (tile_k, tile_n) = (layout.tile_k as usize, layout.tile_n as usize);
     let (s, t) = (layout.mac_s as usize, layout.mac_t as usize);
     let weights = untile_b(

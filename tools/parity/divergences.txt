@@ -74,3 +74,10 @@ http/embeddings: the same two fields, for the same two reasons, in the same
 http/wrong-family-labels: the same two fields, for the same two reasons, in
                            the banner. The 404 body itself -- the one that
                            names the right endpoint -- is byte-identical.
+
+error/unknown-model: the Rust runtime's "not installed / not known" refusal now
+                     also mentions the `weights/<family>/<model>/` layout as a
+                     valid location for a packed container (phase 10). The
+                     refusal is the same in kind and lists the same known
+                     models; only the hint about where a self-packed container
+                     can live is more accurate.

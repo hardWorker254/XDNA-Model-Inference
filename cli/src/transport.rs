@@ -12,6 +12,5 @@ pub type Transport = npum_xdna::transport::SelectedTransport;
 
 /// Open the board.
 pub fn open() -> Result<Transport, String> {
-    npum_xdna::transport::open_selected(0)
-        .map_err(|e| format!("cannot open the NPU board: {e}"))
+    npum_xdna::transport::open_selected(0).map_err(|e| format!("cannot open the NPU board: {e}"))
 }

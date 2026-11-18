@@ -29,14 +29,17 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_REPO = Path(__file__).resolve().parent.parent
+for _p in (str(_REPO), str(_REPO / "reference")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-import encoder_gte                                  # noqa: E402
-from encoder_gte import GteEncoder                  # noqa: E402
-from npz_io import load as load_goldens            # noqa: E402
-from onnx_io import MODEL_ONNX, load, model_digest               # noqa: E402
+from reference import encoder_gte                                  # noqa: E402
+from reference.encoder_gte import GteEncoder                  # noqa: E402
+from reference.npz_io import load as load_goldens            # noqa: E402
+from reference.onnx_io import MODEL_ONNX, load, model_digest               # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = _REPO
 
 # Set from a real run (tasks/0136), not guessed a priori: measured worst
 # valid-rows rel_fro on this corpus is 1.4e-6 at layer 12 (0134's per-layer

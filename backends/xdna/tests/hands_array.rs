@@ -44,17 +44,12 @@ fn container() -> Option<PathBuf> {
     }
     let home = std::env::var("HOME").ok()?;
     let p = PathBuf::from(home).join("xdna-fixtures/mediapipe-hands.npue");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.is_file() { Some(p) } else { None }
 }
 
 /// The image the front end reads.
 fn image() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/parity/fixtures/bus.jpg")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixtures/bus.jpg")
 }
 
 /// The measured width of the difference in a landmark, in pixels.
@@ -119,14 +114,8 @@ fn the_array_path_is_the_host_path_with_coarser_weights() {
     let mut backend =
         npum_xdna::array_convs::ArrayConvs::open(&path, design, &specs).expect("the backend");
     let mut noop = |_net: &str, _node: usize, _t: &npum_cpu::pose::Tensor| {};
-    let array = npum_cpu::hands_decode::detect(
-        &model,
-        &decoded,
-        -1,
-        &mut noop,
-        Some(&mut backend),
-    )
-    .expect("the array run failed");
+    let array = npum_cpu::hands_decode::detect(&model, &decoded, -1, &mut noop, Some(&mut backend))
+        .expect("the array run failed");
 
     // IT REALLY DISPATCHED.
     assert!(
@@ -151,7 +140,9 @@ fn the_array_path_is_the_host_path_with_coarser_weights() {
     for (h, a) in host.hands.iter().zip(array.hands.iter()) {
         worst_score = worst_score.max((h.presence - a.presence).abs());
         for (p, q) in h.landmarks.iter().zip(a.landmarks.iter()) {
-            worst_landmark = worst_landmark.max((p[0] - q[0]).abs()).max((p[1] - q[1]).abs());
+            worst_landmark = worst_landmark
+                .max((p[0] - q[0]).abs())
+                .max((p[1] - q[1]).abs());
         }
     }
     assert!(

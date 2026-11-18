@@ -135,9 +135,7 @@ impl Gpu {
                         .to_string_lossy()
                         .into_owned()
                 };
-                let mem_props = unsafe {
-                    instance.get_physical_device_memory_properties(pd)
-                };
+                let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
                 let mut gpu = Self {
                     _entry: entry,
                     instance,
@@ -268,8 +266,8 @@ impl Gpu {
             // with no such type cannot hold this backend's buffers, and that
             // is a refusal rather than a silent fallback to a type that
             // cannot be mapped.
-            let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE
-                | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let wanted =
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let index = (0..self.mem_props.memory_type_count).find(|i| {
                 let ty = self.mem_props.memory_types[*i as usize];
                 req.memory_type_bits & (1 << i) != 0 && ty.property_flags.contains(wanted)
@@ -323,11 +321,7 @@ impl Gpu {
                 .device
                 .map_memory(b.mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                 .map_err(|e| format!("cannot map a buffer: {e}"))?;
-            std::ptr::copy_nonoverlapping(
-                ptr as *const u8,
-                out.as_mut_ptr() as *mut u8,
-                len * 4,
-            );
+            std::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr() as *mut u8, len * 4);
             self.device.unmap_memory(b.mem);
         }
         Ok(out)
@@ -367,13 +361,12 @@ impl Gpu {
             let create = vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(self.pipeline_layout);
-            let made = self.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[create],
-                None,
-            );
+            let made =
+                self.device
+                    .create_compute_pipelines(vk::PipelineCache::null(), &[create], None);
             self.device.destroy_shader_module(module, None);
-            let pipeline = made.map_err(|(_, e)| format!("cannot create the {shader} pipeline: {e}"))?[0];
+            let pipeline =
+                made.map_err(|(_, e)| format!("cannot create the {shader} pipeline: {e}"))?[0];
             self.pipelines.insert(shader, pipeline);
             Ok(pipeline)
         }
@@ -394,10 +387,7 @@ impl Gpu {
         unsafe {
             let uniform = self.make(16)?;
             let words: [u32; 4] = params;
-            let bytes: &[u8] = std::slice::from_raw_parts(
-                words.as_ptr() as *const u8,
-                16,
-            );
+            let bytes: &[u8] = std::slice::from_raw_parts(words.as_ptr() as *const u8, 16);
             {
                 let ptr = self
                     .device
@@ -477,7 +467,8 @@ impl Gpu {
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .map_err(|e| format!("cannot begin the command buffer: {e}"))?;
-            self.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.device
+                .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.device.cmd_bind_descriptor_sets(
                 self.cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -486,16 +477,15 @@ impl Gpu {
                 &[set],
                 &[],
             );
-            self.device.cmd_dispatch(self.cmd, groups.0, groups.1, groups.2);
+            self.device
+                .cmd_dispatch(self.cmd, groups.0, groups.1, groups.2);
             // The next dispatch reads what this one wrote, so the writes have
             // to be available AND visible. Both masks are the compute stage:
             // the host reads the result only after the fence, and a
             // host-coherent buffer needs no separate invalidation.
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                );
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
             self.device.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -546,11 +536,7 @@ impl Gpu {
                 "gemm",
                 &[&ab, &bb, &cb],
                 [m as u32, k as u32, n as u32, 0],
-                (
-                    (n as u32).div_ceil(16),
-                    (m as u32).div_ceil(16),
-                    1,
-                ),
+                ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1),
             )
             .and_then(|()| self.read(&cb, m * n));
         self.free(&ab);
@@ -704,7 +690,8 @@ impl Drop for Gpu {
             self.free(&self.dummy);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(self.set_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);

@@ -46,16 +46,14 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
-
-from gemm_i8 import add_gemm_b_int8                              # noqa: E402
-from gemm_i4 import add_gemm_b_int4                              # noqa: E402
-from npue import (ARCH_WHISPER_ENC_DEC_GELU, MAC_BY_DEVICE,  # noqa: E402
-                  MAC_DEFAULT_DEVICE, Writer, gemm_b_layout, layout_hash,
-                  mac_for_device, tile_b, to_bf16_bits)
+from tools.lib.gemm_i8 import add_gemm_b_int8                              # noqa: E402
+from tools.lib.gemm_i4 import add_gemm_b_int4                              # noqa: E402
+from tools.lib.npue import (ARCH_WHISPER_ENC_DEC_GELU, MAC_BY_DEVICE,  # noqa: E402
+                             MAC_DEFAULT_DEVICE, Writer, gemm_b_layout, layout_hash,
+                             mac_for_device, tile_b, to_bf16_bits)
 from npue_tools.weights import (WHISPER_DECODER_ONNX,  # noqa: E402
                                 WHISPER_ENCODER_ONNX, open_model)
-from whisper_bpe import VocabMerges, build_table                      # noqa: E402
+from tools.lib.whisper_bpe import VocabMerges, build_table                      # noqa: E402
 
 # Only s and t of the MAC geometry affect the B operand's byte order, and both
 # production datapaths (plain bf16 and bfp16-emulated) give the same pair on a
@@ -389,7 +387,7 @@ def _ffn(w, st, ck_prefix, name_prefix, hidden, inter, mac=MAC_DEFAULT,
 def _embed(w, model_name, datapath, npue_args, where):
     if npue_args is None or getattr(npue_args, "no_embed_artifacts", False):
         return None
-    from design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
+    from tools.lib.design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
     import os
     explicit = getattr(npue_args, "embed_artifacts", None)
     # FOUR levels up, not three: this file is <root>/tools/pack/packers/<x>.py,

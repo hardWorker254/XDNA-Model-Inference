@@ -41,18 +41,16 @@ import numpy as np
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-# tools/lib, not tools: npue.py (and golden_slug with it) lives there. This
-# line said `tools`, so `from npue import golden_slug` raised
-# ModuleNotFoundError and the file had not run since npue.py moved -- found
-# while converting the goldens' container.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools" / "lib"))
+_REPO = Path(__file__).resolve().parent.parent
+for _p in (str(_REPO), str(_REPO / "reference"), str(_REPO / "tools" / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from corpus import SENTENCES, SEQ_LEN as DEFAULT_SEQ_LEN   # noqa: E402
-from npue import golden_slug                   # noqa: E402
-from npz_io import save                        # noqa: E402
+from reference.corpus import SENTENCES, SEQ_LEN as DEFAULT_SEQ_LEN   # noqa: E402
+from tools.lib.npue import golden_slug                   # noqa: E402
+from reference.npz_io import save                        # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = _REPO
 GOLDENS = REPO / "reference" / "goldens"
 
 # The naming rule lives in tools/lib/npue.py, imported by every reader of these

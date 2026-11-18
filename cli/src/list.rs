@@ -35,7 +35,7 @@
 //! `kind` is the container's own claim and the packer writes it, so this
 //! cannot drift from the file the way a list in the binary would.
 
-use npum_families::catalogue::{catalogue, CatalogueEntry};
+use npum_families::catalogue::{CatalogueEntry, catalogue};
 use npum_format::Container;
 use std::path::{Path, PathBuf};
 
@@ -132,7 +132,10 @@ pub fn discover(root: &Path) -> Vec<Installed> {
                 entry.pooling = config.get_str("pooling").unwrap_or("n/a").to_string();
                 entry.layers = config.get_i64("n_layers").unwrap_or(0);
                 entry.hidden = config.get_i64("hidden_size").unwrap_or(0);
-                entry.gemm_layout = config.get_str("gemm_layout").unwrap_or_default().to_string();
+                entry.gemm_layout = config
+                    .get_str("gemm_layout")
+                    .unwrap_or_default()
+                    .to_string();
                 entry.repo = config
                     .get_str("source_repo")
                     .or_else(|| config.get_str("repo"))
@@ -356,9 +359,7 @@ pub fn render(root: &Path, binary: &str) -> String {
     let mut out = String::new();
 
     out.push_str(&format!("\nModels (root {})\n\n", root.display()));
-    out.push_str(
-        "  model                state     layers hidden  pooling      size  notes\n",
-    );
+    out.push_str("  model                state     layers hidden  pooling      size  notes\n");
 
     for entry in catalogue() {
         let m = installed.iter().find(|m| m.name == entry.name);

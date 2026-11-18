@@ -26,6 +26,7 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+use crate::flags::Args;
 /// The speech family's geometry, as the container states it.
 pub struct Geometry {
     /// The container's name.
@@ -178,11 +179,23 @@ fn code_for_stream(op: &str) -> &'static str {
 /// The rows are the C++'s, in the C++'s order, with the C++'s widths: a
 /// row is a name, a place and a reason, and the reason is what makes the
 /// row worth reading.
-pub fn print_block(g: &Geometry, designs: &Path, encoder: Option<&Design>, decoder: Option<&Design>) {
+pub fn print_block(
+    g: &Geometry,
+    designs: &Path,
+    encoder: Option<&Design>,
+    decoder: Option<&Design>,
+) {
     eprintln!("NpuEmbeddings -- Whisper speech to text on the AMD NPU");
     eprintln!(
         "  model      {}: d_model {}, {}+{} layers, {} heads x {}, {} mel bins, vocab {}",
-        g.model_name, g.d_model, g.enc_layers, g.dec_layers, g.heads, g.head_dim, g.mel_bins, g.vocab
+        g.model_name,
+        g.d_model,
+        g.enc_layers,
+        g.dec_layers,
+        g.heads,
+        g.head_dim,
+        g.mel_bins,
+        g.vocab
     );
     eprintln!("  designs    {}", designs.display());
     let datapath = encoder.map(|d| format!("{} MMAC, C as {}", d.datapath, d.c_type));
@@ -211,9 +224,7 @@ pub fn print_block(g: &Geometry, designs: &Path, encoder: Option<&Design>, decod
     row(
         &format!("encoder GEMMs, {} layers", g.enc_layers),
         "host",
-        &format!(
-            "{enc_ops}, M={enc_rows} rows; --npu-ops gemm sends them to the array"
-        ),
+        &format!("{enc_ops}, M={enc_rows} rows; --npu-ops gemm sends them to the array"),
     );
     let dec_ops = decoder.map(|d| d.gemm_ops.join(", ")).unwrap_or_default();
     let tiers = decoder
@@ -228,9 +239,7 @@ pub fn print_block(g: &Geometry, designs: &Path, encoder: Option<&Design>, decod
     row(
         &format!("decoder GEMMs, {} layers", g.dec_layers),
         "host",
-        &format!(
-            "{dec_ops}, M={tiers} rows per tier; --npu-ops gemm sends them to the array"
-        ),
+        &format!("{dec_ops}, M={tiers} rows per tier; --npu-ops gemm sends them to the array"),
     );
     row(
         "layer_norm",
@@ -262,7 +271,10 @@ pub fn print_block(g: &Geometry, designs: &Path, encoder: Option<&Design>, decod
     row(
         "logits + argmax",
         "host",
-        &format!("tied embedding, {} x {} on the last row only", g.vocab, g.d_model),
+        &format!(
+            "tied embedding, {} x {} on the last row only",
+            g.vocab, g.d_model
+        ),
     );
     row(
         "decode + merge",
@@ -338,7 +350,9 @@ pub fn check_context_budget(args: &crate::flags::Args) -> bool {
     if npum_xdna::contention::require_context_budget(&report, 2, allow_contention) {
         return true;
     }
-    eprintln!("error: NPU context budget: refusing to load 2 concurrent hw_context(s) -- see the report above (close the other process, or pass --allow-contention)");
+    eprintln!(
+        "error: NPU context budget: refusing to load 2 concurrent hw_context(s) -- see the report above (close the other process, or pass --allow-contention)"
+    );
     false
 }
 
@@ -419,8 +433,11 @@ pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> 
         );
         return crate::EXIT_REFUSED;
     };
-    let designs = find_designs(root, &geometry.model_name)
-        .unwrap_or_else(|| root.join("runtime").join("artifacts").join(&geometry.model_name));
+    let designs = find_designs(root, &geometry.model_name).unwrap_or_else(|| {
+        root.join("runtime")
+            .join("artifacts")
+            .join(&geometry.model_name)
+    });
     let encoder_design = read_design(&designs, false);
     let decoder_design = read_design(&designs, true);
 
@@ -485,7 +502,12 @@ pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> 
     };
     let setup_s = started.elapsed().as_secs_f64();
 
-    print_block(&geometry, &designs, encoder_design.as_ref(), decoder_design.as_ref());
+    print_block(
+        &geometry,
+        &designs,
+        encoder_design.as_ref(),
+        decoder_design.as_ref(),
+    );
 
     let options = options_from(args);
     print_schedule(setup_s, &options, args.value("--language").is_some());
@@ -559,4 +581,34 @@ fn tensor_f32(container: &npum_format::Container, name: &str) -> Result<Vec<f32>
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some((model, audio)) = args.positional.first().zip(args.positional.get(1)) else {
+        return crate::needs_a_model("transcribe");
+    };
+    crate::families::with_model(model, npum_families::Family::Stt, root, |path, arch| {
+        if !Path::new(audio).exists() {
+            eprintln!("error: the audio file {audio} does not exist.");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Stt) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) =
+            crate::families::refuse_op_not_in_arch(args, npum_families::Family::Stt)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) =
+            crate::families::refuse_array_not_ported(npum_families::Family::Stt, args, &[])
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        let _ = arch;
+        crate::stt::run(path, audio, args, root)
+    })
 }

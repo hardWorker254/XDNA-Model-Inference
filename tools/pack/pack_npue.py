@@ -34,24 +34,25 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
-# The repository root, for `npue_tools` -- the package the plan puts the
-# weight sources in (phase 3). It is last on this list on purpose: the flat
-# `sys.path` modules below are what the packers import by bare name, and a
-# package that shadowed one of them would break every arch at once.
-sys.path.insert(0, str(REPO / "tools" / "lib"))
-sys.path.insert(0, str(REPO / "reference"))
-sys.path.append(str(REPO))
+# Phase 2: prefer package-style imports via repo root. Keep tools/lib and
+# reference on sys.path for flat-name modules still used inside lib/reference.
+_root = str(REPO)
+_lib = str(REPO / "tools" / "lib")
+_ref = str(REPO / "reference")
+for _p in (_root, _lib, _ref):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # gemm_b_layout was factored into npue.py so the descriptor has ONE definition
 # (its docstring records two copies drifting apart). The import was never added
 # here, so pack_npue.py has not run since that refactor -- the shipped .npue
 # predates it and nothing repacked. Found while adding the vocabulary, 0036.
-from design_embed import (GEMM_SET, embed_design_sets,  # noqa: E402
-                          find_design_dir)
-from npue import (ARCH_GEMMA3_MQA_ROPE_GEGLU, ARCH_GTE_NEW_ROPE_GEGLU,  # noqa: E402
-                  ARCH_NOMIC_ROPE_SWIGLU, MAC_BY_DEVICE, MAC_DEFAULT_DEVICE,
-                  Writer, gemm_b_layout, layout_hash, mac_for_device, tile_b,
-                  to_bf16_bits)
+from tools.lib.design_embed import (GEMM_SET, embed_design_sets,  # noqa: E402
+                                    find_design_dir)
+from tools.lib.npue import (ARCH_GEMMA3_MQA_ROPE_GEGLU, ARCH_GTE_NEW_ROPE_GEGLU,  # noqa: E402
+                            ARCH_NOMIC_ROPE_SWIGLU, MAC_BY_DEVICE, MAC_DEFAULT_DEVICE,
+                            Writer, gemm_b_layout, layout_hash, mac_for_device, tile_b,
+                            to_bf16_bits)
 from npue_tools.weights import (EMBEDDINGGEMMA_RENAME,  # noqa: E402
                                 EMBEDDINGGEMMA_STRIP, open_model)
 from xlmr_tokenizer_table import write_table as write_xlmr_table  # noqa: E402
@@ -226,8 +227,6 @@ def calibrate_smoothing(model_dir, alpha=0.5, n_texts=128, max_len=64,
     a late layer's outlier range drove the embedding to nonsense (measured at
     1-cos 0.39-0.52 before this was found, tasks/0078 section 4b).
     """
-    import sys as _sys
-    _sys.path.insert(0, str(REPO / "reference"))
     # THE ORACLE MUST MATCH THE ARCHITECTURE, or the statistics describe a
     # model the array will never see (tasks/0081). arch=2 has RoPE instead of
     # absolute positions and a gated SwiGLU whose ffn_up is 2*intermediate
@@ -245,13 +244,13 @@ def calibrate_smoothing(model_dir, alpha=0.5, n_texts=128, max_len=64,
     # gte would silently need nomic's five-site list, and the site counter below
     # is what says so.
     if arch == "nomic":
-        from encoder_nomic import load_reference, fp32_gemm       # noqa: E402
+        from reference.encoder_nomic import load_reference, fp32_gemm       # noqa: E402
     elif arch == "gemma":
-        from encoder_gemma import load_reference, fp32_gemm        # noqa: E402
+        from reference.encoder_gemma import load_reference, fp32_gemm        # noqa: E402
     elif arch == "gte":
-        from encoder_gte import load_reference, fp32_gemm         # noqa: E402
+        from reference.encoder_gte import load_reference, fp32_gemm         # noqa: E402
     else:
-        from encoder import load_reference, fp32_gemm             # noqa: E402
+        from reference.encoder import load_reference, fp32_gemm             # noqa: E402
     from transformers import AutoTokenizer                       # noqa: E402
 
     # The default calibration corpus. It lives in tools/data/ beside the other

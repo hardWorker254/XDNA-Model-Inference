@@ -1,4 +1,17 @@
-//! The CPU backend: the accuracy reference.
+//! The CPU backend: kernels, ops, and reference execution paths.
+//!
+//! # Responsibility boundaries
+//!
+//! This crate currently contains two closely related but distinct layers:
+//!
+//! * **Arithmetic/backend core:** low-level kernels and `Backend`/`Ops`
+//!   implementations (`kernels`, `ops`, [`CpuBackend`]). This is the CPU
+//!   reference numerics surface other backends are compared against.
+//! * **Reference pipelines and frontends:** family/model execution paths and
+//!   decode/session/input-preprocessing helpers (`pipelines`, `frontend`).
+//!
+//! The module layout makes this separation explicit. Public module paths are
+//! preserved for compatibility (e.g. `npum_cpu::bert`, `npum_cpu::vit_image`).
 //!
 //! # Why this backend exists at all
 //!
@@ -34,30 +47,23 @@
 //!   library's semantics are the hardware's. The ties rule matters:
 //!   round-half-to-even and round-half-away differ on every exact .5.
 
-pub mod bert;
-pub mod hands;
-pub mod hands_decode;
+pub mod frontend;
 pub mod kernels;
-pub mod mppose;
-pub mod mppose_decode;
-pub mod ocr;
-pub mod ocr_decode;
-pub mod ocr_session;
 pub mod ops;
-pub mod pose;
-pub mod pose_decode;
-pub mod vit;
-pub mod vit_image;
-pub mod whisper;
-pub mod whisper_features;
-pub mod whisper_session;
-pub mod whisper_tokenizer;
+pub mod pipelines;
 
-use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
+// Backward-compatible module paths.
+pub use frontend::{vit_image, whisper_features};
+pub use pipelines::{
+    bert, gte, hands, hands_decode, mppose, mppose_decode, ocr, ocr_decode, ocr_session, pose,
+    pose_decode, vit, whisper, whisper_session, whisper_tokenizer,
+};
+
 use npum_model::caps::Precision as CapsPrecision;
+use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 
 pub use bert::BertModel;
-
+pub use gte::GteModel;
 pub use kernels::{gelu_f32, layernorm_row, softmax_row};
 
 /// The CPU backend.
@@ -99,7 +105,10 @@ impl Backend for CpuBackend {
     }
 
     fn prepare(&mut self, spec: &ModelSpec) -> Result<Plan> {
-        self.plan.note = format!("the CPU backend runs {} layers of {}", spec.layers, spec.arch_name);
+        self.plan.note = format!(
+            "the CPU backend runs {} layers of {}",
+            spec.layers, spec.arch_name
+        );
         Ok(self.plan.clone())
     }
 

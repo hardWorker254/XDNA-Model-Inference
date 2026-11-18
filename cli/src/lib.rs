@@ -50,8 +50,8 @@ pub mod stt;
 pub mod transport;
 pub mod vit;
 
-use flags::{parse, Args, ParseError};
-use npum_families::registry::{owns, refuse_other_family, refuse_subcommand, ROSTER};
+use flags::{Args, ParseError, parse};
+use npum_families::registry::{ROSTER, owns, refuse_other_family, refuse_subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -200,7 +200,7 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
     match verb {
         "list" => list::print_list(&root, binary),
         "serve" => run_serve(binary, &args, argv, &root),
-        "embed" => families::embed(&args, &root),
+        "embed" => embed::command(&args, &root),
         "add" => families::add(&args),
         "tokenize" => families::tokenize(&args, &root),
         "transcribe" => families::transcribe(&args, &root),
@@ -263,10 +263,7 @@ fn run_serve(binary: &'static str, args: &Args, argv: &[String], root: &PathBuf)
         .map(|p| p as u16)
         .or(port)
         .unwrap_or(8080);
-    let bind = args
-        .value("--bind")
-        .map(|s| s.to_string())
-        .unwrap_or(bind);
+    let bind = args.value("--bind").map(|s| s.to_string()).unwrap_or(bind);
     serve::serve(binary, model, port, &bind, root, args)
 }
 

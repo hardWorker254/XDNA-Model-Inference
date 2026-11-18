@@ -105,12 +105,9 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "..", "lib"))
-
-import conv_quant                                            # noqa: E402
-from npue import (ARCH_MEDIAPIPE_POSE_DET_SSD_LM_REGRESS,  # noqa: E402
-                  Writer)
+from tools.lib import conv_quant                                            # noqa: E402
+from tools.lib.npue import (ARCH_MEDIAPIPE_POSE_DET_SSD_LM_REGRESS,  # noqa: E402
+                             Writer)
 
 ARCH_STRING = "mediapipe_pose_det_ssd_lm_regress"
 
@@ -1000,7 +997,7 @@ def mac_split(t, conv_of):
 def _embed(w, model_name, datapath, npue_args, where):
     if npue_args is None or getattr(npue_args, "no_embed_artifacts", False):
         return None
-    from design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
+    from tools.lib.design_embed import (GEMM_SET, embed_design_sets, find_design_dir)
     import os
     explicit = getattr(npue_args, "embed_artifacts", None)
     # FOUR levels up, not three: this file is <root>/tools/pack/packers/<x>.py,

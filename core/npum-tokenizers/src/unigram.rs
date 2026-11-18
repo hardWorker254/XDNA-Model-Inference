@@ -17,7 +17,7 @@
 //! sentencepiece uses to mark a word boundary) and that marker is part of
 //! the piece's identity, not decoration.
 
-use crate::tables::{XlmrTables, XLM_R};
+use crate::tables::{XLM_R, XlmrTables};
 use crate::{Encoding, Error, Result, Tokenizer};
 use std::collections::HashMap;
 

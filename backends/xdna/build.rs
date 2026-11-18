@@ -53,9 +53,7 @@ fn main() {
         return;
     }
     let lib_dir = root.join("lib");
-    if !lib_dir.join("libxrt_coreutil.so").exists()
-        && !lib_dir.join("libxrt_coreutil.a").exists()
-    {
+    if !lib_dir.join("libxrt_coreutil.so").exists() && !lib_dir.join("libxrt_coreutil.a").exists() {
         println!(
             "cargo:warning=XRT at {} has no libxrt_coreutil; the array path \
              will report that it has no transport.",
@@ -125,11 +123,12 @@ fn xrt_root() -> Option<PathBuf> {
             if path.is_dir() {
                 return Some(path);
             }
-            println!("cargo:warning={name} points at {}, which is not a directory", path.display());
+            println!(
+                "cargo:warning={name} points at {}, which is not a directory",
+                path.display()
+            );
         }
     }
     candidates.push(PathBuf::from("/opt/xilinx/xrt"));
     candidates.into_iter().find(|p| p.is_dir())
 }
-
-

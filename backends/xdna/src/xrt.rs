@@ -34,7 +34,7 @@
 //! `new` and Rust frees with the matching close, and nothing is allocated on
 //! one side and freed on the other.
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 
 use crate::transport::{BufferFlags, Run, Transport, TransportError};
 
@@ -77,18 +77,8 @@ unsafe extern "C" {
         group: i32,
         out_bo: *mut *mut c_void,
     ) -> i32;
-    fn shim_bo_write(
-        bo: *mut c_void,
-        data: *const c_void,
-        bytes: u64,
-        offset: u64,
-    ) -> i32;
-    fn shim_bo_read(
-        bo: *mut c_void,
-        data: *mut c_void,
-        bytes: u64,
-        offset: u64,
-    ) -> i32;
+    fn shim_bo_write(bo: *mut c_void, data: *const c_void, bytes: u64, offset: u64) -> i32;
+    fn shim_bo_read(bo: *mut c_void, data: *mut c_void, bytes: u64, offset: u64) -> i32;
     fn shim_bo_sync(bo: *mut c_void, to_device: i32, bytes: u64, offset: u64) -> i32;
     fn shim_bo_size(bo: *mut c_void) -> u64;
     fn shim_bo_free(bo: *mut c_void);
@@ -223,12 +213,7 @@ impl Transport for XrtTransport {
         {
             let mut context: *mut c_void = std::ptr::null_mut();
             let rc = unsafe {
-                shim_context_open(
-                    self.device,
-                    xclbin.as_ptr(),
-                    xclbin.len(),
-                    &mut context,
-                )
+                shim_context_open(self.device, xclbin.as_ptr(), xclbin.len(), &mut context)
             };
             if rc != 0 {
                 return Err(last_error());
@@ -292,9 +277,7 @@ impl Transport for XrtTransport {
                 BufferFlags::HostOnly => SHIM_BO_HOST_ONLY,
             };
             let mut bo: *mut c_void = std::ptr::null_mut();
-            let rc = unsafe {
-                shim_bo_alloc(self.device, bytes, shim_flags, group, &mut bo)
-            };
+            let rc = unsafe { shim_bo_alloc(self.device, bytes, shim_flags, group, &mut bo) };
             if rc != 0 {
                 return Err(last_error());
             }
@@ -360,11 +343,7 @@ impl Transport for XrtTransport {
         }
     }
 
-    fn sync_to_device(
-        bo: &Self::Buffer,
-        bytes: u64,
-        offset: u64,
-    ) -> Result<(), TransportError> {
+    fn sync_to_device(bo: &Self::Buffer, bytes: u64, offset: u64) -> Result<(), TransportError> {
         #[cfg(not(all(feature = "xrt", xrt_shim)))]
         {
             let _ = (bo, bytes, offset);
@@ -380,11 +359,7 @@ impl Transport for XrtTransport {
         }
     }
 
-    fn sync_from_device(
-        bo: &Self::Buffer,
-        bytes: u64,
-        offset: u64,
-    ) -> Result<(), TransportError> {
+    fn sync_from_device(bo: &Self::Buffer, bytes: u64, offset: u64) -> Result<(), TransportError> {
         #[cfg(not(all(feature = "xrt", xrt_shim)))]
         {
             let _ = (bo, bytes, offset);

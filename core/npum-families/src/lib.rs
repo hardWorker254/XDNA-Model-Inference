@@ -84,9 +84,7 @@ impl Family {
         match self {
             Family::Embed => "npuembeddings",
             Family::Stt => "npuaudio",
-            Family::Cls | Family::Pose | Family::Hands | Family::MpPose | Family::Ocr => {
-                "npuimage"
-            }
+            Family::Cls | Family::Pose | Family::Hands | Family::MpPose | Family::Ocr => "npuimage",
         }
     }
 
@@ -122,9 +120,7 @@ impl Family {
     pub fn not_ported_reason(self) -> Option<&'static str> {
         match self {
             Family::Embed => None,
-            Family::Stt => {
-                Some("the mel front end, the encoder and the autoregressive decoder")
-            }
+            Family::Stt => Some("the mel front end, the encoder and the autoregressive decoder"),
             Family::Cls => {
                 Some("the image front end, the patch embedding and the classification head")
             }

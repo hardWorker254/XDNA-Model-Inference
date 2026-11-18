@@ -33,15 +33,18 @@ import numpy as np
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_REPO = Path(__file__).resolve().parent.parent
+for _p in (str(_REPO), str(_REPO / "reference"), str(_REPO / "tools" / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from corpus_gemma import SENTENCES, SEQ_LEN as DEFAULT_SEQ_LEN  # noqa: E402
-from encoder_gemma import PROMPTS               # noqa: E402
-from npz_io import save, load as load_goldens    # noqa: E402
-from onnx_io import (EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP,  # noqa: E402
-                     MODEL_ONNX, load, model_digest)
+from reference.corpus_gemma import SENTENCES, SEQ_LEN as DEFAULT_SEQ_LEN  # noqa: E402
+from reference.encoder_gemma import PROMPTS               # noqa: E402
+from reference.npz_io import save, load as load_goldens    # noqa: E402
+from reference.onnx_io import (EMBEDDINGGEMMA_RENAME, EMBEDDINGGEMMA_STRIP,  # noqa: E402
+                               MODEL_ONNX, load, model_digest)
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = _REPO
 GOLDENS = REPO / "reference" / "goldens_gemma"
 
 

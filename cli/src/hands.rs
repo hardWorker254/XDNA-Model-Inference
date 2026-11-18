@@ -35,6 +35,7 @@ use npum_cpu::pose::Tensor;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::flags::Args;
 /// The 64 KiB the dump reserves for its header.
 const DUMP_HEADER: usize = 1 << 16;
 
@@ -352,4 +353,200 @@ impl Dump {
 /// Open a container and hand back the networks, for the CLI's block.
 pub fn open(path: &Path) -> Result<Hands, String> {
     Hands::open(path)
+}
+
+pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some(model) = args.positional.first() else {
+        return crate::needs_a_model("hands");
+    };
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: this is a hands model, so say whose hands to find:");
+        eprintln!("    npuimage hands <model> <image.png> [more.png ...]");
+        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
+        eprintln!("  --max-hands 1     run the second stage on at most N detections");
+        eprintln!("  --text            a human summary instead of JSON");
+        eprintln!("  --hands-dump FILE every graph node's output, for the gate");
+        eprintln!(
+            "  (the score and NMS thresholds come from the container, not from a\n   \
+             flag: they are part of the checkpoint -- see the refusal above)"
+        );
+        return crate::EXIT_REFUSED;
+    }
+    crate::families::with_model(model, npum_families::Family::Hands, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Hands) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) =
+            crate::families::refuse_op_not_in_arch(args, npum_families::Family::Hands)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        // pose's own flags are REFUSED rather than ignored: they read as
+        // "thresholds for the detection" on a mode that also has a detector,
+        // and silently dropping them would produce a run whose boxes differ
+        // from the one that was asked for with nothing in the output saying so.
+        for f in [
+            "--conf",
+            "--iou",
+            "--kpt",
+            "--max-det",
+            "--pose",
+            "--pose-dump",
+            "--bo-mode",
+        ] {
+            if args.value(f).is_some() || args.switch(f) {
+                eprintln!(
+                    "error: {f}: not a flag of `hands`. The score, NMS and crop \
+                     thresholds are read from the container (score_threshold, \
+                     nms_threshold, the two enlarge factors and the two shifts), \
+                     because they are part of how this checkpoint was trained and the \
+                     OpenCV zoo demo that recorded the golden used the container's \
+                     values, not a command line's. For --pose: use `pose`, which is a \
+                     different model with different flags. The two dumps are separate \
+                     because they record different graphs, and one reader cannot read \
+                     the other's file."
+                );
+                return crate::EXIT_REFUSED;
+            }
+        }
+        // --max-hands: a CAP on how many detections reach the second stage, not
+        // a score threshold. Every hand is an independent crop of the original
+        // frame, so the only lever is how many to run. A cap of 0 is a typo and
+        // a cap of -1 is the session's own "all of them".
+        let mut max_hands = -1i64;
+        if let Some(v) = args.value("--max-hands") {
+            match v.parse::<i64>() {
+                Ok(n) if (1..=10000).contains(&n) => max_hands = n,
+                _ => {
+                    eprintln!(
+                        "error: --max-hands '{v}': expected an integer in 1..10000, or \
+                         omit it to run the second stage on every detection"
+                    );
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        let text = args.switch("--text");
+        let started = std::time::Instant::now();
+        let network = match crate::hands::open(path) {
+            Ok(n) => n,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let setup_s = started.elapsed().as_secs_f64();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the DENSE convolutions go to the
+        // array and the depthwise ones stay on the host -- a depthwise
+        // filter reduces WITHIN one channel and has no [M, N] product in it
+        // at all. A container that cannot do it is refused HERE, before the
+        // first image, with the reason.
+        let mut array = if crate::ocr::wants_conv(args) {
+            let specs = npum_cpu::hands::array_specs(network.geometry());
+            match crate::arrayconv::open(path, &specs, args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        let array_info = array.as_ref().map(|backend| crate::hands::ArrayInfo {
+            streams: backend.stream_count(),
+            // THE DESIGN'S OWN PATH, or nothing at all: a container that
+            // carries its own set needs nothing beside it, and there is no
+            // path to print.
+            designs: args
+                .value("--artifacts")
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            rows: backend.rows_per_dispatch(),
+            // The panels the container carries, staged once, at load.
+            staged_bytes: backend.staged_bytes(),
+        });
+        crate::hands::print_block(&name, network.geometry(), setup_s, array_info.as_ref());
+        let _ = arch;
+
+        let dump_path = args.value("--hands-dump").map(std::path::PathBuf::from);
+        let mut dump = match dump_path.as_deref() {
+            Some(p) => match crate::hands::Dump::create(p) {
+                Ok(d) => Some(d),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            },
+            None => None,
+        };
+        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
+            crate::hands::print_dump_header(p, network.geometry());
+        }
+
+        let mut exit = 0;
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            let run = {
+                let mut hook = |net: &str, node: usize, t: &npum_cpu::pose::Tensor| {
+                    if let Some(d) = dump.as_mut() {
+                        d.record(net, node, t);
+                    }
+                };
+                npum_cpu::hands_decode::detect(
+                    &network,
+                    &decoded,
+                    max_hands,
+                    &mut hook,
+                    array.as_deref_mut(),
+                )
+            };
+            let run = match run {
+                Ok(r) => r,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_mut() {
+                d.image += 1;
+            }
+            crate::hands::print_run(image, &run);
+            if text {
+                print!("{}", npum_cpu::hands_decode::text_summary(image, &run));
+                continue;
+            }
+            crate::hands::print_crop(&run);
+            print!("{}", npum_cpu::hands_decode::result_json(&run, image));
+        }
+
+        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
+            match d.finish(p) {
+                Ok(n) => eprintln!("             {n} node tensors written"),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        exit
+    })
 }

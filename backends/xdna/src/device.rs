@@ -38,7 +38,10 @@ pub enum DeviceError {
     },
 
     #[error("--dev {requested} but the device is {found}")]
-    GenerationMismatch { requested: Generation, found: Generation },
+    GenerationMismatch {
+        requested: Generation,
+        found: Generation,
+    },
 
     #[error("{0} is not a generation this build knows")]
     UnknownGeneration(String),
@@ -109,10 +112,7 @@ impl Device {
 
         if let Some(requested) = override_generation {
             if found != requested {
-                return Err(DeviceError::GenerationMismatch {
-                    requested,
-                    found,
-                });
+                return Err(DeviceError::GenerationMismatch { requested, found });
             }
         }
 

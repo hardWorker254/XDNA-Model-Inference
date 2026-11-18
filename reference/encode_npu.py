@@ -59,24 +59,30 @@ from ml_dtypes import bfloat16
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(REPO / "tools"))
-sys.path.insert(0, str(REPO / "experiments" / "m5-pretiled-gemm"))
-sys.path.insert(0, str(REPO / "experiments" / "m5-eltwise"))
+for _p in (
+    str(REPO),
+    str(REPO / "reference"),
+    str(REPO / "tools"),
+    str(REPO / "tools" / "lib"),
+    str(REPO / "experiments" / "m5-pretiled-gemm"),
+    str(REPO / "experiments" / "m5-eltwise"),
+):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import aie.iron as iron                                   # noqa: E402
 from aie.iron import str_to_dtype                         # noqa: E402
 from aie.iron.device import from_name                     # noqa: E402
 
-from encoder import MiniLMReference, fp32_gemm            # noqa: E402
+from reference.encoder import MiniLMReference, fp32_gemm            # noqa: E402
 from gemm_pretiled import pretiled_array                  # noqa: E402
 from gelu_kernel import TILE as GELU_TILE, gelu_array     # noqa: E402
 from layernorm_kernel import (COLS as LN_COLS,            # noqa: E402
                               ROWS_PER_CALL as LN_ROWS, ln_array)
 from softmax_kernel import (COLS as SM_COLS,              # noqa: E402
                             ROWS_PER_CALL as SM_ROWS, sm_array)
-from npue import Reader                                   # noqa: E402
-from npz_io import load                                   # noqa: E402
+from tools.lib.npue import Reader                                   # noqa: E402
+from reference.npz_io import load                                   # noqa: E402
 
 
 class NpuGemm:

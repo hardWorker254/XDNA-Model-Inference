@@ -37,7 +37,7 @@
 //! the tokenizer the embeddings were produced with, and only a test that
 //! compares every id could have caught it.
 
-use crate::tables::{BertTables, BERT};
+use crate::tables::{BERT, BertTables};
 use crate::{Encoding, Error, Result, Tokenizer};
 use std::collections::HashMap;
 

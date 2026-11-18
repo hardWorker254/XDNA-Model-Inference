@@ -26,18 +26,17 @@
 import sys
 from pathlib import Path
 
-# Self-contained: make_goldens.py used to insert tools/ (not tools/lib) and
-# then failed on `from npue import golden_slug` with ModuleNotFoundError, so
-# the file had not run since npue.py moved. A module that fixes its own path
-# cannot regress that way again.
-_LIB = Path(__file__).resolve().parent.parent / "tools" / "lib"
-if str(_LIB) not in sys.path:
-    sys.path.insert(0, str(_LIB))
+# Self-contained bootstrap (phase 2): prefer package imports via repo root,
+# keep tools/lib for flat-name imports inside tools.lib modules.
+_REPO = Path(__file__).resolve().parent.parent
+for _p in (str(_REPO), str(_REPO / "tools" / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from onnx_weights import (EMBEDDINGGEMMA_RENAME,             # noqa: E402
-                          EMBEDDINGGEMMA_STRIP, MODEL_ONNX,
-                          WHISPER_DECODER_ONNX, WHISPER_ENCODER_ONNX,
-                          OnnxWeights, model_digest, sha256_file)
+from tools.lib.onnx_weights import (EMBEDDINGGEMMA_RENAME,             # noqa: E402
+                                    EMBEDDINGGEMMA_STRIP, MODEL_ONNX,
+                                    WHISPER_DECODER_ONNX, WHISPER_ENCODER_ONNX,
+                                    OnnxWeights, model_digest, sha256_file)
 
 __all__ = ["EMBEDDINGGEMMA_RENAME", "EMBEDDINGGEMMA_STRIP", "MODEL_ONNX",
            "WHISPER_ENCODER_ONNX", "WHISPER_DECODER_ONNX",

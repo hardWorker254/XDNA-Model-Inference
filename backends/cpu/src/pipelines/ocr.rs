@@ -576,7 +576,12 @@ fn need_f64(container: &Container, key: &str, label: &str) -> Result<f64, Refusa
         .ok_or_else(|| format!("{label}: '{key}' is not in the container"))
 }
 
-fn need_doubles(container: &Container, key: &str, want: usize, label: &str) -> Result<Vec<f64>, Refusal> {
+fn need_doubles(
+    container: &Container,
+    key: &str,
+    want: usize,
+    label: &str,
+) -> Result<Vec<f64>, Refusal> {
     let value = container
         .config()
         .get(key)
@@ -655,19 +660,16 @@ fn jpair(node: &Value, key: &str, label: &str) -> Result<[i64; 2], Refusal> {
 }
 
 fn jpad4(node: &Value, label: &str) -> Result<[i64; 4], Refusal> {
-    let value = node
-        .get("pad")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            format!(
-                "{label}: 'pad' is not four terms [top, left, bottom, right]. It is \
+    let value = node.get("pad").and_then(|v| v.as_array()).ok_or_else(|| {
+        format!(
+            "{label}: 'pad' is not four terms [top, left, bottom, right]. It is \
                  four and not two because the v5 detector spells two of its stem \
                  convolutions SAME_UPPER, which puts the extra row and column at the \
                  END -- a symmetric transcription of that is a 479-wide map where the \
                  checkpoint has a 480-wide one, and the stem's two branches then \
                  cannot be joined."
-            )
-        })?;
+        )
+    })?;
     if value.len() != 4 {
         return Err(format!(
             "{label}: 'pad' is not four terms [top, left, bottom, right]."
@@ -834,14 +836,13 @@ fn read_conv(
                 } else {
                     1
                 } as usize;
-                let group_scales = f32s(container, &format!("{base}.gscale"), label).map_err(
-                    |_| {
+                let group_scales =
+                    f32s(container, &format!("{base}.gscale"), label).map_err(|_| {
                         format!(
                             "{label}: {base}.gscale is not in the container, and {base}.w says \
                              its weights are i4 with a group of {i4_group}."
                         )
-                    },
-                )?;
+                    })?;
                 if group_scales.len() != g * n {
                     return Err(format!(
                         "{label}: {base}.gscale is for {} groups and the filter needs {}.",
@@ -863,9 +864,12 @@ fn read_conv(
                         if v >= 8 {
                             v -= 16;
                         }
-                        let gsel = if i4_group > 0 { col / i4_group as usize } else { 0 };
-                        w[row * k + col] =
-                            v as f32 * scales[row] * group_scales[gsel * n + row];
+                        let gsel = if i4_group > 0 {
+                            col / i4_group as usize
+                        } else {
+                            0
+                        };
+                        w[row * k + col] = v as f32 * scales[row] * group_scales[gsel * n + row];
                     }
                 }
             }
@@ -973,10 +977,7 @@ fn read_one_graph(
                 l.stride = jpair(o, "stride", &nl)?;
                 if let Some(dil) = o.get("dilation").and_then(|v| v.as_array()) {
                     if dil.len() == 2 {
-                        l.dilation = [
-                            dil[0].as_i64().unwrap_or(1),
-                            dil[1].as_i64().unwrap_or(1),
-                        ];
+                        l.dilation = [dil[0].as_i64().unwrap_or(1), dil[1].as_i64().unwrap_or(1)];
                     }
                 }
                 if let Some(group) = o.get("group").and_then(|v| v.as_i64()) {
@@ -984,10 +985,7 @@ fn read_one_graph(
                 }
                 if let Some(op) = o.get("outpad").and_then(|v| v.as_array()) {
                     if op.len() == 2 {
-                        l.outpad = [
-                            op[0].as_i64().unwrap_or(0),
-                            op[1].as_i64().unwrap_or(0),
-                        ];
+                        l.outpad = [op[0].as_i64().unwrap_or(0), op[1].as_i64().unwrap_or(0)];
                     }
                 }
                 l.w = jopt_str(o, "w", "");
@@ -1203,10 +1201,7 @@ pub fn read_geometry(container: &Container, label: &str) -> Result<Geometry, Ref
     g.det_unclip_ratio = need_f64(container, "det_unclip_ratio", label)?;
     g.det_max_candidates = need_i64(container, "det_max_candidates", label)?;
     g.det_min_size = need_i64(container, "det_min_size", label)?;
-    if g.det_thresh < 0.0
-        || g.det_thresh > 1.0
-        || g.det_box_thresh < 0.0
-        || g.det_box_thresh > 1.0
+    if g.det_thresh < 0.0 || g.det_thresh > 1.0 || g.det_box_thresh < 0.0 || g.det_box_thresh > 1.0
     {
         return Err(format!(
             "{label}: the detector's thresholds are {} and {}, and a threshold outside 0..1 is \
@@ -2128,7 +2123,14 @@ impl Network {
             Some(array) => {
                 let t = std::time::Instant::now();
                 array
-                    .conv(&l.w, &self.a, m as usize, k as usize, n as usize, &mut self.c)
+                    .conv(
+                        &l.w,
+                        &self.a,
+                        m as usize,
+                        k as usize,
+                        n as usize,
+                        &mut self.c,
+                    )
                     .map_err(|e| format!("{nl}: {e}"))?;
                 self.cost.t_array += t.elapsed().as_secs_f64();
                 self.cost.convs_array += 1;
@@ -2257,10 +2259,8 @@ impl Network {
                                         if sx < 0 || sx >= width {
                                             continue;
                                         }
-                                        acc = wf[(i * kw + j) as usize].mul_add(
-                                            src[(sy * width + sx) as usize],
-                                            acc,
-                                        );
+                                        acc = wf[(i * kw + j) as usize]
+                                            .mul_add(src[(sy * width + sx) as usize], acc);
                                     }
                                 }
                                 dst[(y * ow + x) as usize] = match l.act {
@@ -2320,10 +2320,8 @@ impl Network {
                             if sx < 0 || sx >= width {
                                 continue;
                             }
-                            acc = wf[(i * kw + j) as usize].mul_add(
-                                src[(sy * width + sx) as usize],
-                                acc,
-                            );
+                            acc = wf[(i * kw + j) as usize]
+                                .mul_add(src[(sy * width + sx) as usize], acc);
                         }
                     }
                     dst[(y * ow + x) as usize] = match l.act {
@@ -2345,7 +2343,10 @@ impl Network {
         nl: &str,
     ) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
-            return Err(format!("{nl}: convtranspose reads a rank-{} tensor.", input.rank()));
+            return Err(format!(
+                "{nl}: convtranspose reads a rank-{} tensor.",
+                input.rank()
+            ));
         }
         let h = input.shape[2];
         let width = input.shape[3];
@@ -2395,8 +2396,7 @@ impl Network {
                         for co in 0..w.cout as usize {
                             let mut acc = 0.0f32;
                             for ci in 0..w.cin as usize {
-                                acc += pixel[ci]
-                                    * w.w[(ci * cout + co) * khkw + tap(i, j)];
+                                acc += pixel[ci] * w.w[(ci * cout + co) * khkw + tap(i, j)];
                             }
                             out.chw_mut(co as i64)[(oy * ow + ox) as usize] += acc;
                         }
@@ -2507,7 +2507,10 @@ impl Network {
 
     fn pool(&mut self, input: &Tensor, l: &Layer, nl: &str) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
-            return Err(format!("{nl}: pooling reads a rank-{} tensor.", input.rank()));
+            return Err(format!(
+                "{nl}: pooling reads a rank-{} tensor.",
+                input.rank()
+            ));
         }
         let h = input.shape[2];
         let width = input.shape[3];
@@ -2610,7 +2613,10 @@ impl Network {
     /// same number the packer used, and the source index comes out of the two.
     fn resize(&mut self, input: &Tensor, l: &Layer, nl: &str) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
-            return Err(format!("{nl}: resize reads a rank-{} tensor.", input.rank()));
+            return Err(format!(
+                "{nl}: resize reads a rank-{} tensor.",
+                input.rank()
+            ));
         }
         let channels = input.shape[1];
         let h = input.shape[2];
@@ -2625,7 +2631,13 @@ impl Network {
             .map(|d| if oh > 0 { ((d * h) / oh).min(h - 1) } else { 0 })
             .collect();
         let xs: Vec<i64> = (0..ow)
-            .map(|d| if ow > 0 { ((d * width) / ow).min(width - 1) } else { 0 })
+            .map(|d| {
+                if ow > 0 {
+                    ((d * width) / ow).min(width - 1)
+                } else {
+                    0
+                }
+            })
             .collect();
         let t0 = std::time::Instant::now();
         for c in 0..channels {
@@ -2899,8 +2911,16 @@ impl Network {
         let nb = ab.max(bb);
         let mut batch = vec![1i64; nb];
         for i in 0..nb {
-            let av = if i < nb - ab { 1 } else { ashape[i - (nb - ab)] };
-            let bv = if i < nb - bb { 1 } else { bshape[i - (nb - bb)] };
+            let av = if i < nb - ab {
+                1
+            } else {
+                ashape[i - (nb - ab)]
+            };
+            let bv = if i < nb - bb {
+                1
+            } else {
+                bshape[i - (nb - bb)]
+            };
             if av != bv && av != 1 && bv != 1 {
                 return Err(format!(
                     "{nl}: matmul's batch axes do not broadcast: {} and {}.",

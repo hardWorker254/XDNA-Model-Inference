@@ -40,11 +40,7 @@ use crate::Family;
 ///
 /// `None` when the architecture has every code, and when there is
 /// nothing to refuse: an empty listing asks for nothing.
-pub fn refuse_op_not_in_arch(
-    family: Family,
-    listing: &str,
-    codes: &[&str],
-) -> Option<String> {
+pub fn refuse_op_not_in_arch(family: Family, listing: &str, codes: &[&str]) -> Option<String> {
     if codes.is_empty() {
         return None;
     }

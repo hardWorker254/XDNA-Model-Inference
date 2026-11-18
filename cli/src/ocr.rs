@@ -33,6 +33,7 @@ use npum_cpu::ocr::Tensor;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::flags::Args;
 /// The 1 MiB the dump reserves for its header.
 ///
 /// 1 MiB and not 64 KiB: the detector has 154 nodes and the recogniser 334,
@@ -41,7 +42,12 @@ use std::path::Path;
 pub const DUMP_HEADER: usize = 1 << 20;
 
 /// The block, printed to stderr before the first image.
-pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&dyn npum_model::array::ArrayConvs>) {
+pub fn print_block(
+    name: &str,
+    g: &Geometry,
+    setup_s: f64,
+    array: Option<&dyn npum_model::array::ArrayConvs>,
+) {
     eprintln!("NpuEmbeddings -- ocr (PaddleOCR text det + rec) on the CPU");
     eprintln!(
         "  model      {}: detector {}px, recogniser {}x{}, {} classes over {} characters",
@@ -88,7 +94,10 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&dyn np
     );
     eprintln!(
         "             {:<26} {:<5} {}",
-        format!("{} x convtranspose", g.det_transposed() + g.rec_transposed()),
+        format!(
+            "{} x convtranspose",
+            g.det_transposed() + g.rec_transposed()
+        ),
         "host",
         "the DB head's two upsampling convolutions: a sum of SHIFTED contributions, not a GEMM"
     );
@@ -193,12 +202,8 @@ pub struct Dump {
 impl Dump {
     /// Open the dump file and reserve the header.
     pub fn create(path: &Path) -> Result<Dump, String> {
-        let mut file = std::fs::File::create(path).map_err(|_| {
-            format!(
-                "--ocr-dump {}: cannot open it for writing",
-                path.display()
-            )
-        })?;
+        let mut file = std::fs::File::create(path)
+            .map_err(|_| format!("--ocr-dump {}: cannot open it for writing", path.display()))?;
         file.write_all(&vec![b' '; DUMP_HEADER])
             .map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Dump {
@@ -300,4 +305,195 @@ pub fn open_array(
 ) -> Result<Box<dyn npum_model::array::ArrayConvs>, String> {
     let specs = npum_cpu::ocr::array_specs(geometry);
     crate::arrayconv::open(path, &specs, args, root)
+}
+
+pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some(model) = args.positional.first() else {
+        return crate::needs_a_model("ocr");
+    };
+    let images: Vec<&String> = args.positional.iter().skip(1).collect();
+    if images.is_empty() {
+        eprintln!("error: this is an OCR model, so say what to read:");
+        eprintln!("    npuimage ocr <model> <image.png> [more.png ...]");
+        eprintln!("  (PNG and JPEG; anything else is refused rather than guessed at)");
+        eprintln!("  --max-boxes 1      read at most N boxes");
+        eprintln!("  --text             a human summary instead of JSON");
+        eprintln!("  --ocr-dump FILE    every graph node's output, for the gate");
+        eprintln!(
+            "  (every threshold comes from the container, not from a flag: they are\n   \
+             part of the checkpoint -- see the refusal above)"
+        );
+        return crate::EXIT_REFUSED;
+    }
+    crate::families::with_model(model, npum_families::Family::Ocr, root, |path, arch| {
+        if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Ocr) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) =
+            crate::families::refuse_op_not_in_arch(args, npum_families::Family::Ocr)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        // The other architectures' own flags are REFUSED rather than ignored: they
+        // read as "thresholds for the detection" on a mode that also has a detector,
+        // and silently dropping them would produce a run whose boxes differ from the
+        // one that was asked for with nothing in the output saying so.
+        for f in [
+            "--conf",
+            "--iou",
+            "--kpt",
+            "--max-det",
+            "--pose",
+            "--pose-dump",
+            "--bo-mode",
+            "--max-hands",
+            "--hands-dump",
+            "--max-people",
+            "--mppose-dump",
+        ] {
+            if args.value(f).is_some() || args.switch(f) {
+                eprintln!(
+                    "error: {f}: not a flag of `ocr`. The detector's thresholds and the \
+                     recogniser's are read from the container (det_thresh, det_box_thresh, \
+                     det_unclip_ratio, det_max_candidates, det_min_size), because they are \
+                     part of how this checkpoint was trained and the demo that recorded the \
+                     golden used the container's values, not a command line's. For --pose: use \
+                     `pose`, which is a different model with different flags; for \
+                     --max-people: use `mppose`, whose second stage is a landmark network \
+                     and not a recogniser. The dumps are separate because they record \
+                     different graphs, and one reader cannot read another's file."
+                );
+                return crate::EXIT_REFUSED;
+            }
+        }
+        // --max-boxes: a CAP on how many boxes reach the recogniser, not a score
+        // threshold. Every box is an independent crop of the original frame, so there
+        // is no way to batch them and the only lever is how many to read.
+        let mut max_boxes = -1i64;
+        if let Some(v) = args.value("--max-boxes") {
+            match v.parse::<i64>() {
+                Ok(n) if (1..=10000).contains(&n) => max_boxes = n,
+                _ => {
+                    eprintln!(
+                        "error: --max-boxes '{v}': expected an integer in 1..10000, or omit it \
+                         to read every box the detector found"
+                    );
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        let text = args.switch("--text");
+        let started = std::time::Instant::now();
+        let mut session = match crate::ocr::open(path) {
+            Ok(s) => s,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        // THE ARRAY, OR THE HOST.
+        //
+        // The flag is a question about where the run happens, and it is
+        // answered here and nowhere else: the convolutions go to the array,
+        // the depthwise and the transposed ones stay on the host, and the
+        // run says how many it dispatched.
+        let array = if crate::ocr::wants_conv(args) {
+            match crate::ocr::open_array(path, session.geometry(), args, root) {
+                Ok(backend) => Some(backend),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        } else {
+            None
+        };
+        session.set_array(array);
+        let setup_s = started.elapsed().as_secs_f64();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| arch.to_string());
+        let geometry = session.geometry().clone();
+        crate::ocr::print_block(&name, &geometry, setup_s, session.array());
+        let _ = arch;
+
+        let dump_path = args.value("--ocr-dump").map(std::path::PathBuf::from);
+        let mut dump = match dump_path.as_deref() {
+            Some(p) => match crate::ocr::Dump::create(p) {
+                Ok(d) => Some(d),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            },
+            None => None,
+        };
+        if let (Some(p), Some(_)) = (dump_path.as_deref(), dump.as_ref()) {
+            crate::ocr::print_dump_header(p, &geometry);
+        }
+
+        let mut exit = 0;
+        for image in images {
+            let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
+                Ok(d) => d,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            let run = {
+                let mut hook = |net: &str, node: i64, t: &npum_cpu::ocr::Tensor| {
+                    if let Some(d) = dump.as_mut() {
+                        d.record(net, node, t);
+                    }
+                };
+                session.read(&decoded, max_boxes, &mut hook)
+            };
+            let run = match run {
+                Ok(r) => r,
+                Err(reason) => {
+                    eprintln!("  {image}: {reason}");
+                    exit = 1;
+                    continue;
+                }
+            };
+            if let Some(d) = dump.as_mut() {
+                d.image += 1;
+            }
+            crate::ocr::print_run(image, &run);
+            crate::ocr::print_split(
+                session.det_cost(),
+                session.rec_cost(),
+                geometry.det_depthwise(),
+                geometry.det_transposed(),
+                // The recogniser's counters accumulate over EVERY box, so the
+                // split reports the multiplication the oracle's does: the
+                // recogniser runs once per box, and its 24 dense and 14
+                // depthwise convolutions are counted once per crop.
+                geometry.rec_depthwise() * run.boxes_read,
+                geometry.rec_transposed() * run.boxes_read,
+                session.array(),
+            );
+            if text {
+                print!("{}", npum_cpu::ocr_decode::text_summary(image, &run));
+                continue;
+            }
+            print!("{}", npum_cpu::ocr_decode::result_json(&run, image));
+        }
+
+        if let (Some(p), Some(d)) = (dump_path.as_deref(), dump) {
+            match d.finish(p) {
+                Ok(n) => eprintln!("             {n} node tensors written"),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
+        exit
+    })
 }

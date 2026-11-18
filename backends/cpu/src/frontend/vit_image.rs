@@ -295,8 +295,8 @@ pub fn decode_image_bytes(bytes: &[u8], name: &str) -> Result<Image, String> {
 
 /// Decode an image file.
 pub fn decode_image(path: &std::path::Path) -> Result<Image, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|_| format!("cannot open image file {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|_| format!("cannot open image file {}", path.display()))?;
     decode_image_bytes(&bytes, &path.display().to_string())
 }
 

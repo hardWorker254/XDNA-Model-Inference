@@ -40,10 +40,7 @@ impl ModelSpec {
             path: path.to_path_buf(),
             source,
         })?;
-        let arch_name = container
-            .config_str("arch")
-            .unwrap_or_default()
-            .to_string();
+        let arch_name = container.config_str("arch").unwrap_or_default().to_string();
         let arch = container.header().arch;
         let layers = container
             .config()

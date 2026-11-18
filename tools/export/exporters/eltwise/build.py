@@ -100,12 +100,21 @@ def export_arch(out_dir: Path, arch: str, batch: int, hidden: int = 384,
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["IRON_CACHE_DIR"] = str(cache_dir)
 
+    # The LayerNorm branch rewrites `ln_variant` for cache/symbol naming when a
+    # row count selects an il4_* implementation. Preserve the caller's intent so
+    # sibling designs (e.g. RMSNorm) can map base/il4/rne/il4_rne correctly even
+    # when both are exported in one call.
+    ln_variant_intent = ln_variant
+
     # `ops is not None`, not `ops`: an EMPTY set is a request for nothing and is
     # refused below, while an omitted argument keeps this function's historical
     # "all three" default. `if ops` would have quietly turned the first into the
     # second.
     want = set(npu_ops.OPS) if ops is None else set(ops)
-    unknown = want - set(npu_ops.OPS)
+    # Experimental eltwise designs buildable by this exporter but not (yet)
+    # part of the formal --npu-ops registry.
+    allowed_extra = {"silu", "rmsnorm"}
+    unknown = want - set(npu_ops.OPS) - allowed_extra
     if unknown:
         raise SystemExit(
             f"eltwise: unknown op(s) {sorted(unknown)}; valid codes: "
@@ -142,15 +151,15 @@ def export_arch(out_dir: Path, arch: str, batch: int, hidden: int = 384,
     # the one model that needed the design most. Each refusal below names the
     # divisor it wanted and the two flags that move it.
     n_cores = 4 * n_cols
-    if "gelu" in want:
+    if "gelu" in want or "silu" in want:
         if n_gelu % gelu_tile:
             raise SystemExit(
-                f"eltwise: {n_gelu} GELU elements are not a multiple of the "
+                f"eltwise: {n_gelu} GELU/SiLU elements are not a multiple of the "
                 f"{gelu_tile}-element tile. Re-export with a --batch/--seq/"
                 f"--hidden whose product is.")
         if (n_gelu // gelu_tile) % n_cores:
             raise SystemExit(
-                f"eltwise: {n_gelu // gelu_tile} GELU tiles do not spread over "
+                f"eltwise: {n_gelu // gelu_tile} GELU/SiLU tiles do not spread over "
                 f"{n_cores} cores. Re-export with a larger --batch/--seq, or a "
                 f"smaller --elt-cols.")
     if "softm" in want and sm_cols is None and \
@@ -195,6 +204,31 @@ def export_arch(out_dir: Path, arch: str, batch: int, hidden: int = 384,
           "hidden": hidden, "seq": seq, "batch": batch,
           "aie_cols": n_cols, "tile": gelu_tile, "variant": gelu_variant}))
 
+    # -- SiLU ----------------------------------------------------------------
+    if "silu" in want:
+      silu_variant = "base"
+      syms = arr.silu_symbols
+      if silu_variant == "rne":
+        syms = arr.silu_rne_symbols
+      if gelu_tile not in syms:
+        raise SystemExit(
+            f"eltwise: SiLU has no {gelu_tile}-element tile; it has {sorted(syms)}")
+      silu_sym = syms[gelu_tile]
+      purge(cache_dir, [silu_sym], n_gelu, f"silu@b{batch}")
+      X = arr.iron.zeros(n_gelu, dtype=bfloat16, device="npu")
+      Y = arr.iron.zeros(n_gelu, dtype=bfloat16, device="npu")
+      arr.silu_array(X, Y, n_elem=n_gelu, n_cols=n_cols, tile=gelu_tile,
+                     variant=silu_variant)
+      src = find_cache(cache_dir, [silu_sym], n_gelu, n_cols, f"silu@b{batch}")
+      metas.append(_write_dir(out_dir / "silu", src, {
+          "name": "silu", "kind": "eltwise", "kernel": "MLIR_AIE",
+          "arch": int(arch), "device": device,
+          "a_dtype": "bf16", "c_dtype": "bf16",
+          "buffers": [n_gelu * 2, n_gelu * 2],
+          "rows": n_gelu, "row_capacity": 1, "cols": n_gelu,
+          "hidden": hidden, "seq": seq, "batch": batch,
+          "aie_cols": n_cols, "tile": gelu_tile, "variant": silu_variant}))
+
     # -- LayerNorm -----------------------------------------------------------
     if "layn" in want:
       # The width is the MODEL's d_model, not this build's 384, and the epsilon
@@ -238,6 +272,56 @@ def export_arch(out_dir: Path, arch: str, batch: int, hidden: int = 384,
           "rows_per_call": rpc,
           "hidden": hidden, "seq": seq,
           "batch": batch, "variant": ln_variant, "aie_cols": n_cols}))
+
+    # -- RMSNorm -------------------------------------------------------------
+    if "rmsnorm" in want:
+      rcols = hidden if ln_cols is None else ln_cols
+      if rcols % 16:
+        raise SystemExit(
+            f"eltwise: an RMSNorm row of {rcols} columns is not a multiple of "
+            f"16, and the kernel reduces a row in 16-wide vectors.")
+      rpc = ln_rows_per_call(rcols)
+      if ln_rows % (rpc * 4 * n_cols):
+        raise SystemExit(
+            f"eltwise: {ln_rows} RMSNorm rows do not split into {rpc}-row "
+            f"blocks over {4 * n_cols} cores (a {rcols}-column row needs {rpc} "
+            f"rows per call).")
+      has_il4 = "il4" in ln_variant_intent
+      has_rne = "rne" in ln_variant_intent
+      if has_il4 and has_rne:
+        rn_variant = "il4_rne"
+      elif has_il4:
+        rn_variant = "il4"
+      elif has_rne:
+        rn_variant = "rne"
+      else:
+        rn_variant = "base"
+      if rn_variant not in arr.rms_symbols:
+        raise SystemExit(
+            f"eltwise: RMSNorm has no {rn_variant!r} variant; it has "
+            f"{sorted(arr.rms_symbols)}. Pass a supported --ln-variant "
+            f"(base, il4, rne, il4_rne).")
+      rn_sym, _srcname, _stack = arr.rms_symbols[rn_variant]
+      # symbol identity in cache is by name+size
+      n_elem_r = ln_rows * rcols
+      purge(cache_dir, [rn_sym], n_elem_r, f"rmsnorm@b{batch}")
+      X = arr.iron.zeros(n_elem_r, dtype=bfloat16, device="npu")
+      W = arr.iron.zeros(rcols, dtype=np.float32, device="npu")
+      Y = arr.iron.zeros(n_elem_r, dtype=bfloat16, device="npu")
+      arr.rms_array(X, W, Y, rows=ln_rows, n_cols=n_cols, variant=rn_variant,
+                    cols=rcols, eps=ln_eps, rows_per_call=rpc)
+      src = find_cache(cache_dir, [rn_sym], n_elem_r, n_cols,
+                       f"rmsnorm@b{batch}")
+      metas.append(_write_dir(out_dir / "rmsnorm", src, {
+          "name": "rmsnorm", "kind": "rmsnorm", "kernel": "MLIR_AIE",
+          "arch": int(arch), "device": device,
+          "a_dtype": "bf16", "c_dtype": "bf16",
+          "buffers": [n_elem_r * 2, rcols * 4, n_elem_r * 2],
+          "rows": ln_rows, "cols": rcols, "eps": ln_eps,
+          "row_capacity": ln_rows, "rms_norm_eps": ln_eps,
+          "rows_per_call": rpc,
+          "hidden": hidden, "seq": seq,
+          "batch": batch, "variant": rn_variant, "aie_cols": n_cols}))
 
     # -- softmax -------------------------------------------------------------
     if "softm" in want:

@@ -231,8 +231,7 @@ impl DesignInfo {
         let path = dir.join("design.json");
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        serde_json::from_str(&text)
-            .map_err(|e| format!("cannot parse {}: {e}", path.display()))
+        serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))
     }
 
     /// The instruction streams, in slot order: slot 0 first, then the rest.

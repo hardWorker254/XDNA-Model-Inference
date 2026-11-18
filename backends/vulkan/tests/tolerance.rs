@@ -49,7 +49,11 @@ impl Lcg {
 /// The worst relative error, with an absolute floor so a zero is not a
 /// division by zero.
 fn worst(gpu: &[f32], host: &[f32]) -> f32 {
-    assert_eq!(gpu.len(), host.len(), "the two answers have different sizes");
+    assert_eq!(
+        gpu.len(),
+        host.len(),
+        "the two answers have different sizes"
+    );
     gpu.iter()
         .zip(host)
         .map(|(g, h)| (g - h).abs() / h.abs().max(1e-3))

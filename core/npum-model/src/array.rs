@@ -120,7 +120,7 @@ pub type ArrayAttentionRef<'a, 'b> = Option<&'a mut (dyn ArrayAttention + 'b)>;
 /// The two lifetimes are separate for the same reason the others are.
 pub type ArrayTextRef<'a, 'b> = Option<&'a mut (dyn ArrayText + 'b)>;
 
-/// Which of the three elementwise passes a question is about.
+/// Which elementwise pass a question is about.
 ///
 /// The passes are separate designs and separate programs, so a run can put
 /// one of them on the array and leave the others on the host -- and the
@@ -133,6 +133,8 @@ pub enum EltOp {
     Gelu,
     /// The softmax.
     Softmax,
+    /// The RMSNorm (weight only, no mean/beta).
+    RmsNorm,
 }
 
 /// The array's side of a family's elementwise pass.
@@ -153,6 +155,17 @@ pub trait ArrayEltwise {
     /// `params` is the gain and the offset -- gamma first, then beta, f32 --
     /// and it is `2 * cols` values long.
     fn layernorm(&mut self, params: &[f32], x: &mut [f32], n_rows: usize) -> Result<()>;
+
+    /// The RMSNorm, over `n_rows` rows of the design's own width.
+    ///
+    /// `weight` is the gain (gamma), f32, and it is `cols` values long.
+    /// Models that use RMSNorm (e.g. Gemma) pass no mean subtraction and no
+    /// beta; the epsilon is compiled into the design.
+    fn rmsnorm(&mut self, _weight: &[f32], _x: &mut [f32], _n_rows: usize) -> Result<()> {
+        Err(ArrayError(
+            "this run did not ask for RMSNorm to go on the array".to_string(),
+        ))
+    }
 
     /// The GELU, over the whole span.
     ///

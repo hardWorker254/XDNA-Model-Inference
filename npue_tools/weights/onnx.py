@@ -28,14 +28,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# tools/lib is not a package and does not need to become one here: this module
-# is the only place in npue_tools that reaches into it, and a package-wide
-# reorganisation is phase 2's job, not this file's.
-_TOOLS_LIB = Path(__file__).resolve().parents[2] / "tools" / "lib"
-if str(_TOOLS_LIB) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_LIB))
+# Ensure repo root and tools/lib are importable (phase 2 cleanup).
+_REPO = Path(__file__).resolve().parents[2]
+for _p in (str(_REPO), str(_REPO / "tools" / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from onnx_weights import (  # noqa: E402
+from tools.lib.onnx_weights import (  # noqa: E402
     EMBEDDINGGEMMA_RENAME,
     EMBEDDINGGEMMA_STRIP,
     WHISPER_DECODER_ONNX,

@@ -34,7 +34,33 @@ fn compiler() -> String {
 /// out of libjpeg's row buffer is not the slowest part of the decode.
 const FLAGS: [&str; 3] = ["-O2", "-fPIC", "-std=c11"];
 
+/// Detect whether the compiler supports stable AVX-512 intrinsics/target
+/// features. They were stabilized in Rust 1.89; older toolchains (including
+/// this workspace's MSRV of 1.85) cannot compile `#[target_feature(enable =
+/// "avx512f")]` functions that use AVX-512 intrinsics, so the AVX-512 GEMM
+/// paths must be compiled out there.
+fn rustc_supports_stable_avx512() -> bool {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let out = match Command::new(rustc).arg("-V").output() {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    // "rustc 1.85.1 (...)" or "rustc 1.89.0-nightly (...)"
+    let version = s.split_whitespace().nth(1).unwrap_or("");
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor) >= (1, 89)
+}
+
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(has_stable_avx512)");
+    if rustc_supports_stable_avx512() {
+        println!("cargo:rustc-cfg=has_stable_avx512");
+    }
+    println!("cargo:rerun-if-env-changed=RUSTC");
+
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
     let cc = compiler();
 
@@ -74,7 +100,12 @@ fn main() {
         let object = std::path::Path::new(&out_dir).join(format!("{archive_name}.o"));
 
         let mut command = Command::new(&cc);
-        command.args(FLAGS).arg("-c").arg(&source).arg("-o").arg(&object);
+        command
+            .args(FLAGS)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object);
         // The header is in the default include path on every system that has
         // the library's development files; a caller who keeps them elsewhere
         // can point at them with CFLAGS, which cargo passes through.

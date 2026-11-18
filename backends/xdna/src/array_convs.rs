@@ -44,7 +44,7 @@ use npum_format::Container;
 use npum_model::array::ConvSpec;
 
 use crate::array::{ArrayDesign, ArrayError as DesignError};
-use crate::conv::{conv, ConvScratch, ConvShape};
+use crate::conv::{ConvScratch, ConvShape, conv};
 use crate::transport::Transport;
 
 /// The data buffer the weight panels live in.
@@ -180,15 +180,12 @@ impl<T: Transport> ArrayConvs<T> {
             // widths, and the stream is the shape the design computes. A
             // panel of a different shape would be read past its end, so the
             // two are compared rather than trusted.
-            let entry = file
-                .directory()
-                .tensor(&panel_name)
-                .ok_or_else(|| {
-                    DesignError::Design(format!(
-                        "{}: the container's directory does not list {panel_name}.",
-                        container.display()
-                    ))
-                })?;
+            let entry = file.directory().tensor(&panel_name).ok_or_else(|| {
+                DesignError::Design(format!(
+                    "{}: the container's directory does not list {panel_name}.",
+                    container.display()
+                ))
+            })?;
             let shape: Vec<i64> = entry.logical_shape.clone();
             if shape.len() != 2 || shape[0] as usize != padded_k || shape[1] as usize != padded_n {
                 return Err(DesignError::Design(format!(

@@ -1,140 +1,105 @@
-# NpuEmbeddings (на русском) -- рантайм на Rust
+# NpuEmbeddings — Rust-рантайм
 
-Эмбеддинги предложений для моделей семейства BERT на AMD NPU, с хостовым CPU
-как запасным путём. `serve` — HTTP-эндпоинт в форме OpenAI, `embed` — файл в
-файл. Плюс распознавание речи, зрение, поза и OCR.
+Инференс BERT-семейства (эмбеддинги), а также STT, классификация, поза/руки и OCR на AMD NPU (XDNA1/npu1, XDNA2/npu2) с резервным путём на CPU и опциональным Vulkan-бэкендом.
 
-Это дерево — **переписывание на Rust**. Заменяемый им C++-рантайм живёт в
-соседнем дереве и пока остаётся там: он — оракул паритета, а переписывание
-без оракула это переписывание, которому не с кем спорить.
-
-Оригинал на английском — [README.md](README.md).
+Это дерево — **переписывание рантайма на Rust**. C++-рантайм остаётся в соседнем дереве как **оракул паритета**.
 
 ---
 
-## Где два дерева
+## Два дерева (один репозиторий, worktree)
 
 | | это дерево | оракул |
 |---|---|---|
 | путь | `~/XDNA-Model-Inference` | `~/Npu-Embeddings-XDNA1` |
 | ветка | `rust/clean-tree` | `main` |
 | рантайм | Rust | C++ |
-| роль | то, что строится | то, с чем сверяются ответы |
+| роль | разрабатываемый код | эталон для сверки |
 
-Это один и тот же git-репозиторий: здесь `git worktree` от того дерева, так
-что изменение здесь и изменение там — две ветки одной истории, а не две
-вилки одного проекта.
-
-**Полная документация оракула — README на 124 КБ, guide по сборке, заметки о
-точности — лежит в старом дереве.** Этот README говорит то, что верно для
-*этого* дерева, и указывает на остальное.
+Полная историческая документация C++-дерева (большой README, сборка, точность) — в оракуле. Этот README описывает текущее состояние Rust-дерева.
 
 ---
 
-## Устройство дерева
+## Структура
 
 ```
-backends/cpu        хостовые ядра — эталонная арифметика
-backends/vulkan     шейдеры
-backends/xdna       массив: транспорты, диспетчеризация, геометрия
-core/npum-format    контейнер: .npum
-core/npum-model     тензоры, графы, трейт Backend
-core/npum-tokenizers  wordpiece, unigram, таблицы whisper и gemma
-core/npum-families  семь семейств, каталог, отказы
-cli                 три исполняемых файла
-server              восемь HTTP-маршрутов
+backends/cpu         host-kernels (эталон чисел)
+backends/vulkan      GPU-бэкенд (WGSL/ash)
+backends/xdna        NPU: транспорт, диспетчеризация, геометрия
+core/npum-format     контейнер .npum/.npue (чтение)
+core/npum-model      тензоры, граф, шов арифметики (Ops/Backend)
+core/npum-tokenizers токенизаторы (WordPiece, Unigram, Gemma, Whisper-BPE, XLM-R)
+core/npum-families   семейства, каталог, отказы
+cli/                 бинарники npuembeddings, npuaudio, npuimage
+server/              HTTP-сервер (axum)
+tools/               Python-инструменты (упаковка, parity, verify)
+docs/                документация (en/ru)
 ```
 
-**Правило зависимостей, и это правило, а не случайность:** `core/` ничего не
-знает про `backends/`, а `backends/` — ничего про `cli/` и `server/`. Граф
-обходит сам и вызывает трейт; какой реализации отвечать, выбирается на краю,
-в CLI. Ядро, которое может назвать бэкенд, — это ядро, которое нельзя
-протестировать без него.
+Правило зависимостей: `core/` не знает о `backends/`, `backends/` не знают о `cli/`/`server/`.
+
+## Карта контуров репозитория
+
+| Путь | Назначение | API/стабильность | Основные потребители | Примечания |
+|---|---|---|---|---|
+| `core/npum-format` | Контейнер `.npum/.npue` (чтение/запись, дайджесты, provenance) | Канонический источник истины по формату; Rust API в workspace (`rlib` + `cdylib`) | `core/*`, `backends/*`, `cli`, `server`, `tools`/Python через FFI | Единственный writer формата; reader принимает legacy `.npue` и `.npum` |
+| `core/npum-model` | Тензоры, типы модели/графа, швы `Backend`/`Ops`, caps/dispatch | Контракты core-слоя (внутренние, стабильность по соглашению workspace) | `backends/*`, `core/npum-families`, `cli`, `server` | `Backend` — tensor-ориентированный контракт; `Ops` — slice-шов для семейств/forward-pass |
+| `core/npum-tokenizers`, `core/npum-families` | Токенизация и правила семейств/каталога/владения | Контракты core-слоя | `cli`, `server`, backend/семейные реализации | Владение семействами проверяется на границах маршрутизации/CLI |
+| `backends/cpu`, `backends/vulkan`, `backends/xdna` | Провайдеры вычислений и device-специфичные пути | Реализации backend’ов, выбор на краю | `cli`, `server`, тесты/инструменты | CPU — эталон чисел; Vulkan/XDNA имеют ограничения возможностей/точности |
+| `cli/` | Пользовательские бинарники (`npuembeddings`, `npuaudio`, `npuimage`) | CLI-контракт (флаги/вывод/отказы) | Пользователи, скрипты, parity-harness | Composition root выбора backend/семейства |
+| `server/` | HTTP-сервис и обработчики маршрутов | HTTP-контракт | Клиенты/сервисы, пути `serve` | Единый набор маршрутов; режим определяется контейнером/семейством |
+| `tools/` | Build-time/export/pack/verify/gen/research/data инструменты | Внутренний tooling (эволюционирует вместе с пайплайном) | Разработка, CI/parity/build-процессы | В основном Python; детали в [`tools/README.md`](tools/README.md) |
+| `reference/` | Оракул/эталонная среда и входы для сравнения | Не runtime-API; только parity/reference | Запись/сравнение parity, валидация | Не продуктовый runtime-код; отделён от Rust-runtime |
+| `kernels/` | Исходники AIE-ядер для экспорта/сборки NPU-дизайнов | Источники артефактов (не Rust API) | Пайплайн `tools/export`, артефакты для `backends/xdna` | См. [`kernels/README.md`](kernels/README.md) |
+| `python/` | Удобные Python-обёртки/фасады поверх runtime-потоков | Удобный слой, не каноническая runtime-логика | Пользователи/скрипты на Python | Сейчас небольшой; делегирует в CLI/server/runtime |
+| `npue_tools/` | Область Python-пакета/ассетов в переходном состоянии | Переходный/внутренний (минимальный) | Инструменты/процессы, которые ещё на него ссылаются | Не канонический writer формата и не runtime-реализация |
+| `docs/` | Контракты и документация (usage/build/backends/models/parity) | Документация (нормативна где указано, напр. инварианты/parity) | Разработчики/пользователи/ревьюеры | EN/RU для нормативных изменений должны быть согласованы |
+| `models/`, `weights/` (локальные layout’ы) | Хранилище контейнеров/моделей и пути разрешения | Соглашение о данных/расположении, не API кода | Разрешение моделей в CLI/server и tooling | Содержимое может быть локальным; пути определяются во время работы |
 
 ---
 
 ## Сборка
 
 ```sh
-./bootstrap.sh          # venv на Python, с зафиксированными зависимостями
+./bootstrap.sh          # Python venv с зависимостями для tools
 cargo build --release
 ```
 
-Три бинарника оказываются в `target/release/`:
+Бинарники: `target/release/{npuembeddings,npuaudio,npuimage}`.
 
-```
-npuembeddings   embed, list, add, tokenize, serve
-npuaudio        transcribe, serve
-npuimage        classify, pose, hands, mppose, ocr, serve
-```
+Проверка отсутствия XRT/Python в direct-сборке (гейт): `python3 tools/verify/verify_no_xrt.py` (в контексте дерева, где доступен скрипт).
 
 ---
 
-## Контракт
+## Использование (кратко)
 
-Поведение рантайма — это контракт, и он записан:
+- `npuembeddings list|add|tokenize|embed|serve`
+- `npuaudio transcribe|serve`
+- `npuimage classify|pose|hands|mppose|ocr|serve`
 
-* **[docs/ru/INVARIANTS.md](docs/ru/INVARIANTS.md)** -- правила, которые
-  рантайм не ломает, и почему каждое из них есть.
-  [По-английски](docs/en/INVARIANTS.md).
+Режим/эндпоинт сервера определяется `arch` контейнера, а не флагом. Модель можно передать путём к `.npue/.npum` или именем (поиск в `models/`, а также в `weights/<family>/<model>/`).
 
-Изменение, которое ломает инвариант, -- не изменение, а регрессия.
+### Выбор бэкенда/путей
+- `--backend cpu|vulkan` — выбор арифметического бэкенда (где поддерживается).
+- `--vk-ops gemm,layn,gelu,softm` — выборочный offload на Vulkan (подразумевает Vulkan); `--backend vulkan` без `--vk-ops` включает поддерживаемые ops.
+- `--npu-ops ...` — массивный/NPU-путь операций (где реализован), независим от `--backend`; неподдерживаемые комбинации/семейства отказывают по имени.
 
----
-
-## Гейт паритета
-
-`tools/parity/` записывает, что делает C++-рантайм, и проверяет, что Rust
-делает то же.
-
-```sh
-# записать goldens от оракула
-python tools/parity/run.py record --oracle ~/Npu-Embeddings-XDNA1/runtime/build
-
-# сверить Rust-бинарники с ними
-python tools/parity/run.py compare --candidate target/release
-```
-
-Кейс, чья модель не установлена, **пропускается**, и число пропусков печатается
-рядом с числом прошедших: прогон, в котором не сравнилось ничего, не должен
-приниматься за прогон, в котором прошло всё.
-
-Кейс, который отличается, — это **провал**, и первое отличие — это точка, с
-которой читатель начинает. Если отличие задумано, оно объявляется в
-`tools/parity/divergences.txt` с причиной -- и никогда перезаписью golden'а как
-побочным эффектом изменения.
+Embed-сервер поддерживает Vulkan ops; прочие серверные движки в текущем состоянии работают на хосте.
 
 ---
 
-## Формат контейнера
+## Контейнер и модели
 
-`.npum` -- NPU Model. Раньше было `.npue`, что значило «NPU embedding» и
-перестало быть правдой, когда рантайм обрёл аудио-, зрительное, позовое и
-OCR-семейства.
-
-РАЗМЕЩКА при переименовании не изменилась -- изменились только четыре байта
-магии, -- поэтому ридер принимает обе магии, а писатель выдаёт только `NPUM`.
+- Формат: `.npum` (принимается также legacy `.npue`).
+- Источник весов для упаковки — safetensors (где применимо), ONNX остаётся для графов/vision-случаев.
+- Упаковка: Python (`tools/pack/pack_npue.py`).
 
 ---
 
-## Модели
+## Паритет и инварианты
 
-Веса -- это экспорт ONNX, положенный руками рядом с конфигом, который
-рантайм скачивает. «Чекпойнт не должен требовать доверия к бинарнику, который
-сам репозиторий не выбрал».
+- Инварианты: [docs/en/INVARIANTS.md](docs/en/INVARIANTS.md), [docs/ru/INVARIANTS.md](docs/ru/INVARIANTS.md).
+- Паритет с C++-оракулом: `python3 tools/parity/run.py record|compare` (golden’ы в `tools/parity/golden/` — контракт; осмысленные расхождения фиксируются в `tools/parity/divergences.txt`).
 
-```sh
-tools/parity/fixtures/fetch_models.sh        # манифест загрузки с пинами
-python tools/pack/pack_npue.py --model-dir models/all-MiniLM-L6-v2 \
-    --out models/all-MiniLM-L6-v2.npue --dtype f32 --no-embed-artifacts
-```
+Дополнительно: [docs/ru/BUILDING.md](docs/ru/BUILDING.md), [docs/ru/USAGE.md](docs/ru/USAGE.md), [docs/ru/BACKENDS.md](docs/ru/BACKENDS.md).
 
-`--dtype f32` даёт контейнер с row-major операндами на хосте: без набора
-дизайнов, без массива, арифметика на CPU. Это тот контейнер, который можно
-собрать и сверить где угодно.
-
----
-
-## Лицензия
-
-Apache-2.0. См. [LICENSE](LICENSE) и [THIRD-PARTY.md](THIRD-PARTY.md).
+Лицензия: Apache-2.0 (`LICENSE`, `THIRD-PARTY.md`).

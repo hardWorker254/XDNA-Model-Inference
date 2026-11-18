@@ -25,10 +25,10 @@
 //! shape -- so it is not a detail.
 
 use crate::kernels;
+use crate::vit_image::Resample;
 use crate::whisper::attention;
 use crate::whisper::layernorm_row;
 use crate::whisper_features::gelu_erf_exact;
-use crate::vit_image::Resample;
 use npum_format::Container;
 use std::path::Path;
 
@@ -153,8 +153,12 @@ impl Vit {
     /// Read the weights out of a container.
     pub fn open(path: &Path) -> Result<Vit, String> {
         let container = Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let geometry = Geometry::read(&container, path)
-            .ok_or_else(|| format!("{}: the container does not carry the ViT's geometry", path.display()))?;
+        let geometry = Geometry::read(&container, path).ok_or_else(|| {
+            format!(
+                "{}: the container does not carry the ViT's geometry",
+                path.display()
+            )
+        })?;
         let mut layers = Vec::with_capacity(geometry.layers as usize);
         for l in 0..geometry.layers {
             let p = format!("layer.{l}.");
@@ -281,7 +285,15 @@ impl Vit {
                 layernorm_row(row, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
             }
             let mut qkv = vec![0.0f32; n_pos * 3 * d];
-            kernels::gemm_nt(&norm, n_pos, &layer.qkv, d, 3 * d, &layer.qkv_bias, &mut qkv);
+            kernels::gemm_nt(
+                &norm,
+                n_pos,
+                &layer.qkv,
+                d,
+                3 * d,
+                &layer.qkv_bias,
+                &mut qkv,
+            );
             // The fused [Q|K|V] row is Q at offset 0 and a K|V block at
             // offset d, both with row stride 3*d_model -- the same layout
             // the Whisper's encoder reads. There is NO mask.
@@ -300,7 +312,15 @@ impl Vit {
                 &mut ctx,
             );
             let mut proj = vec![0.0f32; n_pos * d];
-            kernels::gemm_nt(&ctx, n_pos, &layer.attn_out, d, d, &layer.attn_out_bias, &mut proj);
+            kernels::gemm_nt(
+                &ctx,
+                n_pos,
+                &layer.attn_out,
+                d,
+                d,
+                &layer.attn_out_bias,
+                &mut proj,
+            );
             for i in 0..n_pos * d {
                 x[i] += proj[i];
             }
@@ -312,12 +332,28 @@ impl Vit {
             }
             let width = layer.ffn_up.len() / d;
             let mut up = vec![0.0f32; n_pos * width];
-            kernels::gemm_nt(&norm, n_pos, &layer.ffn_up, d, width, &layer.ffn_up_bias, &mut up);
+            kernels::gemm_nt(
+                &norm,
+                n_pos,
+                &layer.ffn_up,
+                d,
+                width,
+                &layer.ffn_up_bias,
+                &mut up,
+            );
             for v in up.iter_mut() {
                 *v = gelu_erf_exact(*v);
             }
             let mut down = vec![0.0f32; n_pos * d];
-            kernels::gemm_nt(&up, n_pos, &layer.ffn_down, width, d, &layer.ffn_down_bias, &mut down);
+            kernels::gemm_nt(
+                &up,
+                n_pos,
+                &layer.ffn_down,
+                width,
+                d,
+                &layer.ffn_down_bias,
+                &mut down,
+            );
             for i in 0..n_pos * d {
                 x[i] += down[i];
             }
@@ -385,7 +421,11 @@ pub fn predict(logits: &[f32], labels: &[String]) -> Result<Prediction, String> 
     for v in logits {
         sum += (*v as f64 - mx as f64).exp();
     }
-    let p = if sum > 0.0 { (1.0f64 / sum) as f32 } else { 0.0f32 };
+    let p = if sum > 0.0 {
+        (1.0f64 / sum) as f32
+    } else {
+        0.0f32
+    };
     Ok(Prediction {
         label: best,
         name: labels.get(best).cloned().unwrap_or_default(),
@@ -512,14 +552,17 @@ pub fn format_g(value: f64, precision: usize) -> String {
     let exponent = value.abs().log10().floor() as i32;
     if exponent < -4 || exponent >= precision as i32 {
         let text = format!("{:.*e}", precision - 1, value);
-        let (mantissa, exp) = text.split_once('e').expect("Rust's exponential form");
-        let exp: i32 = exp.parse().expect("Rust's exponential form");
-        format!(
-            "{}e{}{:02}",
-            trim_zeros(mantissa),
-            if exp < 0 { '-' } else { '+' },
-            exp.abs()
-        )
+        if let Some((mantissa, exp)) = text.split_once('e') {
+            if let Ok(exp) = exp.parse::<i32>() {
+                return format!(
+                    "{}e{}{:02}",
+                    trim_zeros(mantissa),
+                    if exp < 0 { '-' } else { '+' },
+                    exp.abs()
+                );
+            }
+        }
+        text
     } else {
         let decimals = (precision as i32 - 1 - exponent).max(0) as usize;
         trim_zeros(&format!("{value:.decimals$}"))

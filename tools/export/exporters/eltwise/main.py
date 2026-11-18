@@ -97,12 +97,19 @@ def main() -> int:
         return 0
 
     args.out = str(arch_out_dir(args.out, args.arch))
+    # Allow experimental eltwise design builds without requiring them to be
+    # part of the formal --npu-ops registry.
+    raw = [p.strip() for p in args.extra_ops.split(",") if p.strip()]
+    extra = {"silu", "rmsnorm"}
+    wanted_extra = {p for p in raw if p in extra}
+    ops = npu_ops.parse_exportable(",".join(p for p in raw if p not in extra) or "", "--extra-ops") if any(p not in extra for p in raw) else set()
+    ops.update(wanted_extra)
     metas = export_arch(
         Path(args.out), args.arch, args.batch, args.hidden, args.seq,
         args.elt_cols, args.gelu_tile, args.ln_variant, args.sm_variant,
         args.cache_root, args.per_arch_cache, gelu_variant=args.gelu_variant,
         ln_cols=args.ln_cols, ln_eps=args.ln_eps, sm_cols=args.sm_cols,
         sm_rows=args.sm_rows,
-        ops=npu_ops.parse_exportable(args.extra_ops, "--extra-ops"))
+        ops=ops)
     print(f"\nwrote {len(metas)} eltwise design(s) under {args.out}")
     return 0

@@ -262,7 +262,9 @@ pub fn read_design(artifacts: &Path) -> Option<DesignStatus> {
 /// and the run cannot disagree about where the design came from.
 pub fn read_container_design(container: &npum_format::Container) -> Option<DesignStatus> {
     let design = container.tensor_bytes("design/gemm_rtp/design.json").ok()?;
-    let toolchain = container.tensor_bytes("design/gemm_rtp/toolchain.json").ok();
+    let toolchain = container
+        .tensor_bytes("design/gemm_rtp/toolchain.json")
+        .ok();
     read_design_from(design, toolchain.as_deref(), None)
 }
 
@@ -401,7 +403,12 @@ pub const CONTAINER_ARTIFACTS: &str =
     "the container's own design set (design/gemm_rtp; no directory needed, no --artifacts given)";
 
 /// The status block, printed before the work.
-pub fn print_block(status: &Status, design: Option<&DesignStatus>, artifacts: &str, places: &Places) {
+pub fn print_block(
+    status: &Status,
+    design: Option<&DesignStatus>,
+    artifacts: &str,
+    places: &Places,
+) {
     println!("  artifacts  {artifacts}");
     println!("NpuEmbeddings Rust runtime -- full encode");
     println!("  bo-mode    host_only (data-buffer allocation)");
@@ -616,7 +623,11 @@ pub fn print_time_split(
         println!(
             "    {name:<22} {value:>8.1} ms  {pct:>5.1}%",
             value = value * ms,
-            pct = if busy > 0.0 { 100.0 * value / busy } else { 0.0 }
+            pct = if busy > 0.0 {
+                100.0 * value / busy
+            } else {
+                0.0
+            }
         );
     };
     // THE ARRAY'S ROWS, AND THEY ARE ZERO ON A HOST RUN.
@@ -648,7 +659,11 @@ pub fn print_time_split(
             timings.gpu * ms,
             gpu.dispatches,
             gpu.device,
-            pct = if busy > 0.0 { 100.0 * timings.gpu / busy } else { 0.0 },
+            pct = if busy > 0.0 {
+                100.0 * timings.gpu / busy
+            } else {
+                0.0
+            },
         );
     }
     println!(
@@ -657,7 +672,8 @@ pub fn print_time_split(
     );
     println!(
         "    {:<22} {:>8.1} ms   (sum of the rows above)",
-        "busy", busy * ms
+        "busy",
+        busy * ms
     );
     println!(
         "    {:<22} {:>8}     (count, not a time)",

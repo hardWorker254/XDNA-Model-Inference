@@ -30,7 +30,9 @@ pub struct CpuOps {
 impl CpuOps {
     /// The host's own choice: the widest GEMM this machine has.
     pub fn best() -> Self {
-        Self { isa: kernels::gemm_isa() }
+        Self {
+            isa: kernels::gemm_isa(),
+        }
     }
 
     /// A named ISA.

@@ -72,10 +72,11 @@ pub fn open(
         .directory()
         .tensor("design/gemm_rtp/design.json")
         .is_some();
-    let dir = if own {
-        None
-    } else {
-        Some(find_design(root, path, args.value("--artifacts")).ok_or_else(|| {
+    let dir =
+        if own {
+            None
+        } else {
+            Some(find_design(root, path, args.value("--artifacts")).ok_or_else(|| {
             format!(
                 "{}: --npu-ops conv needs a design set on disk: pass --artifacts <dir> naming \
                  one, or build it with the exporter. The flag has no default to fall back on, \
@@ -85,7 +86,7 @@ pub fn open(
                 path.display()
             )
         })?)
-    };
+        };
 
     // THE BOARD.
     let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;

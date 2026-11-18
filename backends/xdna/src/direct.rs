@@ -104,8 +104,7 @@ const fn iow(nr: u64, size: u64) -> u64 {
 /// Create a hardware context.
 const IOCTL_CREATE_HWCTX: u64 = iowr(DRM_COMMAND_BASE, size_of::<CreateHwctx>() as u64);
 /// Destroy a hardware context.
-const IOCTL_DESTROY_HWCTX: u64 =
-    iowr(DRM_COMMAND_BASE + 1, size_of::<DestroyHwctx>() as u64);
+const IOCTL_DESTROY_HWCTX: u64 = iowr(DRM_COMMAND_BASE + 1, size_of::<DestroyHwctx>() as u64);
 /// Configure a hardware context.
 const IOCTL_CONFIG_HWCTX: u64 = iowr(DRM_COMMAND_BASE + 2, size_of::<ConfigHwctx>() as u64);
 /// Create a buffer object.
@@ -123,8 +122,7 @@ const IOCTL_GEM_CLOSE: u64 = iow(0x09, size_of::<GemClose>() as u64);
 /// Destroy a syncobj.
 const IOCTL_SYNCOBJ_DESTROY: u64 = iowr(0xC0, size_of::<SyncobjDestroy>() as u64);
 /// Wait for a point on a syncobj's timeline.
-const IOCTL_SYNCOBJ_TIMELINE_WAIT: u64 =
-    iowr(0xCA, size_of::<SyncobjTimelineWait>() as u64);
+const IOCTL_SYNCOBJ_TIMELINE_WAIT: u64 = iowr(0xCA, size_of::<SyncobjTimelineWait>() as u64);
 
 /// The buffer type of a host-visible buffer.
 const BO_TYPE_SHARE: u32 = 1;
@@ -445,7 +443,7 @@ impl Mapping {
                 "cannot map {what}: the driver refused"
             )));
         }
-                Ok(Self {
+        Ok(Self {
             ptr: ptr as *mut u8,
             len,
         })
@@ -929,19 +927,11 @@ impl Transport for DirectTransport {
         Ok(())
     }
 
-    fn sync_to_device(
-        bo: &Self::Buffer,
-        bytes: u64,
-        offset: u64,
-    ) -> Result<(), TransportError> {
+    fn sync_to_device(bo: &Self::Buffer, bytes: u64, offset: u64) -> Result<(), TransportError> {
         sync_bo(&bo.board, bo.handle, offset, bytes, SYNC_DIRECT_TO_DEVICE)
     }
 
-    fn sync_from_device(
-        bo: &Self::Buffer,
-        bytes: u64,
-        offset: u64,
-    ) -> Result<(), TransportError> {
+    fn sync_from_device(bo: &Self::Buffer, bytes: u64, offset: u64) -> Result<(), TransportError> {
         sync_bo(&bo.board, bo.handle, offset, bytes, SYNC_DIRECT_FROM_DEVICE)
     }
 
@@ -1236,10 +1226,8 @@ fn build_packet(
 
     // THE HEADER: the state, the payload's length in words, the opcode and
     // the type.
-    let header = ERT_STATE_NEW
-        | ((payload_words as u32) << 12)
-        | (ERT_START_CU << 23)
-        | (ERT_CU << 28);
+    let header =
+        ERT_STATE_NEW | ((payload_words as u32) << 12) | (ERT_START_CU << 23) | (ERT_CU << 28);
     packet[0..4].copy_from_slice(&header.to_le_bytes());
 
     // THE CU MASK: the first CU.
@@ -1286,7 +1274,9 @@ fn ioctl(board: &Board, request: u64, arg: *mut c_void) -> Result<(), TransportE
 
 /// Close a buffer object's handle.
 fn close_bo(board: &Board, handle: u32) {
-    let mut args = GemClose { handle: handle as u64 };
+    let mut args = GemClose {
+        handle: handle as u64,
+    };
     unsafe {
         libc_ioctl(
             board.fd(),
@@ -1298,7 +1288,9 @@ fn close_bo(board: &Board, handle: u32) {
 
 /// Destroy a syncobj.
 fn destroy_syncobj(board: &Board, handle: u32) {
-    let mut args = SyncobjDestroy { handle: handle as u64 };
+    let mut args = SyncobjDestroy {
+        handle: handle as u64,
+    };
     unsafe {
         libc_ioctl(
             board.fd(),

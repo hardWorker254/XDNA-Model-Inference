@@ -110,7 +110,7 @@ pub fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, String> {
             return Err(format!(
                 "the body does not contain the boundary {dash} -- this does not \
                  look like multipart/form-data"
-            ))
+            ));
         }
     };
     let mut out: Vec<Part> = Vec::new();
@@ -162,7 +162,7 @@ pub fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, String> {
                 return Err(format!(
                     "the body ends inside a part (no closing boundary after {})",
                     part.name
-                ))
+                ));
             }
         };
         part.data = body[pos..next].to_vec();

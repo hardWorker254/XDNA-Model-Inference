@@ -88,7 +88,8 @@ pub struct Refusal(pub String);
 /// A resample that is 0.1% off produces a transcript that is wrong in
 /// no visible way, which is the worst failure there is.
 pub fn read_wav(path: &Path) -> Result<Audio, Refusal> {
-    let raw = std::fs::read(path).map_err(|e| Refusal(format!("cannot open {}: {e}", path.display())))?;
+    let raw =
+        std::fs::read(path).map_err(|e| Refusal(format!("cannot open {}: {e}", path.display())))?;
     read_wav_bytes(&raw, &path.display().to_string())
 }
 
@@ -182,7 +183,12 @@ pub fn read_wav_bytes(raw: &[u8], name: &str) -> Result<Audio, Refusal> {
     } else {
         let count = data.len() / 4;
         for i in 0..count {
-            let v = f32::from_le_bytes([data[4 * i], data[4 * i + 1], data[4 * i + 2], data[4 * i + 3]]);
+            let v = f32::from_le_bytes([
+                data[4 * i],
+                data[4 * i + 1],
+                data[4 * i + 2],
+                data[4 * i + 3],
+            ]);
             samples.push(v);
         }
     }
@@ -309,11 +315,12 @@ fn power_spectrum(frame: &[f64]) -> Vec<f64> {
     let n = frame.len();
     let mut buf: Vec<(f64, f64)> = frame.iter().map(|v| (*v, 0.0)).collect();
     fft_rec(&mut buf);
-    (0..n / 2 + 1).map(|i| {
-        let (re, im) = buf[i];
-        re * re + im * im
-    })
-    .collect()
+    (0..n / 2 + 1)
+        .map(|i| {
+            let (re, im) = buf[i];
+            re * re + im * im
+        })
+        .collect()
 }
 
 /// A mixed-radix Cooley-Tukey over the factors 2 and 5.
@@ -372,10 +379,7 @@ fn fft_rec(a: &mut [(f64, f64)]) {
             for q in 0..p {
                 let (ar, ai) = sub[q][k];
                 let (vr, vi) = v[q][t];
-                acc = (
-                    acc.0 + ar * vr - ai * vi,
-                    acc.1 + ar * vi + ai * vr,
-                );
+                acc = (acc.0 + ar * vr - ai * vi, acc.1 + ar * vi + ai * vr);
             }
             out[k + m * t] = acc;
         }
@@ -686,7 +690,9 @@ fn ln_gamma(x: f64) -> f64 {
     ];
     if x < 0.5 {
         // Reflection: Gamma(x)Gamma(1-x) = pi / sin(pi x).
-        return std::f64::consts::PI.ln() - (std::f64::consts::PI * x).sin().ln() - ln_gamma(1.0 - x);
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - ln_gamma(1.0 - x);
     }
     let x = x - 1.0;
     let mut a = G[0];

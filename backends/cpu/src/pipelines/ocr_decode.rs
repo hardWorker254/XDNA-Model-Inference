@@ -173,7 +173,9 @@ pub fn rec_input(src: &Image, q: &Quad, g: &Geometry) -> Result<RecInput, String
     // resampling wants it -- from the destination rectangle to the source
     // quad -- rather than computed forwards and inverted, which is the same
     // thing without a matrix inversion.
-    let rect = [0.0, 0.0, cw as f64, 0.0, cw as f64, ch as f64, 0.0, ch as f64];
+    let rect = [
+        0.0, 0.0, cw as f64, 0.0, cw as f64, ch as f64, 0.0, ch as f64,
+    ];
     let quad = [
         q.x[0], q.y[0], q.x[1], q.y[1], q.x[2], q.y[2], q.x[3], q.y[3],
     ];
@@ -451,9 +453,9 @@ impl Default for Rect {
 fn convex_hull(mut p: Vec<Pt>) -> Vec<Pt> {
     p.sort_by(|a, b| {
         if a.x != b.x {
-            a.x.partial_cmp(&b.x).unwrap()
+            a.x.total_cmp(&b.x)
         } else {
-            a.y.partial_cmp(&b.y).unwrap()
+            a.y.total_cmp(&b.y)
         }
     });
     p.dedup_by(|a, b| a.x == b.x && a.y == b.y);
@@ -581,9 +583,9 @@ fn order_corners(c: &[Pt; 4]) -> [usize; 4] {
     order.sort_by(|a, b| {
         let (a, b) = (&c[*a], &c[*b]);
         if a.x != b.x {
-            a.x.partial_cmp(&b.x).unwrap()
+            a.x.total_cmp(&b.x)
         } else {
-            a.y.partial_cmp(&b.y).unwrap()
+            a.y.total_cmp(&b.y)
         }
     });
     let (l0, l1, r0, r1) = (order[0], order[1], order[2], order[3]);
@@ -651,8 +653,7 @@ fn box_score(pred: &[f32], h: i64, w: i64, q: &Quad) -> f64 {
             let mut inside = true;
             for k in 0..4 {
                 let k2 = (k + 1) & 3;
-                let cr = (q.x[k2] - q.x[k]) * (py - q.y[k])
-                    - (q.y[k2] - q.y[k]) * (px - q.x[k]);
+                let cr = (q.x[k2] - q.x[k]) * (py - q.y[k]) - (q.y[k2] - q.y[k]) * (px - q.x[k]);
                 if k == 0 {
                     sign = cr;
                 } else if (cr > 0.0) != (sign > 0.0) && cr != 0.0 {
@@ -849,7 +850,12 @@ pub struct CtcResult {
 ///
 /// The blank is class 0, the repeats are collapsed against the previous
 /// frame's RAW index, and the confidence is the mean over the KEPT frames.
-pub fn ctc_decode(logits: &[f32], frames: i64, classes: i64, dict: &[String]) -> Result<CtcResult, String> {
+pub fn ctc_decode(
+    logits: &[f32],
+    frames: i64,
+    classes: i64,
+    dict: &[String],
+) -> Result<CtcResult, String> {
     let mut r = CtcResult::default();
     if classes <= 0 || frames <= 0 {
         return Ok(r);

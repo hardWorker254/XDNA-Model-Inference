@@ -15,7 +15,7 @@
 //! a format whose index comes first.
 
 use crate::directory::{Config, Directory, TensorEntry};
-use crate::header::{ContainerFormat, Header, HEADER_SIZE, VERSION};
+use crate::header::{ContainerFormat, HEADER_SIZE, Header, VERSION};
 use crate::layout::BLayout;
 use std::path::Path;
 
@@ -96,9 +96,10 @@ impl Writer {
             padded_shape: staged.padded_shape,
             offset: self.offset,
             nbytes,
-            layout: staged.layout.as_ref().map(|l| {
-                serde_json::to_value(l).expect("a layout is always serialisable")
-            }),
+            layout: staged
+                .layout
+                .as_ref()
+                .map(|l| serde_json::to_value(l).expect("a layout is always serialisable")),
             layout_hash: staged.layout.as_ref().map(crate::layout::layout_hash),
         };
         self.entries.push(entry);

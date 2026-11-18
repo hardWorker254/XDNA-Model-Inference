@@ -23,7 +23,7 @@
 //! into libm -- and it is the path that proves the others are not
 //! accidentally right.
 
-use npum_cpu::kernels::{available_isas, gemm_nt_on, Isa};
+use npum_cpu::kernels::{Isa, available_isas, gemm_nt_on};
 
 /// A deterministic pseudo-random f32, so the test needs no random seed and
 /// repeats exactly.
@@ -81,7 +81,8 @@ fn the_row_kernels_agree_across_every_isa() {
     let mut reference: Option<(Isa, Vec<u8>)> = None;
     for isa in isas {
         let mut norm = row.clone();
-        npum_cpu::kernels::layernorm_row_on(isa, &mut norm, &gamma, &beta).expect("the row lays out");
+        npum_cpu::kernels::layernorm_row_on(isa, &mut norm, &gamma, &beta)
+            .expect("the row lays out");
         let bytes: Vec<u8> = norm.iter().flat_map(|v| v.to_le_bytes()).collect();
         match &reference {
             None => reference = Some((isa, bytes)),
@@ -118,8 +119,9 @@ fn the_model_agrees_across_every_isa() {
     let blob = container
         .tensor_bytes("tokenizer.vocab")
         .expect("the container holds a vocabulary");
-    let tokenizer = npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
-        .expect("the vocabulary is usable");
+    let tokenizer =
+        npum_tokenizers::wordpiece::WordPiece::from_lines(&String::from_utf8_lossy(blob))
+            .expect("the vocabulary is usable");
     const SEQ: usize = 64;
     let (encoding, _) = tokenizer
         .encode_padded("a golden transcript is a contract", SEQ)

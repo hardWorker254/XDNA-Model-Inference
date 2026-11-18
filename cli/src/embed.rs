@@ -26,6 +26,7 @@
 
 use crate::flags::Args;
 use npum_cpu::bert::BertModel;
+use npum_cpu::gte::GteModel;
 use npum_tokenizers::wordpiece::WordPiece;
 use npum_tokenizers::xlmr::XlmrTokenizer;
 use std::path::{Path, PathBuf};
@@ -88,6 +89,142 @@ pub fn run(
         code: crate::EXIT_REFUSED,
         message: format!("{}: {e}", path.display()),
     })?;
+
+    // GTE has its own forward pass (RoPE, GEGLU, CLS pooling).
+    if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
+        let model = GteModel::open(path).map_err(|e| Refusal {
+            code: crate::EXIT_REFUSED,
+            message: format!("{}: {e}", path.display()),
+        })?;
+
+        // The GTE forward pass does not yet dispatch projections, attention
+        // or eltwise work to the array. Accepting these flags and opening
+        // contexts would make the command line claim array work that the run
+        // does not perform, so refuse them here as well as at the family
+        // gate.
+        let wants_any_npu = wants_gemm(args)
+            || wants_attn(args)
+            || wants_op(args, "layn")
+            || wants_op(args, "gelu")
+            || wants_op(args, "softm");
+        if wants_any_npu {
+            return Err(Refusal {
+                code: crate::EXIT_REFUSED,
+                message: format!(
+                    "{}: --npu-ops is not yet implemented for GTE models ({}). \
+                     The array/eltwise dispatch seam is missing from the GTE \
+                     forward pass, so accepting the flag would run on the host \
+                     while reporting array work. Remove --npu-ops to run on the host.",
+                    path.display(),
+                    arch
+                ),
+            });
+        }
+
+        let mut array: Option<Box<dyn npum_model::array::ArrayText>> = None;
+        let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> = None;
+
+        let artifacts = find_artifacts(root, &container_name(path));
+        let seq = sequence_length(path, &container, root, artifacts.as_deref());
+        let hidden = model.spec.hidden;
+
+        crate::status::print_tokenizer(tokenizer.vocab_size());
+        println!("  input      {} texts", texts.len());
+        let started = std::time::Instant::now();
+        let mut timings = npum_cpu::gte::Timings::default();
+        let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
+        for (index, text) in texts.iter().enumerate() {
+            let raw = match prefix {
+                Some(p) => format!("{p}{text}"),
+                None => text.clone(),
+            };
+            let (encoding, truncated) =
+                tokenizer.encode_padded(&raw, seq).map_err(|e| Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: e.to_string(),
+                })?;
+            if truncated && !allow_truncation {
+                let n_tokens = encoding.ids.len().min(seq) + 2;
+                return Err(Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: format!(
+                        "input {index} is {n_tokens} tokens, but this runtime is running at sequence length {seq}. Split the text into shorter pieces, or run a design exported for a longer sequence (tools/export/export_gemm_rtp.py --seq N). Passing --allow-truncation cuts it at {seq} tokens instead and DISCARDS the rest."
+                    ),
+                });
+            }
+            let chunk = model
+                .embed_timed_with(
+                    ops.as_mut(),
+                    &mut timings,
+                    &encoding.ids,
+                    &encoding.mask,
+                    1,
+                    seq,
+                    array.as_deref_mut(),
+                    eltwise.as_deref_mut(),
+                )
+                .map_err(|e| Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: e.to_string(),
+                })?;
+            vectors.extend_from_slice(&chunk);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "  embedded   {} texts in {:.2} s  ->  {:.1} seq/s",
+            texts.len(),
+            elapsed,
+            texts.len() as f64 / elapsed
+        );
+        let dispatches = array.as_ref().map(|a| a.dispatches()).unwrap_or(0)
+            + array.as_ref().map(|a| a.attn_dispatches()).unwrap_or(0)
+            + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
+        let gpu = match ops.place() {
+            npum_model::dispatcher::Placement::Vulkan => Some(crate::status::Gpu {
+                device: ops.device().unwrap_or("the GPU").to_string(),
+                dispatches: ops.dispatches(),
+            }),
+            _ => None,
+        };
+        let total = dispatches + gpu.as_ref().map(|g| g.dispatches).unwrap_or(0);
+        // print_time_split expects bert timings; map gte timings fields
+        let bt = npum_cpu::bert::Timings {
+            host_layernorm: timings.host_layernorm,
+            host_softmax: timings.host_softmax,
+            host_gelu: timings.host_gelu,
+            attention: timings.attention,
+            qk: timings.qk,
+            av: timings.av,
+            array_gemm: timings.array_gemm,
+            gpu: timings.gpu,
+        };
+        crate::status::print_time_split(&bt, 4, elapsed, total, gpu.as_ref());
+
+        if let Some(out) = out_path {
+            let mut bytes = Vec::with_capacity(vectors.len() * 4);
+            for v in &vectors {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(out, &bytes).map_err(|e| Refusal {
+                code: crate::EXIT_REFUSED,
+                message: format!("failed writing {out}: {e}"),
+            })?;
+            println!(
+                "  wrote      {out}  [{}, {hidden}] fp32",
+                vectors.len() / hidden
+            );
+        } else {
+            for b in 0..texts.len().min(4) {
+                print!("  [{b}]");
+                for c in 0..6 {
+                    print!(" {:+.4}", vectors[b * hidden + c]);
+                }
+                println!(" ...");
+            }
+        }
+        return Ok(vectors);
+    }
+
     let model = BertModel::open(path).map_err(|e| Refusal {
         code: crate::EXIT_REFUSED,
         message: format!("{}: {e}", path.display()),
@@ -101,10 +238,12 @@ pub fn run(
     // dispatched.
     let mut array: Option<Box<dyn npum_model::array::ArrayText>> =
         if wants_gemm(args) || wants_attn(args) {
-            Some(open_array(path, &model, root, args).map_err(|reason| Refusal {
-                code: crate::EXIT_REFUSED,
-                message: reason,
-            })?)
+            Some(
+                open_array(path, &model, root, args).map_err(|reason| Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: reason,
+                })?,
+            )
         } else {
             None
         };
@@ -119,7 +258,7 @@ pub fn run(
                 return Err(Refusal {
                     code: crate::EXIT_REFUSED,
                     message: reason,
-                })
+                });
             }
         };
 
@@ -147,10 +286,6 @@ pub fn run(
             message: e.to_string(),
         })?;
         if truncated && !allow_truncation {
-            // The C++'s refusal, word for word. The token count is the
-            // UNTRUNCATED one, including [CLS] and [SEP], because the
-            // reader's question is "how long is my text" and not "how long
-            // is the part that fitted".
             let n_tokens = encoding.ids.len().min(seq) + 2;
             return Err(Refusal {
                 code: crate::EXIT_REFUSED,
@@ -186,11 +321,6 @@ pub fn run(
     let dispatches = array.as_ref().map(|a| a.dispatches()).unwrap_or(0)
         + array.as_ref().map(|a| a.attn_dispatches()).unwrap_or(0)
         + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
-    // THE GPU'S OWN LINE, when the run used one.
-    //
-    // The row is the GPU's time and the GPU's dispatch count, and it is
-    // printed only when the GPU was used: a host run's split is the
-    // C++'s split, row for row.
     let gpu = match ops.place() {
         npum_model::dispatcher::Placement::Vulkan => Some(crate::status::Gpu {
             device: ops.device().unwrap_or("the GPU").to_string(),
@@ -215,8 +345,6 @@ pub fn run(
             vectors.len() / hidden
         );
     } else {
-        // The C++'s rendering: the first four vectors, the first six
-        // components of each, and an ellipsis.
         for b in 0..texts.len().min(4) {
             print!("  [{b}]");
             for c in 0..6 {
@@ -244,7 +372,9 @@ fn load_tokenizer(
     if arch.contains("gte_new_rope") || arch.contains("gte") && arch.contains("rope") {
         let blob = container
             .tensor_bytes("tokenizer.xlmr_table")
-            .map_err(|_| "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string())?;
+            .map_err(|_| {
+                "the container holds no XLM-R tokenizer table (tokenizer.xlmr_table)".to_string()
+            })?;
         let tok = XlmrTokenizer::from_table_bytes(blob)?;
         return Ok(EmbedTokenizer::Xlmr(tok));
     }
@@ -252,7 +382,8 @@ fn load_tokenizer(
         .tensor_bytes("tokenizer.vocab")
         .map_err(|_| "the container holds no vocabulary".to_string())?;
     let text = String::from_utf8_lossy(blob);
-    let wp = WordPiece::from_lines(&text).map_err(|e| format!("the vocabulary is unusable: {e}"))?;
+    let wp =
+        WordPiece::from_lines(&text).map_err(|e| format!("the vocabulary is unusable: {e}"))?;
     Ok(EmbedTokenizer::WordPiece(wp))
 }
 
@@ -290,7 +421,10 @@ pub fn sequence_length(
         }
     }
     // 2. The design the container carries.
-    for name in ["design/gemm_rtp/design.json", "design/gemm_rtp_dec/design.json"] {
+    for name in [
+        "design/gemm_rtp/design.json",
+        "design/gemm_rtp_dec/design.json",
+    ] {
         if let Some(bytes) = container.tensor_bytes(name).ok() {
             if let Some(seq) = read_seq_bytes(bytes) {
                 return seq;
@@ -416,11 +550,11 @@ pub fn places(
 ) -> crate::status::Places {
     let mut places = crate::status::Places::default();
     let gpu = match ops.place() {
-        npum_model::dispatcher::Placement::Vulkan => ops
-            .device()
-            .map(|device| crate::status::OpWhere::Gpu {
+        npum_model::dispatcher::Placement::Vulkan => {
+            ops.device().map(|device| crate::status::OpWhere::Gpu {
                 device: device.to_string(),
-            }),
+            })
+        }
         _ => None,
     };
     // THE ARRAY'S PLACE FIRST, AND THE GPU'S IF THE ARRAY DOES NOT HAVE
@@ -543,12 +677,7 @@ fn layers(path: &Path) -> Option<usize> {
 /// where that pass's name comes from. A design set that is on the disk and
 /// that the run did not ask for is a design set nobody dispatched, and
 /// saying "on the ARRAY" about it would be a status block that lies.
-fn array_place(
-    path: &Path,
-    root: &Path,
-    set: &str,
-    asked: bool,
-) -> Option<crate::status::OpPlace> {
+fn array_place(path: &Path, root: &Path, set: &str, asked: bool) -> Option<crate::status::OpPlace> {
     if !asked {
         return None;
     }
@@ -603,9 +732,31 @@ fn wants_op(args: &crate::flags::Args, code: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an eltwise design set is present for this model.
+///
+/// Presence is checked before opening so a real open/load failure (corrupt or
+/// incompatible design) is reported directly instead of being masked by trying
+/// an unrelated fallback design.
+fn eltwise_design_present(path: &Path, root: &Path, set: &str) -> bool {
+    if let Ok(container) = npum_format::Container::open(path) {
+        if container
+            .directory()
+            .tensor(&format!("design/{set}/design.json"))
+            .is_some()
+        {
+            return true;
+        }
+    }
+    let Some(dir) = find_artifacts(root, &container_name(path)) else {
+        return false;
+    };
+    let set_dir = dir.join(set);
+    set_dir.join("design.json").is_file() || set_dir.is_dir()
+}
+
 /// The array's elementwise passes, when the run asked for them.
 ///
-/// The three passes are three designs and three contexts, and only the ones
+/// The passes are separate designs and separate contexts, and only the ones
 /// the flag named are opened: a design that was not opened is a pass that
 /// stays on the host.
 pub fn open_eltwise(
@@ -616,9 +767,23 @@ pub fn open_eltwise(
     use npum_xdna::eltwise::{Eltwise, EltwiseDesign};
 
     let mut layernorm = None;
+    let mut rmsnorm = None;
     if wants_layernorm(args) {
-        let design = open_design(path, root, "layernorm", "layn")?;
-        layernorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
+        // Prefer LayerNorm design; for models that use RMSNorm (e.g. Gemma),
+        // the exported eltwise artifact is `rmsnorm/` and should be opened as
+        // RMSNorm while still being requested via the `layn` op code. Only
+        // fall back when the LayerNorm design is not present, so a broken
+        // LayerNorm design is reported instead of being hidden behind an
+        // unrelated rmsnorm lookup.
+        if eltwise_design_present(path, root, "layernorm") {
+            let design = open_design(path, root, "layernorm", "layn")?;
+            layernorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
+        } else if eltwise_design_present(path, root, "rmsnorm") {
+            let design = open_design(path, root, "rmsnorm", "layn")?;
+            rmsnorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
+        } else {
+            let _ = open_design(path, root, "layernorm", "layn")?;
+        }
     }
     let mut gelu = None;
     if wants_gelu(args) {
@@ -630,10 +795,11 @@ pub fn open_eltwise(
         let design = open_design(path, root, "softmax", "softm")?;
         softmax = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
     }
-    if layernorm.is_none() && gelu.is_none() && softmax.is_none() {
+    if layernorm.is_none() && rmsnorm.is_none() && gelu.is_none() && softmax.is_none() {
         return Ok(None);
     }
-    let backend = Eltwise::new(layernorm, gelu, softmax).map_err(|e| e.to_string())?;
+    let backend =
+        Eltwise::with_rmsnorm(layernorm, gelu, softmax, rmsnorm).map_err(|e| e.to_string())?;
     Ok(Some(Box::new(backend)))
 }
 
@@ -657,8 +823,7 @@ fn open_design(
         .directory()
         .tensor(&format!("design/{set}/design.json"))
         .is_some();
-    let transport = crate::transport::open()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
     if own {
         ArrayDesign::open_from_container(path, set, transport).map_err(|e| e.to_string())
     } else {
@@ -717,11 +882,6 @@ pub fn open_array(
     let gemm = wants_gemm(args);
     let attn = wants_attn(args);
 
-    // THE PANELS.
-    //
-    // Only the projections need them: the attention's operands are
-    // ACTIVATIONS, built on the host, and a container packed for the host
-    // has everything the attention needs.
     if gemm {
         let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
             format!(
@@ -744,13 +904,11 @@ pub fn open_array(
         }
     }
 
-    // THE DESIGN.
     let own = container
         .directory()
         .tensor("design/gemm_rtp/design.json")
         .is_some();
-    let transport = crate::transport::open()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
     let design = if own {
         ArrayDesign::open_from_container(path, "gemm_rtp", transport).map_err(|e| e.to_string())?
     } else {
@@ -767,7 +925,6 @@ pub fn open_array(
         ArrayDesign::open(&dir.join("gemm_rtp"), transport).map_err(|e| e.to_string())?
     };
 
-    // THE PROJECTIONS: the four of every layer.
     let spec = &model.spec;
     let hidden = spec.hidden;
     let ffn = spec.ffn;
@@ -793,9 +950,240 @@ pub fn open_array(
     Ok(Box::new(backend))
 }
 
+/// Array backend for GTE (fused up_gate makes ffn_up [hidden, 2*ffn]).
+#[allow(dead_code)]
+fn open_array_gte(
+    path: &Path,
+    model: &GteModel,
+    root: &Path,
+    args: &crate::flags::Args,
+) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
+    use npum_xdna::array::ArrayDesign;
+    use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
+
+    let container =
+        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+
+    let gemm = wants_gemm(args);
+    let attn = wants_attn(args);
+
+    if gemm {
+        let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
+            format!(
+                "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
+                 any: it has no layer.0.qkv. Repack it with the packer's --dtype bf16.",
+                path.display()
+            )
+        })?;
+        if panel.dtype != "BF16" {
+            return Err(format!(
+                "{}: --npu-ops gemm needs the array's panels (BF16), but layer.0.qkv is {}.",
+                path.display(),
+                panel.dtype
+            ));
+        }
+    }
+
+    let own = container
+        .directory()
+        .tensor("design/gemm_rtp/design.json")
+        .is_some();
+    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
+    let design = if own {
+        ArrayDesign::open_from_container(path, "gemm_rtp", transport).map_err(|e| e.to_string())?
+    } else {
+        let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
+            format!(
+                "{}: --npu-ops {} needs a design set: this container does not carry one, \
+                 and no design set was found for it. Pass --artifacts <dir> naming one.",
+                path.display(),
+                if gemm { "gemm" } else { "attn" }
+            )
+        })?;
+        ArrayDesign::open(&dir.join("gemm_rtp"), transport).map_err(|e| e.to_string())?
+    };
+
+    let spec = &model.spec;
+    let hidden = spec.hidden;
+    let ffn = spec.ffn;
+    let mut specs = Vec::with_capacity(spec.layers * 4);
+    if gemm {
+        for layer in 0..spec.layers {
+            for (op, k, n) in [
+                ("qkv", hidden, 3 * hidden),
+                ("attn_out", hidden, hidden),
+                ("ffn_up", hidden, 2 * ffn),
+                ("ffn_down", ffn, hidden),
+            ] {
+                specs.push(GemmSpec {
+                    weight: format!("layer.{layer}.{op}"),
+                    op: op.to_string(),
+                    k,
+                    n,
+                });
+            }
+        }
+    }
+    let backend = ArrayGemms::open(path, design, &specs, attn).map_err(|e| e.to_string())?;
+    Ok(Box::new(backend))
+}
+
 /// A container's name, without the directory and without the extension.
 fn container_name(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some((model, input)) = args.positional.first().zip(args.positional.get(1)) else {
+        return crate::needs_a_model("embed");
+    };
+    let prefix = args.value("--prefix").map(|s| s.to_string());
+    let allow_truncation = args.switch("--allow-truncation");
+    // The provenance warning comes FIRST, before the banner: it is about
+    // the MODEL and not about this run.
+    if !crate::families::looks_like_container_path(model) {
+        crate::families::warn_if_unpinned(model);
+    }
+    crate::families::with_model(model, npum_families::Family::Embed, root, |path, arch| {
+        // THE BACKEND, and the arithmetic it names.
+        //
+        // The choice is made HERE, before the banner: a machine with no
+        // Vulkan device is refused before a status block that would claim
+        // the GPU is printed.
+        let choice = match crate::backend::choose(args) {
+            Ok(choice) => choice,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        // The banner comes before the refusal, as in the C++.
+        crate::status::announce(
+            path,
+            root,
+            &crate::embed::places(path, root, args, choice.ops.as_ref()),
+        );
+        // `--npu-ops` is a valid request and a valid question, and this
+        // runtime answers it for five of the codes: the projections, the
+        // LayerNorm, the GELU, the softmax and the attention go to the
+        // array. The rest are not ported yet, and accepting them and
+        // running the host would leave the command line saying "array"
+        // about a run that dispatched nothing -- which is the one thing
+        // the flag exists to prevent.
+        //
+        // The array path itself is NOT missing: the transport, the design
+        // loader, the array's GEMM, its elementwise passes and its
+        // attention are ported and checked on the board. What is missing is
+        // the SEAM for the other families.
+        //
+        // GTE (rope+GEGLU) carries its own forward pass, and it does not
+        // yet dispatch projections, attention or eltwise work to the array.
+        // Until that seam is ported, every code that would open a design or
+        // claim an array dispatch here must be refused rather than accepted
+        // and run on the host. The refusal must name that seam here, at the
+        // family gate: the generic "no array-able operation" wording hides
+        // why GTE in particular cannot honour the flag.
+        let is_gte =
+            arch.contains("gte_new_rope") || (arch.contains("gte") && arch.contains("rope"));
+        let refusal = if is_gte {
+            crate::families::refuse_gte_array_ops(args, arch)
+        } else {
+            crate::families::refuse_array_not_ported(
+                npum_families::Family::Embed,
+                args,
+                &["gemm", "layn", "gelu", "softm", "attn"],
+            )
+        };
+        if let Some(reason) = refusal {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(prefix) = prefix.as_deref() {
+            if let Some(reason) = crate::families::refuse_unknown_prefix(path, prefix) {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        }
+        let texts = match crate::embed::read_texts(input) {
+            Ok(t) => t,
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        match crate::embed::run(
+            path,
+            arch,
+            &texts,
+            prefix.as_deref(),
+            crate::embed::wants_out_file(args).as_deref(),
+            allow_truncation,
+            root,
+            args,
+            choice.ops,
+        ) {
+            Ok(_) => 0,
+            Err(refusal) => {
+                eprintln!("error: {}", refusal.message);
+                refusal.code
+            }
+        }
+    })
+}
+
+pub fn tokenize_command(args: &Args, root: &Path) -> crate::families::Outcome {
+    let Some((model, file)) = args.positional.first().zip(args.positional.get(1)) else {
+        return crate::needs_a_model("tokenize");
+    };
+    let max_len = args.value_i64("--max-len").unwrap_or(64).max(0) as usize;
+    crate::families::with_model(model, npum_families::Family::Embed, root, |path, arch| {
+        let container = match npum_format::Container::open(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {}: {e}", path.display());
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let tokenizer = match crate::families::load_tokenizer(&container, arch) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {}: {e}", path.display());
+                return crate::EXIT_REFUSED;
+            }
+        };
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: cannot open {file}: {e}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+
+        let mut lines = 0usize;
+        let mut cut = 0usize;
+        for line in text.lines() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let (encoding, truncated) = match tokenizer.encode_padded(line, max_len) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            lines += 1;
+            if truncated {
+                cut += 1;
+            }
+            let ids: Vec<String> = encoding.ids.iter().map(|id| id.to_string()).collect();
+            println!("{}", ids.join(" "));
+        }
+        if cut > 0 {
+            eprintln!(
+                "  NOTE  {cut} of {lines} lines exceeded max_len={max_len} and were truncated."
+            );
+        }
+        0
+    })
 }

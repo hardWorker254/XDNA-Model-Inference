@@ -40,7 +40,10 @@ fn the_driver_names_the_contexts_it_holds() {
     // driver hides other users' contexts -- but every entry it does return
     // has a pid and a partition, because that is what the budget check reads.
     for context in &contexts {
-        assert!(context.num_col > 0, "a context with no columns: {context:?}");
+        assert!(
+            context.num_col > 0,
+            "a context with no columns: {context:?}"
+        );
     }
     eprintln!("# contexts {}", contexts.len());
 }

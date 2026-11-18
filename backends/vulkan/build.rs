@@ -49,9 +49,8 @@ fn main() {
     for (const_name, file) in SHADERS {
         let path = format!("shaders/{file}.wgsl");
         let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let module = wgsl::parse_str(&source).unwrap_or_else(|e| {
-            panic!("{path}: WGSL does not parse: {e}")
-        });
+        let module =
+            wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{path}: WGSL does not parse: {e}"));
         let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
             .validate(&module)
             .unwrap_or_else(|e| panic!("{path}: WGSL does not validate: {e:?}"));

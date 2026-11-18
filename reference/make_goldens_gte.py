@@ -51,13 +51,16 @@ import numpy as np
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_REPO = Path(__file__).resolve().parent.parent
+for _p in (str(_REPO), str(_REPO / "reference"), str(_REPO / "tools" / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from corpus_gte import SENTENCES, SEQ_LEN as DEFAULT_SEQ_LEN  # noqa: E402
-from npz_io import save, load as load_goldens  # noqa: E402
-from onnx_io import MODEL_ONNX, load, model_digest           # noqa: E402
+from reference.corpus_gte import SENTENCES, SEQ_LEN as DEFAULT_SEQ_LEN  # noqa: E402
+from reference.npz_io import save, load as load_goldens  # noqa: E402
+from reference.onnx_io import MODEL_ONNX, load, model_digest           # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = _REPO
 GOLDENS = REPO / "reference" / "goldens_gte"
 
 # Cross-pipeline gate: oracle 1's manual CLS + L2-normalize vs oracle 2's
@@ -151,7 +154,9 @@ def main():
     pin = json.loads((model_dir / "CHECKPOINT.json").read_text(encoding="utf-8"))
     npue_path = REPO / "models" / "gte-multilingual-base.npue"
     if npue_path.exists():
-        sys.path.insert(0, str(REPO / "tools"))
+        _p = str(REPO / "tools")
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
         import npue as npue_mod
         packed_sha = npue_mod.Reader(str(npue_path)).config["source_sha256"]
         if packed_sha != digest:
@@ -289,7 +294,9 @@ def main():
         # make_goldens_nomic.py: the boundary file is the torch reference,
         # the taps file is the numpy oracle's intermediates, and
         # tools/export/export_validation.py consumes the taps.
-        sys.path.insert(0, str(REPO / "reference"))
+        _p = str(REPO / "reference")
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
         from encoder_gte import GteEncoder
         w, _ = load(model_dir / MODEL_ONNX)
         w32 = {}
