@@ -908,7 +908,14 @@ const PAGE_FLOATS: usize = 4096 / 4;
 #[inline(always)]
 fn avx512_tail_mask(tail: usize) -> u16 {
     debug_assert!((1..=16).contains(&tail));
-    (1u16 << tail) - 1
+    // A full sixteen-lane vector cannot be formed by shifting a u16 by 16:
+    // that overflows in debug and wraps to zero in release, which would mask
+    // EVERY lane out. The full width is simply "all sixteen bits set".
+    if tail >= 16 {
+        u16::MAX
+    } else {
+        (1u16 << tail) - 1
+    }
 }
 
 /// The eight-lane mask for a tail of `1..=8` columns.
@@ -920,13 +927,10 @@ fn avx512_tail_mask(tail: usize) -> u16 {
 unsafe fn avx2_tail_mask(tail: usize) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
     debug_assert!((1..=8).contains(&tail));
-    // SAFETY: AVX2 was enabled on this function; the comparison is lane-wise.
-    unsafe {
-        _mm256_cmpgt_epi32(
-            _mm256_set1_epi32(tail as i32),
-            _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0),
-        )
-    }
+    _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(tail as i32),
+        _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0),
+    )
 }
 
 /// The GEMM, one row at a time, with the accumulator in memory.
@@ -1014,9 +1018,7 @@ unsafe fn gemm_nt_avx2_rows(
         let arow = &a[r * k..r * k + k];
         acc.fill(0.0);
         for kk in 0..k {
-            // SAFETY: the host was checked for the feature when this function
-            // was dispatched to.
-            let av = unsafe { _mm256_set1_ps(arow[kk]) };
+            let av = _mm256_set1_ps(arow[kk]);
             let brow = &b[kk * n..kk * n + n];
             let mut j = 0usize;
             while j + 8 <= n {

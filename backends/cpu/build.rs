@@ -35,10 +35,11 @@ fn compiler() -> String {
 const FLAGS: [&str; 3] = ["-O2", "-fPIC", "-std=c11"];
 
 /// Detect whether the compiler supports stable AVX-512 intrinsics/target
-/// features. They were stabilized in Rust 1.89; older toolchains (including
-/// this workspace's MSRV of 1.85) cannot compile `#[target_feature(enable =
-/// "avx512f")]` functions that use AVX-512 intrinsics, so the AVX-512 GEMM
-/// paths must be compiled out there.
+/// features. They were stabilized in Rust 1.89, which is why the workspace
+/// pins 1.89 in `rust-toolchain.toml`: with the pin, the AVX-512 GEMM paths
+/// are compiled in and the runtime feature check picks them on capable
+/// silicon. The crate's declared MSRV stays 1.85 -- on an older toolchain
+/// this gate compiles the AVX-512 kernels out instead of failing the build.
 fn rustc_supports_stable_avx512() -> bool {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let out = match Command::new(rustc).arg("-V").output() {
