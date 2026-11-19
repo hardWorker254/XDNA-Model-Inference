@@ -288,6 +288,15 @@ impl GteModel {
             path: path.display().to_string(),
             source,
         })?;
+        Self::from_container(&container)
+    }
+
+    /// Read the model out of an ALREADY OPEN container.
+    ///
+    /// The embed command opens one container and threads it through the arch
+    /// check, the status block, the tokenizer and the model; opening it again
+    /// here would map the same multi-GB file a second time.
+    pub fn from_container(container: &npum_format::Container) -> Result<Self> {
         let arch = container.config_str("arch").unwrap_or("").to_string();
         if arch != IMPLEMENTED_ARCH {
             return Err(Error::WrongArch {

@@ -167,6 +167,7 @@ fn pack_batch(
 /// the reference pushes every line it reads, and a line that is empty is a text
 /// that embeds to something.
 pub fn run(
+    container: &npum_format::Container,
     path: &Path,
     arch: &str,
     texts: &[String],
@@ -177,18 +178,14 @@ pub fn run(
     args: &crate::flags::Args,
     mut ops: Box<dyn npum_model::Ops>,
 ) -> Result<Vec<f32>, Refusal> {
-    let container = npum_format::Container::open(path).map_err(|e| Refusal {
-        code: crate::EXIT_REFUSED,
-        message: format!("{}: {e}", path.display()),
-    })?;
-    let tokenizer = load_tokenizer(&container, arch).map_err(|e| Refusal {
+    let tokenizer = load_tokenizer(container, arch).map_err(|e| Refusal {
         code: crate::EXIT_REFUSED,
         message: format!("{}: {e}", path.display()),
     })?;
 
     // GTE has its own forward pass (RoPE, GEGLU, CLS pooling).
     if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
-        let model = GteModel::open(path).map_err(|e| Refusal {
+        let model = GteModel::from_container(container).map_err(|e| Refusal {
             code: crate::EXIT_REFUSED,
             message: format!("{}: {e}", path.display()),
         })?;
@@ -221,7 +218,7 @@ pub fn run(
         let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> = None;
 
         let artifacts = find_artifacts(root, &container_name(path));
-        let seq = sequence_length(path, &container, root, artifacts.as_deref());
+        let seq = sequence_length(path, container, root, artifacts.as_deref());
         let hidden = model.spec.hidden;
 
         crate::status::print_tokenizer(tokenizer.vocab_size());
@@ -312,7 +309,7 @@ pub fn run(
         return Ok(vectors);
     }
 
-    let model = BertModel::open(path).map_err(|e| Refusal {
+    let model = BertModel::from_container(container).map_err(|e| Refusal {
         code: crate::EXIT_REFUSED,
         message: format!("{}: {e}", path.display()),
     })?;
@@ -326,7 +323,7 @@ pub fn run(
     let mut array: Option<Box<dyn npum_model::array::ArrayText>> =
         if wants_gemm(args) || wants_attn(args) {
             Some(
-                open_array(path, &model, root, args).map_err(|reason| Refusal {
+                open_array(container, path, &model, root, args).map_err(|reason| Refusal {
                     code: crate::EXIT_REFUSED,
                     message: reason,
                 })?,
@@ -339,7 +336,7 @@ pub fn run(
     // Each pass is its own design and its own context, and a design that
     // was not opened is a pass that stays on the host.
     let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> =
-        match open_eltwise(path, root, args) {
+        match open_eltwise(container, path, root, args) {
             Ok(backend) => backend,
             Err(reason) => {
                 return Err(Refusal {
@@ -353,7 +350,7 @@ pub fn run(
     // run might give: the banner says WHICH container, and a refusal on
     // its own does not.
     let artifacts = find_artifacts(root, &container_name(path));
-    let seq = sequence_length(path, &container, root, artifacts.as_deref());
+    let seq = sequence_length(path, container, root, artifacts.as_deref());
     let hidden = model.spec.hidden;
 
     // The vocabulary's size, and then the texts. The reference's order, and the
@@ -631,6 +628,7 @@ pub fn wants_attn(args: &crate::flags::Args) -> bool {
 /// different one. So the attention's line says the host, and the run does
 /// the attention on the host.
 pub fn places(
+    container: &npum_format::Container,
     path: &Path,
     root: &Path,
     args: &Args,
@@ -656,19 +654,20 @@ pub fn places(
     // set's existence: a design set on the disk is not a dispatch, and a
     // status block that said "on the ARRAY" for a pass the host computed
     // would be a block that lies. The reference's block reads it the same way.
-    places.layn = array_place(path, root, "layernorm", wants_layernorm(args))
+    places.layn = array_place(container, path, root, "layernorm", wants_layernorm(args))
         .map(crate::status::OpWhere::Array)
         .or_else(|| gpu.clone());
-    places.gelu = array_place(path, root, "gelu", wants_gelu(args))
+    places.gelu = array_place(container, path, root, "gelu", wants_gelu(args))
         .map(crate::status::OpWhere::Array)
         .or_else(|| gpu.clone());
-    places.softm = array_place(path, root, "softmax", wants_softmax(args))
+    places.softm = array_place(container, path, root, "softmax", wants_softmax(args))
         .map(crate::status::OpWhere::Array)
         .or_else(|| gpu.clone());
     if wants_attn(args) {
         // The attention's streams are inside the projections' set, so the
         // place it names is that set's.
-        places.attn = op_place(path, root, "gemm_rtp").map(crate::status::OpWhere::Array);
+        places.attn =
+            op_place(container, path, root, "gemm_rtp").map(crate::status::OpWhere::Array);
     }
     // THE GPU'S OWN PASSES, for the backend's line.
     //
@@ -695,7 +694,7 @@ pub fn places(
             passes,
         });
     }
-    places.staged_bytes = staged_bytes(path, root, args);
+    places.staged_bytes = staged_bytes(container, path, root, args);
     places
 }
 
@@ -719,13 +718,21 @@ fn is_gpu(place: &Option<crate::status::OpWhere>) -> bool {
 /// because the block is a description of the run rather than a report on
 /// it -- and a block that reports the intention rather than the value is
 /// this project's recurring fail-open.
-pub fn staged_bytes(path: &Path, root: &Path, args: &Args) -> usize {
+pub fn staged_bytes(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    args: &Args,
+) -> usize {
     let mut bytes = 0usize;
     if wants_gemm(args) {
-        bytes += panel_bytes(path);
+        bytes += panel_bytes(container);
     }
     if wants_layernorm(args) {
-        if let (Some(cols), Some(layers)) = (design_cols(path, root, "layernorm"), layers(path)) {
+        if let (Some(cols), Some(layers)) = (
+            design_cols(container, path, root, "layernorm"),
+            layers(container),
+        ) {
             // gamma and beta, f32, two of them per row.
             bytes += (1 + 2 * layers) * 2 * cols * 4;
         }
@@ -734,10 +741,7 @@ pub fn staged_bytes(path: &Path, root: &Path, args: &Args) -> usize {
 }
 
 /// The projections' panels, as the container holds them.
-fn panel_bytes(path: &Path) -> usize {
-    let Ok(container) = npum_format::Container::open(path) else {
-        return 0;
-    };
+fn panel_bytes(container: &npum_format::Container) -> usize {
     container
         .directory()
         .tensors()
@@ -748,14 +752,18 @@ fn panel_bytes(path: &Path) -> usize {
 }
 
 /// One design set's row width, from its own manifest.
-fn design_cols(path: &Path, root: &Path, set: &str) -> Option<usize> {
-    let value = design_manifest(path, root, set)?;
+fn design_cols(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    set: &str,
+) -> Option<usize> {
+    let value = design_manifest(container, path, root, set)?;
     value.get("cols")?.as_u64().map(|v| v as usize)
 }
 
 /// How many transformer layers the container's model has.
-fn layers(path: &Path) -> Option<usize> {
-    let container = npum_format::Container::open(path).ok()?;
+fn layers(container: &npum_format::Container) -> Option<usize> {
     container.config().get_i64("num_layers").map(|v| v as usize)
 }
 
@@ -765,16 +773,27 @@ fn layers(path: &Path) -> Option<usize> {
 /// where that pass's name comes from. A design set that is on the disk and
 /// that the run did not ask for is a design set nobody dispatched, and
 /// saying "on the ARRAY" about it would be a status block that lies.
-fn array_place(path: &Path, root: &Path, set: &str, asked: bool) -> Option<crate::status::OpPlace> {
+fn array_place(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    set: &str,
+    asked: bool,
+) -> Option<crate::status::OpPlace> {
     if !asked {
         return None;
     }
-    op_place(path, root, set)
+    op_place(container, path, root, set)
 }
 
 /// One design set's place, from its own manifest.
-fn op_place(path: &Path, root: &Path, set: &str) -> Option<crate::status::OpPlace> {
-    let value = design_manifest(path, root, set)?;
+fn op_place(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    set: &str,
+) -> Option<crate::status::OpPlace> {
+    let value = design_manifest(container, path, root, set)?;
     Some(crate::status::OpPlace {
         name: value
             .get("name")
@@ -795,15 +814,18 @@ fn op_place(path: &Path, root: &Path, set: &str) -> Option<crate::status::OpPlac
 ///
 /// The container is the PREFERRED source and the directory is the
 /// fallback, and the two are read the same way the design itself is.
-fn design_manifest(path: &Path, root: &Path, set: &str) -> Option<serde_json::Value> {
-    if let Ok(container) = npum_format::Container::open(path) {
-        if let Some(bytes) = container
-            .tensor_bytes(&format!("design/{set}/design.json"))
-            .ok()
-        {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                return Some(value);
-            }
+fn design_manifest(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    set: &str,
+) -> Option<serde_json::Value> {
+    if let Some(bytes) = container
+        .tensor_bytes(&format!("design/{set}/design.json"))
+        .ok()
+    {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            return Some(value);
         }
     }
     let dir = find_artifacts(root, &container_name(path))?;
@@ -825,15 +847,18 @@ fn wants_op(args: &crate::flags::Args, code: &str) -> bool {
 /// Presence is checked before opening so a real open/load failure (corrupt or
 /// incompatible design) is reported directly instead of being masked by trying
 /// an unrelated fallback design.
-fn eltwise_design_present(path: &Path, root: &Path, set: &str) -> bool {
-    if let Ok(container) = npum_format::Container::open(path) {
-        if container
-            .directory()
-            .tensor(&format!("design/{set}/design.json"))
-            .is_some()
-        {
-            return true;
-        }
+fn eltwise_design_present(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    set: &str,
+) -> bool {
+    if container
+        .directory()
+        .tensor(&format!("design/{set}/design.json"))
+        .is_some()
+    {
+        return true;
     }
     let Some(dir) = find_artifacts(root, &container_name(path)) else {
         return false;
@@ -848,6 +873,7 @@ fn eltwise_design_present(path: &Path, root: &Path, set: &str) -> bool {
 /// the flag named are opened: a design that was not opened is a pass that
 /// stays on the host.
 pub fn open_eltwise(
+    container: &npum_format::Container,
     path: &Path,
     root: &Path,
     args: &crate::flags::Args,
@@ -863,24 +889,24 @@ pub fn open_eltwise(
         // fall back when the LayerNorm design is not present, so a broken
         // LayerNorm design is reported instead of being hidden behind an
         // unrelated rmsnorm lookup.
-        if eltwise_design_present(path, root, "layernorm") {
-            let design = open_design(path, root, "layernorm", "layn")?;
+        if eltwise_design_present(container, path, root, "layernorm") {
+            let design = open_design(container, path, root, "layernorm", "layn")?;
             layernorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
-        } else if eltwise_design_present(path, root, "rmsnorm") {
-            let design = open_design(path, root, "rmsnorm", "layn")?;
+        } else if eltwise_design_present(container, path, root, "rmsnorm") {
+            let design = open_design(container, path, root, "rmsnorm", "layn")?;
             rmsnorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
         } else {
-            let _ = open_design(path, root, "layernorm", "layn")?;
+            let _ = open_design(container, path, root, "layernorm", "layn")?;
         }
     }
     let mut gelu = None;
     if wants_gelu(args) {
-        let design = open_design(path, root, "gelu", "gelu")?;
+        let design = open_design(container, path, root, "gelu", "gelu")?;
         gelu = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
     }
     let mut softmax = None;
     if wants_softmax(args) {
-        let design = open_design(path, root, "softmax", "softm")?;
+        let design = open_design(container, path, root, "softmax", "softm")?;
         softmax = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
     }
     if layernorm.is_none() && rmsnorm.is_none() && gelu.is_none() && softmax.is_none() {
@@ -898,6 +924,7 @@ pub fn open_eltwise(
 /// beside it -- no directory, no MLIR-AIE on the reader's machine, no
 /// artifacts to install.
 fn open_design(
+    container: &npum_format::Container,
     path: &Path,
     root: &Path,
     set: &str,
@@ -905,8 +932,6 @@ fn open_design(
 ) -> Result<npum_xdna::array::ArrayDesign<crate::transport::Transport>, String> {
     use npum_xdna::array::ArrayDesign;
 
-    let container =
-        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let own = container
         .directory()
         .tensor(&format!("design/{set}/design.json"))
@@ -956,6 +981,7 @@ pub fn wants_gemm(args: &crate::flags::Args) -> bool {
 /// attention asks for the same design set, and the run holds ONE hardware
 /// context for the whole of the text family's dense work.
 pub fn open_array(
+    container: &npum_format::Container,
     path: &Path,
     model: &BertModel,
     root: &Path,
@@ -963,9 +989,6 @@ pub fn open_array(
 ) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
     use npum_xdna::array::ArrayDesign;
     use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
-
-    let container =
-        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
     let gemm = wants_gemm(args);
     let attn = wants_attn(args);
@@ -1041,6 +1064,7 @@ pub fn open_array(
 /// Array backend for GTE (fused up_gate makes ffn_up [hidden, 2*ffn]).
 #[allow(dead_code)]
 fn open_array_gte(
+    container: &npum_format::Container,
     path: &Path,
     model: &GteModel,
     root: &Path,
@@ -1048,9 +1072,6 @@ fn open_array_gte(
 ) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
     use npum_xdna::array::ArrayDesign;
     use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
-
-    let container =
-        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
     let gemm = wants_gemm(args);
     let attn = wants_attn(args);
@@ -1134,7 +1155,8 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
     if !crate::families::looks_like_container_path(model) {
         crate::families::warn_if_unpinned(model);
     }
-    crate::families::with_model(model, npum_families::Family::Embed, root, |path, arch| {
+    #[rustfmt::skip]
+    let outcome = crate::families::with_model_open(model, npum_families::Family::Embed, root, |path, arch, container| {
         // THE BACKEND, and the arithmetic it names.
         //
         // The choice is made HERE, before the banner: a machine with no
@@ -1149,9 +1171,10 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         };
         // The banner comes before the refusal, as in the reference.
         crate::status::announce(
+            container,
             path,
             root,
-            &crate::embed::places(path, root, args, choice.ops.as_ref()),
+            &crate::embed::places(container, path, root, args, choice.ops.as_ref()),
         );
         // `--npu-ops` is a valid request and a valid question, and this
         // runtime answers it for five of the codes: the projections, the
@@ -1189,7 +1212,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             return crate::EXIT_REFUSED;
         }
         if let Some(prefix) = prefix.as_deref() {
-            if let Some(reason) = crate::families::refuse_unknown_prefix(path, prefix) {
+            if let Some(reason) = crate::families::refuse_unknown_prefix(container, prefix) {
                 eprintln!("error: {reason}");
                 return crate::EXIT_REFUSED;
             }
@@ -1202,6 +1225,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             }
         };
         match crate::embed::run(
+            container,
             path,
             arch,
             &texts,
@@ -1218,7 +1242,8 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                 refusal.code
             }
         }
-    })
+    });
+    outcome
 }
 
 pub fn tokenize_command(args: &Args, root: &Path) -> crate::families::Outcome {
@@ -1226,15 +1251,9 @@ pub fn tokenize_command(args: &Args, root: &Path) -> crate::families::Outcome {
         return crate::needs_a_model("tokenize");
     };
     let max_len = args.value_i64("--max-len").unwrap_or(64).max(0) as usize;
-    crate::families::with_model(model, npum_families::Family::Embed, root, |path, arch| {
-        let container = match npum_format::Container::open(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: {}: {e}", path.display());
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let tokenizer = match crate::families::load_tokenizer(&container, arch) {
+    #[rustfmt::skip]
+    let outcome = crate::families::with_model_open(model, npum_families::Family::Embed, root, |path, arch, container| {
+        let tokenizer = match crate::families::load_tokenizer(container, arch) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("error: {}: {e}", path.display());
@@ -1273,7 +1292,8 @@ pub fn tokenize_command(args: &Args, root: &Path) -> crate::families::Outcome {
             );
         }
         0
-    })
+    });
+    outcome
 }
 
 #[cfg(test)]

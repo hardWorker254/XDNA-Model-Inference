@@ -255,7 +255,8 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         );
         return crate::EXIT_REFUSED;
     }
-    crate::families::with_model(model, npum_families::Family::Cls, root, |path, arch| {
+    #[rustfmt::skip]
+    let outcome = crate::families::with_model_open(model, npum_families::Family::Cls, root, |path, arch, container| {
         if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Cls) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -275,14 +276,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // The ViT's own block, on the stderr: the geometry, the design set,
         // and where every operation runs.
         let started = std::time::Instant::now();
-        let container = match npum_format::Container::open(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: {}: {e}", path.display());
-                return crate::EXIT_REFUSED;
-            }
-        };
-        let Some(geometry) = crate::vit::read_geometry(&container, path) else {
+        let Some(geometry) = crate::vit::read_geometry(container, path) else {
             eprintln!(
                 "error: {}: the container does not carry the ViT's geometry",
                 path.display()
@@ -389,5 +383,6 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             print!("{out}");
         }
         0
-    })
+    });
+    outcome
 }

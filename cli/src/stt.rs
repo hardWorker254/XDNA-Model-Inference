@@ -408,7 +408,13 @@ pub fn find_designs(root: &Path, model_name: &str) -> Option<PathBuf> {
 /// The order of the stderr is the reference's: the context budget BEFORE
 /// anything is built, the block before the work, and the chunks and the
 /// time after it.
-pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> i32 {
+pub fn run(
+    container: &npum_format::Container,
+    path: &Path,
+    audio: &str,
+    args: &crate::flags::Args,
+    root: &Path,
+) -> i32 {
     // The context budget, BEFORE the session builds anything. Two design
     // sets are the floor here, and every elementwise op on the array is one
     // more xclbin and one more hw_context: the npu1 driver measured six, so
@@ -419,14 +425,7 @@ pub fn run(path: &Path, audio: &str, args: &crate::flags::Args, root: &Path) -> 
         return crate::EXIT_REFUSED;
     }
 
-    let container = match npum_format::Container::open(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {}: {e}", path.display());
-            return crate::EXIT_REFUSED;
-        }
-    };
-    let Some(geometry) = read_geometry(&container, path) else {
+    let Some(geometry) = read_geometry(container, path) else {
         eprintln!(
             "error: {}: the container does not carry the speech family's geometry",
             path.display()
@@ -587,7 +586,8 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
     let Some((model, audio)) = args.positional.first().zip(args.positional.get(1)) else {
         return crate::needs_a_model("transcribe");
     };
-    crate::families::with_model(model, npum_families::Family::Stt, root, |path, arch| {
+    #[rustfmt::skip]
+    let outcome = crate::families::with_model_open(model, npum_families::Family::Stt, root, |path, arch, container| {
         if !Path::new(audio).exists() {
             eprintln!("error: the audio file {audio} does not exist.");
             return crate::EXIT_REFUSED;
@@ -609,6 +609,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             return crate::EXIT_REFUSED;
         }
         let _ = arch;
-        crate::stt::run(path, audio, args, root)
-    })
+        crate::stt::run(container, path, audio, args, root)
+    });
+    outcome
 }

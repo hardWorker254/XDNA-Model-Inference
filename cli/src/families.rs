@@ -51,8 +51,10 @@ pub type Outcome = i32;
 /// The names are listed in SORTED order, and not in the table's order: a
 /// list that a reader has to scan is more useful sorted, and the table's
 /// order is the order the checkpoint happened to write them in.
-pub(crate) fn refuse_unknown_prefix(path: &Path, prefix: &str) -> Option<String> {
-    let container = npum_format::Container::open(path).ok()?;
+pub(crate) fn refuse_unknown_prefix(
+    container: &npum_format::Container,
+    prefix: &str,
+) -> Option<String> {
     let config = container.config();
     let Some(prompts) = config.get_object("prompts") else {
         return Some(format!(
@@ -294,7 +296,12 @@ pub(crate) fn load_tokenizer(
 /// in `npum_cpu::ocr_decode`. This function is the block, the per-image lines
 /// and the loop.
 
-/// Resolve the model, check the family, and run the family's body.
+/// Resolve the model, check the family, and run a body that needs only the
+/// path and the arch.
+///
+/// The container is still opened here, and cached, so a family that opens it
+/// again in its weights loader pays no second I/O. Bodies that read metadata
+/// all the way down use [`with_model_open`] instead and share ONE `&Container`.
 pub(crate) fn with_model<F>(
     model: &str,
     wanted: npum_families::Family,
@@ -303,6 +310,27 @@ pub(crate) fn with_model<F>(
 ) -> Outcome
 where
     F: FnOnce(&PathBuf, &str) -> Outcome,
+{
+    with_model_open(model, wanted, root, |path, arch, _container| {
+        body(path, arch)
+    })
+}
+
+/// Resolve the model, check the family, and run the family's body with ONE
+/// already-open container.
+///
+/// The container is opened HERE, once, and handed to the body. Every helper
+/// the body calls -- the status block, the tokenizer, the panels, the design
+/// manifest, the model itself -- takes this one `&Container`. Nothing below
+/// this line opens the file again.
+pub(crate) fn with_model_open<F>(
+    model: &str,
+    wanted: npum_families::Family,
+    root: &Path,
+    body: F,
+) -> Outcome
+where
+    F: FnOnce(&PathBuf, &str, &npum_format::Container) -> Outcome,
 {
     let path = match resolve_model(model, root) {
         Ok(p) => p,
@@ -332,7 +360,7 @@ where
         );
         return crate::EXIT_REFUSED;
     }
-    body(&path, &arch)
+    body(&path, &arch, &container)
 }
 
 /// Resolve a model's name or path to a container on disk.

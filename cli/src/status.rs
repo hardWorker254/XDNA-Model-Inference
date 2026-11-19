@@ -369,9 +369,13 @@ fn read_design_from(
 /// seen the banner knows WHICH container the refusal is about -- a
 /// refusal on its own says "something is wrong" and a banner says "this
 /// container, this design, this device".
-pub fn announce(path: &Path, root: &Path, places: &Places) -> Option<Status> {
-    let container = npum_format::Container::open(path).ok()?;
-    let status = read_container(&container, path);
+pub fn announce(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    places: &Places,
+) -> Option<Status> {
+    let status = read_container(container, path);
     let artifacts = crate::embed::find_artifacts(root, &status.model_name);
     // THE CONTAINER'S OWN SET, OR THE DIRECTORY'S.
     //
@@ -380,7 +384,7 @@ pub fn announce(path: &Path, root: &Path, places: &Places) -> Option<Status> {
     // beside it. The block has to name the same source the run will use --
     // a block that names a directory the run ignores is a block that
     // describes a different run.
-    let own = read_container_design(&container);
+    let own = read_container_design(container);
     let from_dir = artifacts.as_ref().and_then(|a| read_design(a));
     let design = own.as_ref().or(from_dir.as_ref());
     let what = match (own.is_some(), artifacts.as_deref()) {
