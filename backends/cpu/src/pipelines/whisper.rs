@@ -38,6 +38,7 @@
 //! norm, and the difference is not a rounding one.
 
 use crate::kernels;
+use crate::parallel;
 use crate::whisper_features::{MelSpec, gelu_erf_exact};
 use npum_format::Container;
 use std::path::Path;
@@ -282,13 +283,30 @@ impl Encoder {
             g.attn_scale as f32
         };
 
+        let threads = parallel::threads();
         for layer in &self.layers {
             // ---- self-attention, pre-LN ----
-            norm.copy_from_slice(x);
-            for row in norm.chunks_exact_mut(d) {
-                layernorm_row(row, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
-            }
-            kernels::gemm_nt(norm, n_src, &layer.qkv, d, 3 * d, &layer.qkv_bias, qkv);
+            // Fused copy + norm: the old `copy_from_slice` walked these 3 MB
+            // once only to overwrite every byte in the next loop.
+            layernorm_rows(
+                x,
+                norm,
+                n_src,
+                d,
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
+                g.ln_eps,
+            );
+            kernels::gemm_nt_rows(
+                norm,
+                n_src,
+                &layer.qkv,
+                d,
+                3 * d,
+                &layer.qkv_bias,
+                qkv,
+                threads,
+            );
             attention_into(
                 qkv,
                 3 * d,
@@ -304,7 +322,7 @@ impl Encoder {
                 scores,
                 acc,
             );
-            kernels::gemm_nt(
+            kernels::gemm_nt_rows(
                 ctx,
                 n_src,
                 &layer.attn_out,
@@ -312,17 +330,21 @@ impl Encoder {
                 d,
                 &layer.attn_out_bias,
                 proj,
+                threads,
             );
-            for i in 0..n_src * d {
-                x[i] += proj[i];
-            }
+            kernels::add_inplace(x, &proj[..n_src * d]);
 
             // ---- feed-forward, pre-LN ----
-            norm.copy_from_slice(x);
-            for row in norm.chunks_exact_mut(d) {
-                layernorm_row(row, &layer.ln2_gamma, &layer.ln2_beta, g.ln_eps);
-            }
-            kernels::gemm_nt(
+            layernorm_rows(
+                x,
+                norm,
+                n_src,
+                d,
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
+                g.ln_eps,
+            );
+            kernels::gemm_nt_rows(
                 norm,
                 n_src,
                 &layer.ffn_up,
@@ -330,11 +352,10 @@ impl Encoder {
                 g.enc_intermediate,
                 &layer.ffn_up_bias,
                 up,
+                threads,
             );
-            for v in up.iter_mut() {
-                *v = gelu_erf_exact(*v);
-            }
-            kernels::gemm_nt(
+            gelu_erf_rows(&mut up[..n_src * g.enc_intermediate]);
+            kernels::gemm_nt_rows(
                 up,
                 n_src,
                 &layer.ffn_down,
@@ -342,17 +363,14 @@ impl Encoder {
                 d,
                 &layer.ffn_down_bias,
                 down,
+                threads,
             );
-            for i in 0..n_src * d {
-                x[i] += down[i];
-            }
+            kernels::add_inplace(x, &down[..n_src * d]);
         }
 
         // Whisper's encoder output is AFTER the final LayerNorm -- that is
         // what transformers hands the decoder.
-        for row in x.chunks_exact_mut(d) {
-            layernorm_row(row, &self.final_gamma, &self.final_beta, g.ln_eps);
-        }
+        layernorm_rows_inplace(x, n_src, d, &self.final_gamma, &self.final_beta, g.ln_eps);
         x
     }
 }
@@ -578,7 +596,7 @@ impl Decoder {
         for (l, layer) in self.layers.iter().enumerate() {
             let cache = &mut self.cross_kv[l];
             cache.resize(n_src * 2 * d, 0.0);
-            kernels::gemm_nt(
+            kernels::gemm_nt_rows(
                 enc,
                 n_src,
                 &layer.cross_kv,
@@ -586,6 +604,7 @@ impl Decoder {
                 2 * d,
                 &layer.cross_kv_bias,
                 cache,
+                parallel::threads(),
             );
         }
         self.reset();
@@ -668,11 +687,20 @@ impl Decoder {
             h[j] = et[j] + pe[j];
         }
 
+        // A single-token GEMM falls back to the serial kernel inside
+        // `gemm_nt_rows`; the width is still useful if a caller decodes a
+        // batch, so go through the same seam as the encoder.
+        let threads = parallel::threads();
         for (l, layer) in self.layers.iter().enumerate() {
             // ---- self-attention over the cache, one new row ----
-            norm.copy_from_slice(&h[..d]);
-            layernorm_row(&mut norm[..d], &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
-            kernels::gemm_nt(
+            layernorm_into(
+                &h[..d],
+                &mut norm[..d],
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
+                g.ln_eps,
+            );
+            kernels::gemm_nt_rows(
                 &norm[..d],
                 1,
                 &layer.self_qkv,
@@ -680,6 +708,7 @@ impl Decoder {
                 3 * d,
                 &layer.self_qkv_bias,
                 &mut qkv[..3 * d],
+                threads,
             );
             // The K|V half of the fused QKV joins the cache; the Q half is
             // this step's query.
@@ -701,7 +730,7 @@ impl Decoder {
                 &mut scores[..n_kv],
                 &mut acc[..g.head_dim],
             );
-            kernels::gemm_nt(
+            kernels::gemm_nt_rows(
                 &ctx[..d],
                 1,
                 &layer.self_attn_out,
@@ -709,15 +738,19 @@ impl Decoder {
                 d,
                 &layer.self_attn_out_bias,
                 &mut proj[..d],
+                threads,
             );
-            for j in 0..d {
-                h[j] += proj[j];
-            }
+            kernels::add_inplace(&mut h[..d], &proj[..d]);
 
             // ---- cross-attention over the encoder output ----
-            norm.copy_from_slice(&h[..d]);
-            layernorm_row(&mut norm[..d], &layer.ln2_gamma, &layer.ln2_beta, g.ln_eps);
-            kernels::gemm_nt(
+            layernorm_into(
+                &h[..d],
+                &mut norm[..d],
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
+                g.ln_eps,
+            );
+            kernels::gemm_nt_rows(
                 &norm[..d],
                 1,
                 &layer.cross_q,
@@ -725,6 +758,7 @@ impl Decoder {
                 d,
                 &layer.cross_q_bias,
                 &mut qkv[..3 * d],
+                threads,
             );
             // The Q row is all this step needs from cross_q: its K|V half was
             // folded into a separate operand precisely so the two could be
@@ -744,7 +778,7 @@ impl Decoder {
                 &mut scores[..self.n_src],
                 &mut acc[..g.head_dim],
             );
-            kernels::gemm_nt(
+            kernels::gemm_nt_rows(
                 &ctx[..d],
                 1,
                 &layer.cross_attn_out,
@@ -752,15 +786,19 @@ impl Decoder {
                 d,
                 &layer.cross_attn_out_bias,
                 &mut proj[..d],
+                threads,
             );
-            for j in 0..d {
-                h[j] += proj[j];
-            }
+            kernels::add_inplace(&mut h[..d], &proj[..d]);
 
             // ---- feed-forward ----
-            norm.copy_from_slice(&h[..d]);
-            layernorm_row(&mut norm[..d], &layer.ln3_gamma, &layer.ln3_beta, g.ln_eps);
-            kernels::gemm_nt(
+            layernorm_into(
+                &h[..d],
+                &mut norm[..d],
+                &layer.ln3_gamma,
+                &layer.ln3_beta,
+                g.ln_eps,
+            );
+            kernels::gemm_nt_rows(
                 &norm[..d],
                 1,
                 &layer.ffn_up,
@@ -768,11 +806,10 @@ impl Decoder {
                 g.dec_intermediate,
                 &layer.ffn_up_bias,
                 &mut up[..g.dec_intermediate],
+                threads,
             );
-            for v in up.iter_mut() {
-                *v = gelu_erf_exact(*v);
-            }
-            kernels::gemm_nt(
+            gelu_erf_rows(&mut up[..g.dec_intermediate]);
+            kernels::gemm_nt_rows(
                 &up[..g.dec_intermediate],
                 1,
                 &layer.ffn_down,
@@ -780,10 +817,9 @@ impl Decoder {
                 d,
                 &layer.ffn_down_bias,
                 &mut down[..d],
+                threads,
             );
-            for j in 0..d {
-                h[j] += down[j];
-            }
+            kernels::add_inplace(&mut h[..d], &down[..d]);
         }
 
         self.n_cached += 1;
@@ -934,27 +970,25 @@ pub fn logits_from(h: &[f32], embed_tokens: &[f32], d: usize, vocab: usize) -> V
 /// overwritten. This is the form the decoder's step uses, so the 50k-entry
 /// logits vector is not rebuilt on every token.
 pub fn logits_from_into(h: &[f32], embed_tokens: &[f32], d: usize, vocab: usize, out: &mut [f32]) {
+    let h = &h[..d];
     let out = &mut out[..vocab];
-    for (v, slot) in out.iter_mut().enumerate() {
-        let e = &embed_tokens[v * d..][..d];
-        let mut lanes = [0.0f32; 8];
-        for l in 0..8 {
-            lanes[l] = h[l] * e[l];
+    let work = (vocab as i64) * (d as i64);
+    let Some(chunk) = parallel::chunk_rows(vocab, work, parallel::threads()) else {
+        for (v, slot) in out.iter_mut().enumerate() {
+            *slot = kernels::dot8(h, &embed_tokens[v * d..][..d]);
         }
-        let mut j = 8;
-        while j + 8 <= d {
-            for l in 0..8 {
-                lanes[l] = h[j + l].mul_add(e[j + l], lanes[l]);
-            }
-            j += 8;
+        return;
+    };
+    // Each vocabulary row is one independent dot product: splitting the rows
+    // changes which worker computes a logit, never the reduction order inside
+    // it, so the projection stays bit-identical to the serial one. `dot8`
+    // keeps the first-eight-products / eight-FMA-lanes / `hsum8` tree.
+    parallel::for_each_chunk_mut(out, chunk, |ci, part| {
+        let first = ci * chunk;
+        for (v, slot) in part.iter_mut().enumerate() {
+            *slot = kernels::dot8(h, &embed_tokens[(first + v) * d..][..d]);
         }
-        let mut acc = kernels::hsum8(lanes);
-        while j < d {
-            acc += h[j] * e[j];
-            j += 1;
-        }
-        *slot = acc;
-    }
+    });
 }
 
 /// LayerNorm over one row, as the reference's `layernorm_rows` computes it.
@@ -982,6 +1016,124 @@ pub fn layernorm_row(row: &mut [f32], gamma: &[f32], beta: &[f32], eps: f64) {
     for (j, v) in row.iter_mut().enumerate() {
         *v = ((*v - mean) * inv).mul_add(gamma[j], beta[j]);
     }
+}
+
+/// LayerNorm from one row into another, in one pass.
+///
+/// Identical arithmetic to [`layernorm_row`] -- the same f64 mean and
+/// variance, the same single rounding, the same FMA epilogue -- but it reads
+/// `src` while writing `dst`. The callers used to do `dst.copy_from_slice(src)`
+/// and then normalise `dst`, which walked each row twice; the first walk was
+/// pure overhead because every byte it copied was overwritten immediately.
+#[inline]
+pub fn layernorm_into(src: &[f32], dst: &mut [f32], gamma: &[f32], beta: &[f32], eps: f64) {
+    let d = dst.len();
+    let src = &src[..d];
+    let mut sm = 0.0f64;
+    for v in src.iter() {
+        sm += *v as f64;
+    }
+    let mean = (sm / d as f64) as f32;
+    let mut sv = 0.0f64;
+    for v in src.iter() {
+        let dd = *v as f64 - mean as f64;
+        sv += dd * dd;
+    }
+    let var = (sv / d as f64) as f32;
+    let inv = 1.0f32 / (var + eps as f32).sqrt();
+    for (j, slot) in dst.iter_mut().enumerate() {
+        *slot = ((src[j] - mean) * inv).mul_add(gamma[j], beta[j]);
+    }
+}
+
+/// LayerNorm of `rows` rows from `src` into `dst`, split over the pool.
+///
+/// A row is normalised from its own values only, so the split crosses no
+/// reduction and is bit-identical to running [`layernorm_into`] row by row.
+pub fn layernorm_rows(
+    src: &[f32],
+    dst: &mut [f32],
+    rows: usize,
+    width: usize,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f64,
+) {
+    let dst = &mut dst[..rows * width];
+    let Some(chunk) = parallel::chunk_rows(
+        rows,
+        (rows as i64) * (width as i64),
+        parallel::threads(),
+    ) else {
+        for i in 0..rows {
+            layernorm_into(
+                &src[i * width..][..width],
+                &mut dst[i * width..][..width],
+                gamma,
+                beta,
+                eps,
+            );
+        }
+        return;
+    };
+    parallel::for_each_chunk_mut(dst, chunk * width, |ci, part| {
+        let first = ci * chunk;
+        for (i, row) in part.chunks_exact_mut(width).enumerate() {
+            layernorm_into(
+                &src[(first + i) * width..][..width],
+                row,
+                gamma,
+                beta,
+                eps,
+            );
+        }
+    });
+}
+
+/// The in-place form of [`layernorm_rows`], for a stack's final norm.
+pub fn layernorm_rows_inplace(
+    x: &mut [f32],
+    rows: usize,
+    width: usize,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f64,
+) {
+    let x = &mut x[..rows * width];
+    let Some(chunk) = parallel::chunk_rows(
+        rows,
+        (rows as i64) * (width as i64),
+        parallel::threads(),
+    ) else {
+        for row in x.chunks_exact_mut(width) {
+            layernorm_row(row, gamma, beta, eps);
+        }
+        return;
+    };
+    parallel::for_each_chunk_mut(x, chunk * width, |_, part| {
+        for row in part.chunks_exact_mut(width) {
+            layernorm_row(row, gamma, beta, eps);
+        }
+    });
+}
+
+/// Whisper's exact-erf GELU over a slice, split over the pool.
+///
+/// `gelu_erf_exact` evaluates `erf` in f64 and rounds once; that is far more
+/// work per element than a polynomial GELU, so the 1.5 M elements of the
+/// encoder's FFNs are worth splitting even though each one is independent.
+pub fn gelu_erf_rows(x: &mut [f32]) {
+    let Some(chunk) = parallel::chunk_rows(x.len(), x.len() as i64, parallel::threads()) else {
+        for v in x.iter_mut() {
+            *v = gelu_erf_exact(*v);
+        }
+        return;
+    };
+    parallel::for_each_chunk_mut(x, chunk, |_, part| {
+        for v in part.iter_mut() {
+            *v = gelu_erf_exact(*v);
+        }
+    });
 }
 
 /// Attention over a K|V block, with the queries in a separate operand.
@@ -1054,27 +1206,92 @@ pub fn attention_into(
     scores: &mut [f32],
     acc: &mut [f32],
 ) {
-    let nv = head_dim / 8;
+    if n_q == 0 || n_kv == 0 || heads == 0 {
+        return;
+    }
+    let out = &mut out[..n_q * d_model];
+    let work = (n_q as i64) * (heads as i64) * (n_kv as i64) * (head_dim as i64) * 2;
+
+    // OVER QUERY ROWS first. One query's scores and output depend on no other
+    // query's, so a row split crosses no reduction: it is a choice of WHICH
+    // worker computes a row, never of what the row contains. Each chunk owns
+    // its score row and head accumulator, so workers cannot race on scratch.
+    if let Some(chunk) = parallel::chunk_rows(n_q, work, parallel::threads()) {
+        parallel::for_each_chunk_mut(out, chunk * d_model, |ci, part| {
+            let first = ci * chunk;
+            let rows = part.len() / d_model;
+            let mut scores = vec![0.0f32; n_kv];
+            let mut acc = vec![0.0f32; head_dim];
+            attention_rows(
+                q, q_stride, kv, kv_stride, first, rows, n_kv, d_model, 0, heads,
+                head_dim, scale, part, &mut scores, &mut acc,
+            );
+        });
+        return;
+    }
+
+    // One query has no row to split, so split the HEADS: each head writes its
+    // own `head_dim`-wide slice of the output row and reads only its own Q/K/V
+    // columns. This is what makes single-token decode use more than one core.
+    if n_q == 1 {
+        let row = &mut out[..d_model];
+        if let Some(chunk) = parallel::chunk_rows(heads, work, parallel::threads()) {
+            parallel::for_each_chunk_mut(row, chunk * head_dim, |hi, part| {
+                let first = hi * chunk;
+                let count = part.len() / head_dim;
+                let mut scores = vec![0.0f32; n_kv];
+                let mut acc = vec![0.0f32; head_dim];
+                attention_rows(
+                    q, q_stride, kv, kv_stride, 0, 1, n_kv, d_model, first,
+                    first + count, head_dim, scale, part, &mut scores, &mut acc,
+                );
+            });
+            return;
+        }
+    }
+
+    // Too small for a worker: the barrier costs more than the arithmetic.
+    // The caller's reusable scratch is used only on this path.
+    attention_rows(
+        q, q_stride, kv, kv_stride, 0, n_q, n_kv, d_model, 0, heads, head_dim,
+        scale, out, &mut scores[..n_kv], &mut acc[..head_dim],
+    );
+}
+
+/// One slice of attention: queries `i0..i0+rows`, heads `h0..h1`.
+///
+/// `out` is `rows` rows of `d_model` floats. The score dot product and the
+/// softmax-weighted value accumulation go through the bit-exact eight-lane
+/// helpers in [`kernels`], so the parallel path produces the same bytes the
+/// old hand-rolled eight-lane loops did.
+#[allow(clippy::too_many_arguments)]
+fn attention_rows(
+    q: &[f32],
+    q_stride: usize,
+    kv: &[f32],
+    kv_stride: usize,
+    i0: usize,
+    rows: usize,
+    n_kv: usize,
+    d_model: usize,
+    h0: usize,
+    h1: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+    scores: &mut [f32],
+    acc: &mut [f32],
+) {
     let scores = &mut scores[..n_kv];
     let acc = &mut acc[..head_dim];
-    for i in 0..n_q {
-        for h in 0..heads {
-            // QK^T, one row of scores at a time. The accumulation is eight
-            // lane accumulators with an FMA per element, finished with the
-            // same eight-lane horizontal sum the reference's `hsum256` does.
+    for i in i0..i0 + rows {
+        for h in h0..h1 {
+            // QK^T, one row of scores at a time: eight lane accumulators with
+            // an FMA per element and the reference's fixed `hsum8` tree.
             for (j, slot) in scores.iter_mut().enumerate() {
                 let qh = &q[i * q_stride + h * head_dim..][..head_dim];
                 let kj = &kv[j * kv_stride + h * head_dim..][..head_dim];
-                let mut lanes = [0.0f32; 8];
-                for l in 0..8 {
-                    lanes[l] = qh[l] * kj[l];
-                }
-                for v in 1..nv {
-                    for l in 0..8 {
-                        lanes[l] = qh[v * 8 + l].mul_add(kj[v * 8 + l], lanes[l]);
-                    }
-                }
-                *slot = kernels::hsum8(lanes) * scale;
+                *slot = kernels::dot8(qh, kj) * scale;
             }
 
             // Softmax with the maximum subtracted, the same reduction HF's
@@ -1097,16 +1314,12 @@ pub fn attention_into(
             // `__m256 acc[NV]`, and not one accumulator for the whole head.
             // The difference is the ORDER of the additions, and the order is
             // the answer.
-            let o = &mut out[i * d_model + h * head_dim..][..head_dim];
+            let o = &mut out[(i - i0) * d_model + h * head_dim..][..head_dim];
             acc.fill(0.0);
             for (j, &aj) in scores.iter().enumerate() {
                 let a = aj * inv;
                 let vj = &kv[j * kv_stride + d_model + h * head_dim..][..head_dim];
-                for lane in 0..nv {
-                    for l in 0..8 {
-                        acc[lane * 8 + l] = a.mul_add(vj[lane * 8 + l], acc[lane * 8 + l]);
-                    }
-                }
+                kernels::weighted_accumulate(acc, vj, a);
             }
             o.copy_from_slice(acc);
         }

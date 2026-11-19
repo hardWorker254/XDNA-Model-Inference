@@ -5,6 +5,7 @@
 //! FFN with GELU on the gate half, CLS pooling, no final norm.
 
 use crate::kernels;
+use crate::parallel;
 use npum_model::Ops;
 use npum_model::array::{ArrayEltwise, ArrayTextRef};
 use std::path::Path;
@@ -621,9 +622,7 @@ impl GteModel {
                     }
                 }
             }
-            for i in 0..x.len() {
-                x[i] += proj[i];
-            }
+            kernels::add_inplace(x, &proj[..x.len()]);
             // attn_ln (post-LN)
             let t_ln = std::time::Instant::now();
             ops.layernorm_rows(x, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
@@ -653,12 +652,37 @@ impl GteModel {
                 }
             }
             let inter = spec.ffn;
-            for r in 0..rows {
+            let geglu = |r: usize, out: &mut [f32]| {
                 let base = r * 2 * inter;
-                for j in 0..inter {
+                for (j, slot) in out.iter_mut().enumerate() {
                     let upv = up_gate[base + j];
                     let gate = up_gate[base + inter + j];
-                    act[r * inter + j] = upv * gelu_erf_f32(gate);
+                    *slot = upv * gelu_erf_f32(gate);
+                }
+            };
+            // Every output element is one `erff` on its own gate, so a row
+            // split crosses no reduction and keeps the exact libm result.
+            match parallel::chunk_rows(
+                rows,
+                (rows as i64) * (inter as i64),
+                parallel::threads(),
+            ) {
+                Some(chunk) => {
+                    parallel::for_each_chunk_mut(
+                        &mut act[..rows * inter],
+                        chunk * inter,
+                        |ci, part| {
+                            let first = ci * chunk;
+                            for (i, row) in part.chunks_exact_mut(inter).enumerate() {
+                                geglu(first + i, row);
+                            }
+                        },
+                    );
+                }
+                None => {
+                    for (r, part) in act[..rows * inter].chunks_exact_mut(inter).enumerate() {
+                        geglu(r, part);
+                    }
                 }
             }
             match array.as_deref_mut().filter(|_| gemm_on) {
@@ -691,9 +715,7 @@ impl GteModel {
                     }
                 }
             }
-            for i in 0..x.len() {
-                x[i] += down[i];
-            }
+            kernels::add_inplace(x, &down[..x.len()]);
             // mlp_ln (post-LN)
             let t_ln = std::time::Instant::now();
             ops.layernorm_rows(x, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
@@ -706,27 +728,33 @@ impl GteModel {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let head_dim = spec.head_dim;
-        let nv = head_dim / 8;
-        for b in 0..batch {
-            for h in 0..spec.heads {
-                for i in 0..seq {
-                    let q = &qkv[(b * seq + i) * 3 * hidden + h * head_dim..][..head_dim];
-                    let row_base = ((b * spec.heads + h) * seq + i) * seq;
-                    for j in 0..seq {
-                        let k =
-                            &qkv[(b * seq + j) * 3 * hidden + hidden + h * head_dim..][..head_dim];
-                        let mut lanes = [0.0f32; 8];
-                        for l in 0..8 {
-                            lanes[l] = q[l] * k[l];
-                        }
-                        for v in 1..nv {
-                            let off = v * 8;
-                            for l in 0..8 {
-                                lanes[l] = q[off + l].mul_add(k[off + l], lanes[l]);
-                            }
-                        }
-                        scores[row_base + j] = kernels::hsum8(lanes) + add_mask[b * seq + j];
+        let rows = batch * spec.heads * seq;
+        let work = (rows as i64) * (seq as i64) * (head_dim as i64) * 2;
+        let qk_row = |row: usize, dst: &mut [f32]| {
+            let p = row / seq;
+            let i = row % seq;
+            let b = p / spec.heads;
+            let h = p % spec.heads;
+            let q = &qkv[(b * seq + i) * 3 * hidden + h * head_dim..][..head_dim];
+            for (j, slot) in dst.iter_mut().enumerate() {
+                let k = &qkv[(b * seq + j) * 3 * hidden + hidden + h * head_dim..][..head_dim];
+                // `dot8` keeps the first-eight-products / FMA-lanes / hsum8
+                // order of the old hand-rolled loop, bit for bit.
+                *slot = kernels::dot8(q, k) + add_mask[b * seq + j];
+            }
+        };
+        match parallel::chunk_rows(rows, work, parallel::threads()) {
+            Some(chunk) => {
+                parallel::for_each_chunk_mut(&mut scores[..rows * seq], chunk * seq, |ci, part| {
+                    let first = ci * chunk;
+                    for (i, row) in part.chunks_exact_mut(seq).enumerate() {
+                        qk_row(first + i, row);
                     }
+                });
+            }
+            None => {
+                for (row, part) in scores[..rows * seq].chunks_exact_mut(seq).enumerate() {
+                    qk_row(row, part);
                 }
             }
         }
@@ -736,22 +764,34 @@ impl GteModel {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let head_dim = spec.head_dim;
-        for b in 0..batch {
+        let rows = batch * seq;
+        let work = (rows as i64) * (spec.heads as i64) * (seq as i64) * (head_dim as i64) * 2;
+        let av_row = |row: usize, out: &mut [f32]| {
+            let b = row / seq;
+            let i = row % seq;
             for h in 0..spec.heads {
-                for i in 0..seq {
-                    let a = &scores[((b * spec.heads + h) * seq + i) * seq..][..seq];
-                    let o = &mut ctx[(b * seq + i) * hidden + h * head_dim..][..head_dim];
-                    for v in o.iter_mut() {
-                        *v = 0.0;
+                let a = &scores[((b * spec.heads + h) * seq + i) * seq..][..seq];
+                let o = &mut out[h * head_dim..][..head_dim];
+                o.fill(0.0);
+                for (j, &aj) in a.iter().enumerate() {
+                    let vrow = &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..]
+                        [..head_dim];
+                    kernels::weighted_accumulate(o, vrow, aj);
+                }
+            }
+        };
+        match parallel::chunk_rows(rows, work, parallel::threads()) {
+            Some(chunk) => {
+                parallel::for_each_chunk_mut(&mut ctx[..rows * hidden], chunk * hidden, |ci, part| {
+                    let first = ci * chunk;
+                    for (i, row) in part.chunks_exact_mut(hidden).enumerate() {
+                        av_row(first + i, row);
                     }
-                    for j in 0..seq {
-                        let aj = a[j];
-                        let vrow = &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..]
-                            [..head_dim];
-                        for d in 0..head_dim {
-                            o[d] = aj.mul_add(vrow[d], o[d]);
-                        }
-                    }
+                });
+            }
+            None => {
+                for (row, part) in ctx[..rows * hidden].chunks_exact_mut(hidden).enumerate() {
+                    av_row(row, part);
                 }
             }
         }

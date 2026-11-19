@@ -25,10 +25,10 @@
 //! shape -- so it is not a detail.
 
 use crate::kernels;
+use crate::parallel;
 use crate::vit_image::Resample;
 use crate::whisper::attention_into;
-use crate::whisper::layernorm_row;
-use crate::whisper_features::gelu_erf_exact;
+use crate::whisper::{gelu_erf_rows, layernorm_rows, layernorm_rows_inplace};
 use npum_format::Container;
 use std::path::Path;
 
@@ -351,7 +351,7 @@ impl Vit {
 
         // The patch embedding: a conv rewritten as an exact GEMM, because
         // the stride equals the kernel, so im2col is a permutation.
-        kernels::gemm_nt(
+        kernels::gemm_nt_rows(
             patches,
             n_patches,
             &self.patch_embed,
@@ -359,6 +359,7 @@ impl Vit {
             d,
             &self.patch_embed_bias,
             patch_out,
+            parallel::threads(),
         );
 
         // The CLS row and the position table. Positions are added AFTER
@@ -392,13 +393,29 @@ impl Vit {
             g.attn_scale as f32
         };
 
+        let threads = parallel::threads();
         for layer in &self.layers {
             // ---- self-attention, pre-LN ----
-            norm.copy_from_slice(x);
-            for row in norm.chunks_exact_mut(d) {
-                layernorm_row(row, &layer.ln1_gamma, &layer.ln1_beta, g.ln_eps);
-            }
-            kernels::gemm_nt(norm, n_pos, &layer.qkv, d, 3 * d, &layer.qkv_bias, qkv);
+            // One fused copy + normalise pass instead of a copy and a norm.
+            layernorm_rows(
+                x,
+                norm,
+                n_pos,
+                d,
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
+                g.ln_eps,
+            );
+            kernels::gemm_nt_rows(
+                norm,
+                n_pos,
+                &layer.qkv,
+                d,
+                3 * d,
+                &layer.qkv_bias,
+                qkv,
+                threads,
+            );
             // The fused [Q|K|V] row is Q at offset 0 and a K|V block at
             // offset d, both with row stride 3*d_model -- the same layout
             // the Whisper's encoder reads. There is NO mask.
@@ -417,7 +434,7 @@ impl Vit {
                 scores,
                 acc,
             );
-            kernels::gemm_nt(
+            kernels::gemm_nt_rows(
                 ctx,
                 n_pos,
                 &layer.attn_out,
@@ -425,32 +442,30 @@ impl Vit {
                 d,
                 &layer.attn_out_bias,
                 proj,
+                threads,
             );
-            for i in 0..n_pos * d {
-                x[i] += proj[i];
-            }
+            kernels::add_inplace(x, &proj[..n_pos * d]);
 
             // ---- feed-forward, pre-LN ----
-            norm.copy_from_slice(x);
-            for row in norm.chunks_exact_mut(d) {
-                layernorm_row(row, &layer.ln2_gamma, &layer.ln2_beta, g.ln_eps);
-            }
+            layernorm_rows(
+                x,
+                norm,
+                n_pos,
+                d,
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
+                g.ln_eps,
+            );
             let w = layer.ffn_up.len() / d;
             let up = &mut up[..n_pos * w];
-            kernels::gemm_nt(norm, n_pos, &layer.ffn_up, d, w, &layer.ffn_up_bias, up);
-            for v in up.iter_mut() {
-                *v = gelu_erf_exact(*v);
-            }
-            kernels::gemm_nt(up, n_pos, &layer.ffn_down, w, d, &layer.ffn_down_bias, down);
-            for i in 0..n_pos * d {
-                x[i] += down[i];
-            }
+            kernels::gemm_nt_rows(norm, n_pos, &layer.ffn_up, d, w, &layer.ffn_up_bias, up, threads);
+            gelu_erf_rows(up);
+            kernels::gemm_nt_rows(up, n_pos, &layer.ffn_down, w, d, &layer.ffn_down_bias, down, threads);
+            kernels::add_inplace(x, &down[..n_pos * d]);
         }
 
         // The final LayerNorm, over the whole stack and not per chunk.
-        for row in x.chunks_exact_mut(d) {
-            layernorm_row(row, &self.final_gamma, &self.final_beta, g.ln_eps);
-        }
+        layernorm_rows_inplace(x, n_pos, d, &self.final_gamma, &self.final_beta, g.ln_eps);
         out.resize(n_pos * d, 0.0);
         out.copy_from_slice(x);
     }

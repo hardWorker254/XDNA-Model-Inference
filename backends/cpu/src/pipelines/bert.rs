@@ -26,6 +26,7 @@
 
 use crate::kernels;
 use crate::kernels::Isa;
+use crate::parallel;
 use crate::ops::CpuOps;
 use npum_model::Ops;
 use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape};
@@ -1381,35 +1382,48 @@ impl BertModel {
     /// zero. A zero there would be a key attending to everything.
     fn qk(&self, qkv: &[f32], scores: &mut [f32], batch: usize, seq: usize, sc_cols: usize) {
         let spec = &self.spec;
-        let hidden = spec.hidden;
         let head_dim = spec.head_dim;
-        let nv = head_dim / 8;
         let pairs = batch * spec.heads;
-        for p in 0..pairs {
-            let b = p / spec.heads;
-            let h = p % spec.heads;
-            for i in 0..seq {
-                let q = &qkv[(b * seq + i) * 3 * hidden + h * head_dim..][..head_dim];
-                let row = (p * seq + i) * sc_cols;
-                let dst = &mut scores[row..][..seq];
-                for (j, slot) in dst.iter_mut().enumerate() {
-                    let k = &qkv[(b * seq + j) * 3 * hidden + hidden + h * head_dim..][..head_dim];
-                    let mut lanes = [0.0f32; 8];
-                    for l in 0..8 {
-                        lanes[l] = q[l] * k[l];
-                    }
-                    for v in 1..nv {
-                        for l in 0..8 {
-                            lanes[l] = q[v * 8 + l].mul_add(k[v * 8 + l], lanes[l]);
-                        }
-                    }
-                    *slot = kernels::hsum8(lanes);
-                }
-                // The padding column, only when the array's softmax is what
-                // will read this row and it was compiled wider than the
-                // sequence.
-                scores[row + seq..][..sc_cols - seq].fill(-1.0e30);
+        let rows = pairs * seq;
+        let work = (rows as i64) * (seq as i64) * (head_dim as i64) * 2;
+        let Some(chunk) = parallel::chunk_rows(rows, work, parallel::threads()) else {
+            self.qk_rows(qkv, &mut scores[..rows * sc_cols], seq, sc_cols, 0);
+            return;
+        };
+        // OVER (batch, head, query) rows: one score row is a dot product of
+        // its query against every key, independent of every other row. The
+        // split crosses no reduction, so the bytes are the serial bytes.
+        parallel::for_each_chunk_mut(&mut scores[..rows * sc_cols], chunk * sc_cols, |ci, part| {
+            self.qk_rows(qkv, part, seq, sc_cols, ci * chunk);
+        });
+    }
+
+    /// The score rows starting at `first`, with the same dot-product order.
+    fn qk_rows(
+        &self,
+        qkv: &[f32],
+        scores: &mut [f32],
+        seq: usize,
+        sc_cols: usize,
+        first: usize,
+    ) {
+        let hidden = self.spec.hidden;
+        let head_dim = self.spec.head_dim;
+        for (r, row_view) in scores.chunks_exact_mut(sc_cols).enumerate() {
+            let row = first + r;
+            let p = row / seq;
+            let i = row % seq;
+            let b = p / self.spec.heads;
+            let h = p % self.spec.heads;
+            let q = &qkv[(b * seq + i) * 3 * hidden + h * head_dim..][..head_dim];
+            for (j, slot) in row_view[..seq].iter_mut().enumerate() {
+                let k = &qkv[(b * seq + j) * 3 * hidden + hidden + h * head_dim..][..head_dim];
+                *slot = kernels::dot8(q, k);
             }
+            // The padding column, only when the array's softmax is what
+            // will read this row and it was compiled wider than the
+            // sequence.
+            row_view[seq..].fill(-1.0e30);
         }
     }
 
@@ -1432,27 +1446,38 @@ impl BertModel {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let head_dim = spec.head_dim;
-        let nv = head_dim / 8;
-        let pairs = batch * spec.heads;
-        for p in 0..pairs {
-            let b = p / spec.heads;
-            let h = p % spec.heads;
-            for i in 0..seq {
+        let rows = batch * seq;
+        let work = (rows as i64) * (spec.heads as i64) * (seq as i64) * (head_dim as i64) * 2;
+        let av_row = |row: usize, out: &mut [f32]| {
+            let b = row / seq;
+            let i = row % seq;
+            for h in 0..spec.heads {
+                let p = b * spec.heads + h;
                 let a = &scores[(p * seq + i) * sc_cols..][..seq];
-                let o = &mut ctx[(b * seq + i) * hidden + h * head_dim..][..head_dim];
+                let o = &mut out[h * head_dim..][..head_dim];
                 o.fill(0.0);
                 for (j, &aj) in a.iter().enumerate() {
                     let v =
                         &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..][..head_dim];
-                    for lane in 0..nv {
-                        for l in 0..8 {
-                            let idx = lane * 8 + l;
-                            o[idx] = aj.mul_add(v[idx], o[idx]);
-                        }
-                    }
+                    kernels::weighted_accumulate(o, v, aj);
                 }
             }
-        }
+        };
+        let Some(chunk) = parallel::chunk_rows(rows, work, parallel::threads()) else {
+            for (r, part) in ctx[..rows * hidden].chunks_exact_mut(hidden).enumerate() {
+                av_row(r, part);
+            }
+            return;
+        };
+        // OVER output rows: a row is one weighted sum per head, and no row
+        // reads another row's output. The accumulation order inside a head is
+        // unchanged, so the split is bit-exact.
+        parallel::for_each_chunk_mut(&mut ctx[..rows * hidden], chunk * hidden, |ci, part| {
+            let first = ci * chunk;
+            for (r, row) in part.chunks_exact_mut(hidden).enumerate() {
+                av_row(first + r, row);
+            }
+        });
     }
 
     /// The pooling, as the reference's `pool_rows` computes it.

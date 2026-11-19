@@ -150,7 +150,17 @@ impl Ops for CpuOps {
     }
 
     fn gelu(&mut self, x: &mut [f32]) -> Result<()> {
-        kernels::gelu_row_on(self.isa, x);
+        // GELU is elementwise, so any split is bit-exact: each worker runs the
+        // same polynomial on its own slice. `gelu_row_on` now has a genuinely
+        // eight-wide AVX2 body, so combining the two gives width AND cores.
+        let work = x.len() as i64;
+        let Some(chunk) = parallel::chunk_rows(x.len(), work, self.threads) else {
+            kernels::gelu_row_on(self.isa, x);
+            return Ok(());
+        };
+        parallel::for_each_chunk_mut(x, chunk, |_, part| {
+            kernels::gelu_row_on(self.isa, part);
+        });
         Ok(())
     }
 
