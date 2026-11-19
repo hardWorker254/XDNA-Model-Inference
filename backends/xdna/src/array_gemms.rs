@@ -70,6 +70,13 @@ use crate::transport::Transport;
 /// the weights, the result.
 const BUFFER_WEIGHTS: usize = 1;
 
+/// How many projections may be in flight at once.
+///
+/// Each one owns an A/C slot pair and, on the direct transport, its own
+/// command buffer. Four keeps a batch of projections busy while the host
+/// packs and reads back, without unbounded activation memory.
+const GEMM_PIPELINE_DEPTH: usize = 4;
+
 /// Read one container tensor as little-endian f32 values.
 ///
 /// The dequantisation scales are metadata, not weights: they are small, and
@@ -210,7 +217,7 @@ pub struct ArrayGemms<T: Transport> {
     /// old ticket cannot accidentally complete a different run.
     outstanding: Vec<Option<Outstanding>>,
     /// Which ping-pong slot pair is held by an in-flight run.
-    slot_busy: [bool; 2],
+    slot_busy: [bool; GEMM_PIPELINE_DEPTH],
     /// Reused staging for the validated ops of one `gemm_batch`.
     ///
     /// A model repeats the same projection sets every layer and every step;
@@ -384,11 +391,13 @@ impl<T: Transport> ArrayGemms<T> {
         // THE ATTENTION'S STREAMS.
         //
         // They are streams of THIS design, so they cost no context and no
-        // second design set -- and they are found here, while there is still
-        // nothing to unwind: a set exported without them is refused by
-        // name, and not discovered at the first attention.
+        // second design set. A design exported without them, or an int8
+        // design whose attention panels would need scales it does not have,
+        // leaves the attention on the HOST -- it must not take the GEMMs down
+        // with it. `run_attention` reports "not on the array" when there is
+        // no attention here, and the caller's host path answers the op.
         let attention = if attention {
-            Some(Attention::open(&mut design)?)
+            Attention::open(&mut design).ok()
         } else {
             None
         };
@@ -401,7 +410,7 @@ impl<T: Transport> ArrayGemms<T> {
             dispatches: 0,
             staged,
             outstanding: Vec::new(),
-            slot_busy: [false; 2],
+            slot_busy: [false; GEMM_PIPELINE_DEPTH],
             resolved_buf: Vec::new(),
             resolved_cache: HashMap::new(),
             quant,
@@ -503,8 +512,8 @@ impl<T: Transport> ArrayGemms<T> {
     /// work between the two halves is done. While the device computes, the
     /// caller may submit another projection -- the bindings a dispatch
     /// captured at `start_dispatch` are its own, so rebinding does not move an
-    /// in-flight run's operands. At most two runs may be in flight, one per
-    /// ping-pong slot pair; a third is refused until one is completed.
+    /// in-flight run's operands. At most [`GEMM_PIPELINE_DEPTH`] runs may be
+    /// in flight, one per slot pair; another is refused until one completes.
     pub fn gemm_submit(
         &mut self,
         weight: &str,
@@ -518,6 +527,31 @@ impl<T: Transport> ArrayGemms<T> {
         self.submit_resolved(&resolved, a, bias)
     }
 
+    /// The first free A/C slot pair, growing the design's slots on demand.
+    ///
+    /// Extra slots are allocated uninitialised: every A slot is written in
+    /// full before a dispatch reads it, and every C slot is read only over
+    /// the rows the device wrote. Zeroing them would be work nobody observes.
+    fn free_slot(&mut self) -> Result<usize, DesignError> {
+        let slot = self
+            .slot_busy
+            .iter()
+            .position(|busy| !busy)
+            .ok_or_else(|| {
+                DesignError::Design(format!(
+                    "all {GEMM_PIPELINE_DEPTH} GEMM slot pairs are busy -- complete a \
+                     submitted projection before submitting another"
+                ))
+            })?;
+        if self.design.slots_of(0) <= slot {
+            self.design.add_slot_uninit(0)?;
+        }
+        if self.design.slots_of(2) <= slot {
+            self.design.add_slot_uninit(2)?;
+        }
+        Ok(slot)
+    }
+
     /// Submit a validated projection into a free ping-pong slot pair.
     fn submit_resolved(
         &mut self,
@@ -525,25 +559,7 @@ impl<T: Transport> ArrayGemms<T> {
         a: &[f32],
         bias: Option<&[f32]>,
     ) -> Result<GemmTicket, DesignError> {
-        if self.slot_busy[0] && self.slot_busy[1] {
-            return Err(DesignError::Design(
-                "both GEMM ping-pong slots are busy -- complete a submitted projection \
-                 before submitting a third"
-                    .to_string(),
-            ));
-        }
-        let slot = usize::from(self.slot_busy[0]);
-        if slot == 1 {
-            // A second run needs its own A and C slot pair. Allocate it on the
-            // first overlap, so a plain submit/complete pair pays for no extra
-            // buffer and a batch does not have to know how slots are managed.
-            if self.design.slots_of(0) < 2 {
-                self.design.add_slot_uninit(0)?;
-            }
-            if self.design.slots_of(2) < 2 {
-                self.design.add_slot_uninit(2)?;
-            }
-        }
+        let slot = self.free_slot()?;
 
         // The bindings belong to THIS dispatch: start_dispatch captures them,
         // so rebinding for the next run cannot move this one's operands.
@@ -687,29 +703,22 @@ impl<T: Transport> ArrayGemms<T> {
             self.resolved_buf.push(resolved);
         }
 
-        // More than one op needs the ping-pong pairs. A single op has nothing
-        // to overlap and pays for no extra slot.
-        if ops.len() > 1 {
-            if self.design.slots_of(0) < 2 {
-                self.design.add_slot_uninit(0)?;
-            }
-            if self.design.slots_of(2) < 2 {
-                self.design.add_slot_uninit(2)?;
-            }
-        }
+        // Extra slot pairs are allocated by `submit_resolved` on the first
+        // overlap that needs them, so a single op pays for none.
 
-        // At most two runs are in flight -- one per ping-pong pair -- so this
-        // is a fixed two-slot ring with no heap allocation per batch.
-        let mut in_flight: [Option<(GemmTicket, &mut [f32])>; 2] = [None, None];
+        // At most GEMM_PIPELINE_DEPTH runs are in flight, one per slot pair,
+        // so this is a fixed ring with no heap allocation per batch.
+        let mut in_flight: [Option<(GemmTicket, &mut [f32])>; GEMM_PIPELINE_DEPTH] =
+            std::array::from_fn(|_| None);
         let mut head = 0usize;
         let mut live = 0usize;
         for (index, out) in outs.iter_mut().enumerate() {
-            // Keep at most two runs in flight. Completing the oldest frees its
-            // slot pair for the run about to be submitted; its read-back still
-            // overlaps with the younger run's device compute.
-            if live == 2 {
-                let (ticket, done_out) = in_flight[head].take().expect("two runs are in flight");
-                head = (head + 1) & 1;
+            // Keep at most DEPTH runs in flight. Completing the oldest frees
+            // its slot pair for the run about to be submitted; its read-back
+            // still overlaps with the younger runs' device compute.
+            if live == GEMM_PIPELINE_DEPTH {
+                let (ticket, done_out) = in_flight[head].take().expect("a run is in flight");
+                head = (head + 1) % GEMM_PIPELINE_DEPTH;
                 live -= 1;
                 self.gemm_complete(ticket, done_out)?;
             }
@@ -718,14 +727,14 @@ impl<T: Transport> ArrayGemms<T> {
             let resolved = self.resolved_buf[index];
             let op = &ops[index];
             let ticket = self.submit_resolved(&resolved, op.a, op.bias)?;
-            let tail = (head + live) & 1;
+            let tail = (head + live) % GEMM_PIPELINE_DEPTH;
             in_flight[tail] = Some((ticket, &mut **out));
             live += 1;
         }
         // EPILOGUE: the last runs have no successors to hide their read-back.
         while live > 0 {
             let (ticket, out) = in_flight[head].take().expect("a run is in flight");
-            head = (head + 1) & 1;
+            head = (head + 1) % GEMM_PIPELINE_DEPTH;
             live -= 1;
             self.gemm_complete(ticket, out)?;
         }
@@ -767,25 +776,9 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         // An in-flight async run owns its A/C slot pair even though its
         // bindings were captured at submit. Use a free pair here rather than
         // writing into the slot it is still reading from.
-        let slot = usize::from(self.slot_busy[0]);
-        if slot == 1 {
-            if self.slot_busy[1] {
-                return Err(npum_model::array::ArrayError(
-                    "both GEMM slots are busy -- complete the submitted projections first"
-                        .to_string(),
-                ));
-            }
-            if self.design.slots_of(0) < 2 {
-                self.design
-                    .add_slot_uninit(0)
-                    .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
-            }
-            if self.design.slots_of(2) < 2 {
-                self.design
-                    .add_slot_uninit(2)
-                    .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
-            }
-        }
+        let slot = self
+            .free_slot()
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
         self.design
             .bind(BUFFER_WEIGHTS, resolved.weight_slot)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
@@ -1323,7 +1316,7 @@ mod async_tests {
                 dispatches: 0,
                 staged: 0,
                 outstanding: Vec::new(),
-                slot_busy: [false; 2],
+                slot_busy: [false; GEMM_PIPELINE_DEPTH],
                 resolved_buf: Vec::new(),
                 resolved_cache: HashMap::new(),
                 quant: Vec::new(),
@@ -1400,23 +1393,26 @@ mod async_tests {
         // The design's load zeroes its instruction and data buffers first.
         // The pipeline starts at the first dispatch.
         let first_start = log.iter().position(|e| e == "start").unwrap();
+        // With four slot pairs a three-op batch submits ALL of them before
+        // reading any back: the host overlap is deeper than the old two-slot
+        // ping-pong, and no write has to wait for an earlier read.
         let expected = [
             "start",
             "write(3:1)",
             "sync_to_device(3:1)",
             "start",
+            "write(3:2)",
+            "sync_to_device(3:2)",
+            "start",
             "wait",
             "sync_from_device(5:0)",
             "read(5:0)",
-            "write(3:0)",
-            "sync_to_device(3:0)",
-            "start",
             "wait",
             "sync_from_device(5:1)",
             "read(5:1)",
             "wait",
-            "sync_from_device(5:0)",
-            "read(5:0)",
+            "sync_from_device(5:2)",
+            "read(5:2)",
         ];
         assert_eq!(
             &log[first_start..],

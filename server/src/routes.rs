@@ -166,7 +166,11 @@ pub fn format_g(value: f32, precision: usize) -> String {
 /// keeps the bytes identical while removing those temporaries.
 fn format_g_into(out: &mut String, value: f32, precision: usize) {
     if value.is_nan() {
-        out.push_str(if value.is_sign_negative() { "-nan" } else { "nan" });
+        out.push_str(if value.is_sign_negative() {
+            "-nan"
+        } else {
+            "nan"
+        });
         return;
     }
     if value.is_infinite() {
@@ -183,24 +187,25 @@ fn format_g_into(out: &mut String, value: f32, precision: usize) {
         // dividing it: a division rounds, and rounding twice -- once in the
         // division and once in the formatting -- is not the same as rounding
         // once. C's printf rounds the exact value, and so does Rust's
-        // formatter.
-        let text = format!("{:.*e}", precision - 1, value);
-        if let Some((mantissa, exp)) = text.split_once('e') {
-            if let Ok(exp) = exp.parse::<i32>() {
-                let _ = write!(
-                    out,
-                    "{}e{}{:02}",
-                    trim_zeros(mantissa),
-                    if exp < 0 { '-' } else { '+' },
-                    exp.abs()
-                );
+        // formatter. Write it straight into the response buffer, then trim
+        // the mantissa in place: a temporary String per float was ~786 000
+        // allocations on a 2048x384 response.
+        let start = out.len();
+        let _ = write!(out, "{:.*e}", precision - 1, value);
+        if let Some(e) = out[start..].find('e').map(|at| start + at) {
+            if let Ok(exp) = out[e + 1..].parse::<i32>() {
+                let kept = trim_zeros(&out[start..e]).len();
+                out.truncate(start + kept);
+                let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
                 return;
             }
         }
-        out.push_str(&text);
     } else {
         let decimals = (precision as i32 - 1 - exponent).max(0) as usize;
-        out.push_str(&trim_zeros(&format!("{value:.decimals$}")));
+        let start = out.len();
+        let _ = write!(out, "{value:.decimals$}");
+        let kept = trim_zeros(&out[start..]).len();
+        out.truncate(start + kept);
     }
 }
 
@@ -211,6 +216,43 @@ fn trim_zeros(text: &str) -> &str {
     }
     let trimmed = text.trim_end_matches('0');
     trimmed.strip_suffix('.').unwrap_or(trimmed)
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn format_g_matches_c_seven_significant_digits() {
+        // The bytes are the HTTP contract: compare them, not the numbers.
+        let cases: &[(f32, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (1.0, "1"),
+            (-2.5, "-2.5"),
+            (1.23456789, "1.234568"),
+            (100.0, "100"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (12_345_678.0, "1.234568e+07"),
+            (f32::INFINITY, "inf"),
+            (f32::NEG_INFINITY, "-inf"),
+            (f32::NAN, "nan"),
+        ];
+        for &(value, want) in cases {
+            assert_eq!(format_g(value, 7), want, "{value}");
+        }
+    }
+
+    #[test]
+    fn format_g_into_appends_without_touching_what_is_already_there() {
+        let mut out = String::from("[");
+        format_g_into(&mut out, 1e-5, 7);
+        out.push(',');
+        format_g_into(&mut out, 100.0, 7);
+        out.push(']');
+        assert_eq!(out, "[1e-05,100]");
+    }
 }
 
 /// `GET /health`.
@@ -416,7 +458,7 @@ async fn classify(
             ),
         );
     };
-    let mut parts = match crate::multipart::parse(&body, &boundary) {
+    let parts = match crate::multipart::parse(&body, &boundary) {
         Ok(parts) => parts,
         Err(reason) => {
             return json(
@@ -509,9 +551,9 @@ async fn classify(
     } else {
         parts[image_idx].filename.clone()
     };
-    // Take the upload's bytes out of the parsed parts: the old clone doubled
-    // the peak memory of a buffer that can be tens of megabytes.
-    let data = std::mem::take(&mut parts[image_idx].data);
+    // The part is a refcounted slice of the request body: handing the task
+    // another reference costs nothing and copies no image bytes.
+    let data = parts[image_idx].data.clone();
     let engine = classifier.clone();
     let name = label.clone();
     let outcome = tokio::task::spawn_blocking(move || engine.classify_bytes(&data, &name))
@@ -606,7 +648,7 @@ async fn pose(
             ),
         );
     };
-    let mut parts = match crate::multipart::parse(&body, &boundary) {
+    let parts = match crate::multipart::parse(&body, &boundary) {
         Ok(parts) => parts,
         Err(reason) => {
             return json(
@@ -707,9 +749,8 @@ async fn pose(
     } else {
         parts[image_idx].filename.clone()
     };
-    // Take, do not clone: the pose upload is the largest body the server
-    // accepts and the old clone doubled its peak memory.
-    let data = std::mem::take(&mut parts[image_idx].data);
+    // Another reference to the body's bytes, not a copy of the upload.
+    let data = parts[image_idx].data.clone();
     let engine = detector.clone();
     let name = label.clone();
     let request_params = params.clone();
@@ -814,7 +855,7 @@ async fn transcriptions(
             ),
         );
     };
-    let mut parts = match crate::multipart::parse(&body, &boundary) {
+    let parts = match crate::multipart::parse(&body, &boundary) {
         Ok(parts) => parts,
         Err(reason) => {
             return json(
@@ -953,9 +994,9 @@ async fn transcriptions(
     } else {
         parts[audio_idx].filename.clone()
     };
-    // Audio uploads run to hundreds of megabytes; take them out of the
-    // parsed parts instead of cloning them for the blocking task.
-    let data = std::mem::take(&mut parts[audio_idx].data);
+    // Audio uploads run to hundreds of megabytes; the part is already a
+    // refcounted slice, so the blocking task takes a reference, not a copy.
+    let data = parts[audio_idx].data.clone();
     let engine = transcriber.clone();
     let transcript =
         tokio::task::spawn_blocking(move || engine.transcribe_bytes(&data, &name, &options))

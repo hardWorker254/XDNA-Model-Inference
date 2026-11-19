@@ -69,9 +69,10 @@
 //! error and not a number: the design may have written half an output, and
 //! half an output read back is a plausible tensor.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::device::Generation;
 use crate::transport::{BufferFlags, Run, Transport, TransportError};
@@ -141,11 +142,24 @@ const BO_TYPE_CMD: u32 = 4;
 /// it is more than the array path needs.
 const DEVICE_HEAP_BYTES: u64 = 64 * 1024 * 1024;
 
-/// How big the command buffer is.
+/// How big a command buffer is.
 ///
 /// The driver's own command buffers are four kilobytes each, and the ERT's
 /// packet for one CU is a few dozen words.
 const COMMAND_BUFFER_BYTES: u64 = 4096;
+
+/// How many command buffers to create when a context is opened.
+///
+/// A run owns its command buffer from `start` until it is dropped, because the
+/// driver writes the completion state into the packet's header word. One buffer
+/// per context is therefore a race: the second of two overlapping dispatches
+/// overwrites the first one's header, and `wait` reads the younger run's state.
+///
+/// The pool starts with room for the deepest pipeline plus one spare, so a
+/// batch never has to create a buffer in the middle of a dispatch. If a caller
+/// nevertheless has more runs in flight than this, the pool grows on demand --
+/// correctness does not depend on the number being right.
+const COMMAND_POOL_SIZE: usize = 8;
 
 /// The state an ERT packet is in when it is submitted.
 const ERT_STATE_NEW: u32 = 1;
@@ -186,6 +200,29 @@ const QUERY_HW_CONTEXTS: u32 = 5;
 /// past -- and the wait answers ETIME at once. That reads exactly like a
 /// device that never completes a job.
 const DISPATCH_TIMEOUT_NS: i64 = 60 * 1_000_000_000;
+
+/// The wait timeout, in nanoseconds, as configured by `NPU_DISPATCH_TIMEOUT_MS`.
+///
+/// Read once: it is a property of the process, not of a dispatch, and the
+/// environment is not something that changes under an inference loop.
+fn dispatch_timeout_ns() -> i64 {
+    static TIMEOUT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let configured = std::env::var("NPU_DISPATCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .and_then(|ms| ms.checked_mul(1_000_000))
+            .and_then(|ns| i64::try_from(ns).ok());
+        configured.unwrap_or(DISPATCH_TIMEOUT_NS)
+    })
+}
+
+/// How many times to read the packet's state before giving up and taking the
+/// ioctl. A dispatch is milliseconds, so this is only enough to catch a run
+/// that finished between submission and the wait call -- the common case in a
+/// pipeline, where the host has work to do after `start`.
+const DISPATCH_SPIN_ITERS: usize = 128;
 
 /// `struct amdxdna_drm_create_hwctx`.
 #[repr(C)]
@@ -553,6 +590,10 @@ pub struct DirectBuffer {
     device_addr: u64,
     /// The mapping this process made, when it made one.
     map: Option<Mapping>,
+    /// The pool this buffer returns to when dropped, when it is pooled.
+    pool: Option<BufferPool>,
+    /// The key it must be returned under, set together with `pool`.
+    key: Option<BufferKey>,
 }
 
 // SAFETY: the handle is owned by this struct and is used by the thread that
@@ -560,12 +601,100 @@ pub struct DirectBuffer {
 // touched by two threads at once.
 unsafe impl Send for DirectBuffer {}
 
+/// What a buffer is pooled under: its size, its kind and its bank.
+///
+/// `BufferFlags` is represented by a byte here so the pool needs no trait
+/// bound on the transport's public enum. The group is part of the key because
+/// the design layer asks for banks by number, even though the direct
+/// transport decides placement by the buffer's kind.
+type BufferKey = (u64, u8, i32);
+
+fn buffer_key(bytes: u64, flags: BufferFlags, group: i32) -> BufferKey {
+    let kind = match flags {
+        BufferFlags::Cacheable => 0,
+        BufferFlags::HostOnly => 1,
+    };
+    (bytes, kind, group)
+}
+
+/// How many buffers of one shape to keep. Enough for ping-pong reuse; more
+/// than that would pin device memory the next design set may need for a
+/// differently sized panel.
+const MAX_POOLED_PER_KEY: usize = 4;
+
+/// The parts of a buffer that survive being returned to the pool.
+struct PooledBuffer {
+    board: Arc<Board>,
+    _heap: Option<Arc<Heap>>,
+    handle: u32,
+    size: u64,
+    host: *mut u8,
+    device_addr: u64,
+    map: Option<Mapping>,
+}
+
+// SAFETY: the handle and the mapping are owned by this value and are touched
+// by one thread at a time, just as they were in `DirectBuffer`.
+unsafe impl Send for PooledBuffer {}
+
+/// Reusable buffers, kept by shape so loading a design set does not pay for
+/// a CREATE_BO + GET_BO_INFO + mmap per staged panel, nor a GEM_CLOSE + munmap
+/// per drop. A buffer is matched only by an identical request, so reuse never
+/// changes what a dispatch sees.
+#[derive(Clone)]
+struct BufferPool(Arc<Mutex<HashMap<BufferKey, Vec<PooledBuffer>>>>);
+
+impl BufferPool {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    fn take(&self, key: BufferKey) -> Option<PooledBuffer> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&key)
+            .and_then(|free| free.pop())
+    }
+
+    fn give(&self, key: BufferKey, buffer: PooledBuffer) {
+        let mut pool = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let free = pool.entry(key).or_default();
+        if free.len() < MAX_POOLED_PER_KEY {
+            free.push(buffer);
+        } else {
+            // A fifth buffer of the same shape is unlikely to be reused and
+            // would only hold device memory hostage. Close it as before.
+            drop(buffer.map);
+            close_bo(&buffer.board, buffer.handle);
+        }
+    }
+}
+
 impl Drop for DirectBuffer {
     fn drop(&mut self) {
-        // The mapping goes first: the driver's handle is the last thing to
-        // be let go of.
-        self.map = None;
-        close_bo(&self.board, self.handle);
+        // A pooled buffer goes back with its mapping intact; only a buffer
+        // that was never pooled gives its handle back to the driver here.
+        if let (Some(pool), Some(key)) = (self.pool.take(), self.key.take()) {
+            pool.give(
+                key,
+                PooledBuffer {
+                    board: Arc::clone(&self.board),
+                    _heap: self._heap.take(),
+                    handle: self.handle,
+                    size: self.size,
+                    host: self.host,
+                    device_addr: self.device_addr,
+                    map: self.map.take(),
+                },
+            );
+        } else {
+            self.map = None;
+            close_bo(&self.board, self.handle);
+        }
     }
 }
 
@@ -581,10 +710,21 @@ struct DirectRun {
     ///
     /// The driver writes the run's state into the packet's header word, so
     /// the run holds the buffer -- and the mapping it lives in -- for as long
-    /// as the state can be read. A run dropped without being waited for holds
-    /// it until it is freed; a run that outlived the buffer would be reading
-    /// a freed page for a number.
+    /// as the state can be read. Two runs in flight own two different buffers;
+    /// sharing one is the race that makes `wait` read a stranger's state.
     command: Arc<Command>,
+    /// The pool the buffer goes back to once this run is done with it.
+    pool: CommandPool,
+}
+
+impl Drop for DirectRun {
+    fn drop(&mut self) {
+        // The run is dropped after `wait` has read the header, so the buffer
+        // is free for the next dispatch. Returning it here rather than in
+        // `wait` keeps the hand-off on the one path every run takes -- a run
+        // dropped without being waited on still gives its buffer back.
+        self.pool.give(Arc::clone(&self.command));
+    }
 }
 
 /// Free a run.
@@ -600,10 +740,14 @@ pub struct DirectTransport {
     board: Arc<Board>,
     /// The device heap.
     heap: Option<Arc<Heap>>,
+    /// Reusable data buffers, keyed by their request shape.
+    buffers: BufferPool,
     /// The hardware context, when one is open.
     context: Option<Context>,
     /// The design's kernel, when a context is open.
     kernel: Option<Kernel>,
+    /// The kernel's register map, parsed once for the life of the context.
+    args: Option<ArgMap>,
     /// The PDI, when a context is open.
     ///
     /// The CU's program stays in the memory the context was configured with:
@@ -611,8 +755,12 @@ pub struct DirectTransport {
     /// closed, and the next buffer carved out of the heap would land on the
     /// program. It is held for as long as the context lives.
     pdi: Option<DirectBuffer>,
-    /// The command buffer, when a context is open.
-    command: Option<Arc<Command>>,
+    /// The pool of command buffers, filled when a context is opened.
+    ///
+    /// One buffer per in-flight run, never one for the whole context: the
+    /// packet's header is the run's completion state, and two runs writing
+    /// the same header is a race.
+    commands: CommandPool,
 }
 
 /// A hardware context, and the syncobj its jobs' timeline lives on.
@@ -658,18 +806,53 @@ impl Drop for Command {
     }
 }
 
+/// A pool of command buffers, shared between the transport and its runs.
+///
+/// `start` takes a buffer out of the pool and the run gives it back when it is
+/// dropped. The pool is behind a `Mutex` because `wait` is an associated
+/// function with no access to the transport, so the returning happens in
+/// `DirectRun::drop` through this shared handle. The lock is held only for a
+/// queue pop/push, never across an ioctl or a packet write.
+#[derive(Clone)]
+struct CommandPool(Arc<Mutex<VecDeque<Arc<Command>>>>);
+
+impl CommandPool {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(VecDeque::new())))
+    }
+
+    /// Take a free buffer, if there is one.
+    fn take(&self) -> Option<Arc<Command>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+    }
+
+    /// Return a buffer when its run is finished with it.
+    fn give(&self, command: Arc<Command>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(command);
+    }
+}
+
 // SAFETY: the handles are owned by this struct and are used by the thread
 // that owns it.
 unsafe impl Send for DirectTransport {}
 
 impl Drop for DirectTransport {
     fn drop(&mut self) {
-        // The order matters: the context goes before the command buffer it
-        // was submitting to, and the heap goes after everything that was
-        // carved out of it.
+        // The order matters: the context goes before the buffers it was
+        // submitting to, and the heap goes after everything carved out of it.
+        // The command pool is an `Arc`: it closes its buffers when the last
+        // run holding one is dropped, which is why it needs no explicit reset.
         self.context = None;
         self.pdi = None;
-        self.command = None;
+        // Close the pooled buffers before the heap they were carved out of;
+        // their handles are the last users of its device memory.
+        self.buffers = BufferPool::new();
         self.heap = None;
     }
 }
@@ -693,10 +876,12 @@ impl Transport for DirectTransport {
                     return Ok(Self {
                         board,
                         heap: None,
+                        buffers: BufferPool::new(),
                         context: None,
                         kernel: None,
+                        args: None,
                         pdi: None,
-                        command: None,
+                        commands: CommandPool::new(),
                     });
                 }
                 Err(error) => last = error,
@@ -837,13 +1022,23 @@ impl Transport for DirectTransport {
             &mut config as *mut ConfigHwctx as *mut c_void,
         )?;
 
-        // THE COMMAND BUFFER: where the packet goes.
-        let command = self.create_command()?;
+        // THE COMMAND BUFFERS: one per in-flight run, not one for the whole
+        // context. Fill the pool up front so a pipelined batch never pays for
+        // a CREATE_BO + GET_BO_INFO + mmap in the middle of a dispatch.
+        let commands = CommandPool::new();
+        for _ in 0..COMMAND_POOL_SIZE {
+            commands.give(Arc::new(self.create_command()?));
+        }
 
+        // THE REGISTER MAP: resolve the kernel's argument names ONCE. Every
+        // packet would otherwise scan the metadata for `opcode`, `instr`,
+        // `ninstr` and each `boN`, and format a fresh String for each `boN`.
+        let arg_map = ArgMap::new(&kernel);
         self.context = Some(context);
         self.kernel = Some(kernel);
+        self.args = Some(arg_map);
         self.pdi = Some(pdi_buffer);
-        self.command = Some(Arc::new(command));
+        self.commands = commands;
         Ok(())
     }
 
@@ -881,16 +1076,36 @@ impl Transport for DirectTransport {
         &mut self,
         bytes: u64,
         flags: BufferFlags,
-        _group: i32,
+        group: i32,
     ) -> Result<Self::Buffer, TransportError> {
-        match flags {
+        // Reuse a buffer of exactly this shape before asking the driver for
+        // another: loading a design set stages many panels, and a buffer
+        // dropped by one design is the buffer the next design wants.
+        let key = buffer_key(bytes, flags, group);
+        if let Some(pooled) = self.buffers.take(key) {
+            return Ok(DirectBuffer {
+                board: self.board.clone(),
+                _heap: pooled._heap,
+                handle: pooled.handle,
+                size: pooled.size,
+                host: pooled.host,
+                device_addr: pooled.device_addr,
+                map: pooled.map,
+                pool: Some(self.buffers.clone()),
+                key: Some(key),
+            });
+        }
+        let mut buffer = match flags {
             // THE INSTRUCTION STREAM: device memory, read by the device's
             // instruction fetch.
             BufferFlags::Cacheable => self.alloc_device(bytes),
             // THE DATA: host memory, written by the host and read by the
             // device.
             BufferFlags::HostOnly => self.alloc_host(bytes),
-        }
+        }?;
+        buffer.pool = Some(self.buffers.clone());
+        buffer.key = Some(key);
+        Ok(buffer)
     }
 
     fn write(bo: &Self::Buffer, data: &[u8], offset: u64) -> Result<(), TransportError> {
@@ -941,30 +1156,33 @@ impl Transport for DirectTransport {
         words: u32,
         args: &[&Self::Buffer],
     ) -> Result<Run, TransportError> {
-        let kernel = self
-            .kernel
+        let map = self
+            .args
             .as_ref()
             .ok_or_else(|| TransportError::new("no context is open"))?;
-        let command = self
-            .command
-            .clone()
-            .ok_or_else(|| TransportError::new("no command buffer is open"))?;
+        // A buffer belongs to THIS run until it is dropped. Taking from the
+        // pool is what makes overlapping dispatches safe; growing it here is
+        // what keeps a deeper-than-expected pipeline correct.
+        let command = match self.commands.take() {
+            Some(command) => command,
+            None => Arc::new(self.create_command()?),
+        };
         let context = self
             .context
             .as_ref()
             .ok_or_else(|| TransportError::new("no context is open"))?;
 
-        // THE PACKET.
-        let packet = build_packet(kernel, instr, words, args)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                packet.as_ptr(),
-                command.map.ptr,
-                packet.len().min(command.map.len),
-            );
+        // THE PACKET: written straight into the buffer's mapping, with the
+        // register map already parsed at context open. A malformed packet
+        // must not keep the buffer checked out of the pool.
+        let packet = unsafe { std::slice::from_raw_parts_mut(command.map.ptr, command.map.len) };
+        if let Err(error) = write_packet(map, packet, instr, words, args) {
+            self.commands.give(command);
+            return Err(error);
         }
 
-        // THE SUBMISSION.
+        // THE SUBMISSION. A rejected submission must not keep the buffer out
+        // of the pool: there is no run that will give it back.
         let mut exec = ExecCmd {
             ext: 0,
             ext_flags: 0,
@@ -976,59 +1194,89 @@ impl Transport for DirectTransport {
             arg_count: 0,
             seq: 0,
         };
-        ioctl(
+        if let Err(error) = ioctl(
             &self.board,
             IOCTL_EXEC_CMD,
             &mut exec as *mut ExecCmd as *mut c_void,
-        )?;
+        ) {
+            self.commands.give(command);
+            return Err(error);
+        }
 
         let run = Box::new(DirectRun {
             board: self.board.clone(),
             syncobj: context.syncobj,
             point: exec.seq,
             command,
+            pool: self.commands.clone(),
         });
         Ok(Run::new(Box::into_raw(run) as *mut c_void, free_run))
     }
 
     fn wait(run: &Run) -> Result<(), TransportError> {
         let run = unsafe { &*(run.handle() as *const DirectRun) };
+        let header = run.command.map.ptr as *const u32;
 
-        // THE TIMELINE: the point the job was given, waited for.
-        let mut handles = [run.syncobj as u64];
-        let mut points = [run.point];
-        let mut wait = SyncobjTimelineWait {
-            handles: handles.as_mut_ptr() as u64,
-            points: points.as_mut_ptr() as u64,
-            timeout_nsec: monotonic_now_ns().saturating_add(DISPATCH_TIMEOUT_NS),
-            count_handles: 1,
-            flags: 0,
-            first_signaled: 0,
-            pad: 0,
-            deadline_nsec: 0,
-        };
-        if let Err(error) = ioctl(
-            &run.board,
-            IOCTL_SYNCOBJ_TIMELINE_WAIT,
-            &mut wait as *mut SyncobjTimelineWait as *mut c_void,
-        ) {
-            return Err(TransportError::new(format!(
-                "the kernel did not finish in {} s: {error}. The job is still the device's; \
-                 do not reuse this context -- open it again before running more",
-                DISPATCH_TIMEOUT_NS / 1_000_000_000
-            )));
+        // FAST PATH: in a pipeline the job usually finished while the host
+        // was preparing the next one. The driver writes COMPLETED into the
+        // packet's header, and reading it costs neither a clock_gettime nor a
+        // SYNCOBJ_TIMELINE_WAIT ioctl -- one volatile load instead of two
+        // system calls on the dispatch's hot path.
+        let mut state = unsafe { std::ptr::read_volatile(header) } & 0xf;
+        if state != ERT_STATE_COMPLETED {
+            // POLL: catch a job that completed while we were reading. A
+            // bounded spin keeps a still-running job from ever taking the
+            // slow path's syscall budget on top of this one.
+            for _ in 0..DISPATCH_SPIN_ITERS {
+                std::hint::spin_loop();
+                state = unsafe { std::ptr::read_volatile(header) } & 0xf;
+                if state == ERT_STATE_COMPLETED {
+                    break;
+                }
+            }
         }
 
-        // AND THE STATE: the driver writes it into the packet's own header
-        // word, and a run that did not complete is an error and not a
-        // number.
-        let header = run.command.map.ptr as *mut u32;
-        let state = unsafe { std::ptr::read_volatile(header) } & 0xf;
+        if state != ERT_STATE_COMPLETED {
+            // SLOW PATH: the timeline, and the absolute deadline the ioctl
+            // wants. `monotonic_now_ns` is the clock_gettime this path costs.
+            let timeout = dispatch_timeout_ns();
+            let mut handles = [run.syncobj as u64];
+            let mut points = [run.point];
+            let mut wait = SyncobjTimelineWait {
+                handles: handles.as_mut_ptr() as u64,
+                points: points.as_mut_ptr() as u64,
+                timeout_nsec: monotonic_now_ns().saturating_add(timeout),
+                count_handles: 1,
+                flags: 0,
+                first_signaled: 0,
+                pad: 0,
+                deadline_nsec: 0,
+            };
+            if let Err(error) = ioctl(
+                &run.board,
+                IOCTL_SYNCOBJ_TIMELINE_WAIT,
+                &mut wait as *mut SyncobjTimelineWait as *mut c_void,
+            ) {
+                return Err(TransportError::new(format!(
+                    "the kernel did not finish in {} s: {error}. The job is still the device's; \
+                     do not reuse this context -- open it again before running more \
+                     (NPU_DISPATCH_TIMEOUT_MS configures this)",
+                    timeout / 1_000_000_000
+                )));
+            }
+            state = unsafe { std::ptr::read_volatile(header) } & 0xf;
+        }
+
+        // The state is an error and not a number: the design may have written
+        // half an output, and half an output read back is a plausible tensor.
+        // An acquire fence orders the driver's writes to the data buffers
+        // before the caller reads them.
         if state != ERT_STATE_COMPLETED {
             return Err(TransportError::new(format!(
                 "the kernel did not complete: the driver's state is {state}"
             )));
         }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         Ok(())
     }
 }
@@ -1105,6 +1353,8 @@ impl DirectTransport {
             host: info.vaddr as *mut u8,
             device_addr: info.xdna_addr,
             map: None,
+            pool: None,
+            key: None,
         })
     }
 
@@ -1138,6 +1388,8 @@ impl DirectTransport {
             host: ptr,
             device_addr: 0,
             map: Some(map),
+            pool: None,
+            key: None,
         })
     }
 
@@ -1209,23 +1461,87 @@ const SYNC_DIRECT_TO_DEVICE: u32 = 0;
 /// The direction of a buffer's synchronisation.
 const SYNC_DIRECT_FROM_DEVICE: u32 = 1;
 
-/// Build the command packet.
+/// The design's register map, parsed once when the context opens.
 ///
-/// The header says what the packet is, the CU mask says which CU runs it,
-/// and the register map says what it runs on. The map's layout is the
-/// design's own: the offsets come from the xclbin's metadata.
-fn build_packet(
-    kernel: &Kernel,
+/// A packet never changes shape: the same eleven names are looked up for
+/// every one of the hundreds of chunks an inference dispatches. Resolving
+/// them here turns that hot path into an array index, and lets the names in
+/// error messages be `&'static str` instead of freshly formatted `String`s.
+///
+/// The slots are ordered as `opcode`, `instr`, `ninstr`, `bo0` ... `bo7`:
+/// the names a design's kernel signature uses, in the order `build_packet`
+/// has always written them.
+const MAX_KERNEL_BUFFERS: usize = 8;
+const ARG_SLOTS: usize = 3 + MAX_KERNEL_BUFFERS;
+
+/// The names of the slots above, for the rare error path.
+const ARG_NAMES: [&str; ARG_SLOTS] = [
+    "opcode", "instr", "ninstr", "bo0", "bo1", "bo2", "bo3", "bo4", "bo5", "bo6", "bo7",
+];
+
+#[derive(Clone)]
+struct ArgMap {
+    /// `(offset, size)` for each slot the kernel actually declares.
+    slots: [Option<(u32, u32)>; ARG_SLOTS],
+    /// The packet's size in bytes, derived once from the map's extent.
+    packet_bytes: usize,
+}
+
+impl ArgMap {
+    fn new(kernel: &Kernel) -> Self {
+        let mut slots = [None; ARG_SLOTS];
+        for arg in &kernel.args {
+            let index = match arg.name.as_str() {
+                "opcode" => Some(0),
+                "instr" => Some(1),
+                "ninstr" => Some(2),
+                name if name.starts_with("bo") => name[2..]
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|index| *index < MAX_KERNEL_BUFFERS)
+                    .map(|index| 3 + index),
+                _ => None,
+            };
+            if let Some(index) = index {
+                slots[index] = Some((arg.offset, arg.size));
+            }
+        }
+        let extent = kernel.map_size() as usize;
+        Self {
+            slots,
+            // The header word, then the CU mask as one payload word, then
+            // the register map rounded up to whole words.
+            packet_bytes: 4 + (1 + extent.div_ceil(4)) * 4,
+        }
+    }
+}
+
+/// Write the command packet straight into a command buffer's mapping.
+///
+/// Building a temporary `Vec` per dispatch and copying it into the mapping
+/// was two allocations' worth of work for a few dozen bytes. The mapping is
+/// already the packet's home: zero the range, write the fields, and submit.
+fn write_packet(
+    map: &ArgMap,
+    packet: &mut [u8],
     instr: &DirectBuffer,
     words: u32,
     args: &[&DirectBuffer],
-) -> Result<Vec<u8>, TransportError> {
-    let map = kernel.map_size() as usize;
-    let payload_words = 1 + map.div_ceil(4);
-    let mut packet = vec![0u8; 4 + payload_words * 4];
+) -> Result<(), TransportError> {
+    let bytes = map.packet_bytes;
+    let available = packet.len();
+    let packet: &mut [u8] = packet.get_mut(..bytes).ok_or_else(|| {
+        TransportError::new(format!(
+            "the command buffer holds {available} bytes, and the packet needs {bytes}"
+        ))
+    })?;
+    // Holes in the register map and the rounded-up tail must read as zero,
+    // just as the old zero-filled `Vec` left them.
+    packet.fill(0);
 
     // THE HEADER: the state, the payload's length in words, the opcode and
     // the type.
+    let payload_words = (bytes - 4) / 4;
     let header =
         ERT_STATE_NEW | ((payload_words as u32) << 12) | (ERT_START_CU << 23) | (ERT_CU << 28);
     packet[0..4].copy_from_slice(&header.to_le_bytes());
@@ -1233,30 +1549,34 @@ fn build_packet(
     // THE CU MASK: the first CU.
     packet[4..8].copy_from_slice(&1u32.to_le_bytes());
 
-    let mut put = |name: &str, value: u64| -> Result<(), TransportError> {
-        let arg = kernel.arg(name).ok_or_else(|| {
+    let mut put = |slot: usize, value: u64| -> Result<(), TransportError> {
+        let name = ARG_NAMES[slot];
+        let (offset, size) = map.slots[slot].ok_or_else(|| {
             TransportError::new(format!("the design's kernel has no `{name}` argument"))
         })?;
-        let at = 8 + arg.offset as usize;
-        let bytes = value.to_le_bytes();
-        let width = (arg.size as usize).min(8);
+        let at = 8 + offset as usize;
+        let width = (size as usize).min(8);
         if at + width > packet.len() {
             return Err(TransportError::new(format!(
                 "the design's kernel puts `{name}` outside the packet"
             )));
         }
-        packet[at..at + width].copy_from_slice(&bytes[..width]);
+        packet[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
         Ok(())
     };
 
-    put("opcode", CU_OPCODE_RUN)?;
-    put("instr", instr.device_addr)?;
-    put("ninstr", words as u64)?;
+    put(0, CU_OPCODE_RUN)?;
+    put(1, instr.device_addr)?;
+    put(2, words as u64)?;
     for (index, arg) in args.iter().enumerate() {
-        let name = format!("bo{index}");
-        put(&name, arg.host as u64)?;
+        if index >= MAX_KERNEL_BUFFERS {
+            return Err(TransportError::new(format!(
+                "the design's kernel has no `bo{index}` argument"
+            )));
+        }
+        put(3 + index, arg.host as u64)?;
     }
-    Ok(packet)
+    Ok(())
 }
 
 /// An ioctl, with the driver's own words for a refusal.
@@ -1650,4 +1970,147 @@ unsafe fn libc_mmap(
 #[cfg(not(target_os = "linux"))]
 unsafe fn libc_munmap(_addr: *mut std::ffi::c_void, _length: usize) -> i32 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kernel() -> Kernel {
+        Kernel {
+            name: "MLIR_AIE".to_string(),
+            args: vec![
+                crate::xclbin::Arg {
+                    name: "opcode".to_string(),
+                    offset: 0,
+                    size: 8,
+                },
+                crate::xclbin::Arg {
+                    name: "instr".to_string(),
+                    offset: 8,
+                    size: 8,
+                },
+                crate::xclbin::Arg {
+                    name: "ninstr".to_string(),
+                    offset: 16,
+                    size: 4,
+                },
+                crate::xclbin::Arg {
+                    name: "bo0".to_string(),
+                    offset: 20,
+                    size: 8,
+                },
+                crate::xclbin::Arg {
+                    name: "bo1".to_string(),
+                    offset: 28,
+                    size: 8,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn arg_map_resolves_every_name_into_a_fixed_slot() {
+        let map = ArgMap::new(&kernel());
+        assert_eq!(map.slots[0], Some((0, 8))); // opcode
+        assert_eq!(map.slots[1], Some((8, 8))); // instr
+        assert_eq!(map.slots[2], Some((16, 4))); // ninstr
+        assert_eq!(map.slots[3], Some((20, 8))); // bo0
+        assert_eq!(map.slots[4], Some((28, 8))); // bo1
+        assert_eq!(map.slots[5], None); // bo2 is not in this design
+        // The map ends at 36 bytes; 9 payload words + the mask word + header.
+        assert_eq!(map.packet_bytes, 4 + (1 + 9) * 4);
+    }
+
+    #[test]
+    fn arg_map_ignores_a_buffer_index_out_of_range() {
+        let mut k = kernel();
+        k.args.push(crate::xclbin::Arg {
+            name: "bo99".to_string(),
+            offset: 36,
+            size: 8,
+        });
+        let map = ArgMap::new(&k);
+        assert_eq!(map.slots[3 + MAX_KERNEL_BUFFERS - 1], None);
+        // `bo99` is still part of the map's extent (44 bytes), even though
+        // no slot holds it: the packet is sized from the map, not the slots.
+        assert_eq!(map.packet_bytes, 4 + (1 + 11) * 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffer_pool_reuses_matching_shapes_only() {
+        let pool = BufferPool::new();
+        let board = Arc::new(Board {
+            file: std::fs::File::open("/dev/null").unwrap(),
+        });
+        let pooled = |handle: u32| PooledBuffer {
+            board: Arc::clone(&board),
+            _heap: None,
+            handle,
+            size: 128,
+            host: std::ptr::null_mut(),
+            device_addr: 0,
+            map: None,
+        };
+        let key = buffer_key(128, BufferFlags::HostOnly, 3);
+        assert!(pool.take(key).is_none());
+        pool.give(key, pooled(7));
+
+        let reused = pool.take(key).expect("the buffer was just returned");
+        assert_eq!(reused.handle, 7);
+        assert!(pool.take(key).is_none());
+        assert!(
+            pool.take(buffer_key(128, BufferFlags::Cacheable, 3))
+                .is_none()
+        );
+        assert!(
+            pool.take(buffer_key(256, BufferFlags::HostOnly, 3))
+                .is_none()
+        );
+        assert!(
+            pool.take(buffer_key(128, BufferFlags::HostOnly, 4))
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_packet_places_fields_and_leaves_the_holes_zero() {
+        let map = ArgMap::new(&kernel());
+        let board = Arc::new(Board {
+            file: std::fs::File::open("/dev/null").unwrap(),
+        });
+        let buffer = |handle: u32, addr: u64| DirectBuffer {
+            board: Arc::clone(&board),
+            _heap: None,
+            handle,
+            size: 64,
+            host: addr as *mut u8,
+            device_addr: addr,
+            map: None,
+            pool: None,
+            key: None,
+        };
+        let instr = buffer(1, 0x1000);
+        let bo0 = buffer(2, 0x2000);
+        let bo1 = buffer(3, 0x3000);
+
+        let mut memory = vec![0xaa_u8; 64];
+        write_packet(&map, &mut memory, &instr, 17, &[&bo0, &bo1]).unwrap();
+
+        let word = |at: usize| u32::from_le_bytes(memory[at..at + 4].try_into().unwrap());
+        let qword = |at: usize| u64::from_le_bytes(memory[at..at + 8].try_into().unwrap());
+
+        assert_eq!(word(0) & 0xf, ERT_STATE_NEW);
+        assert_eq!((word(0) >> 12) & 0xff, 10); // payload length in words
+        assert_eq!(word(4), 1); // CU mask
+        assert_eq!(qword(8), CU_OPCODE_RUN); // opcode
+        assert_eq!(qword(16), 0x1000); // instr's DEVICE address
+        assert_eq!(word(24), 17); // ninstr
+        assert_eq!(qword(28), 0x2000); // bo0's HOST address
+        assert_eq!(qword(36), 0x3000); // bo1's HOST address
+        // The byte between ninstr and bo0 was part of the zero-filled Vec.
+        assert_eq!(memory[20], 0);
+    }
 }

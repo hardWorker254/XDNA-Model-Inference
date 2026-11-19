@@ -1563,10 +1563,7 @@ unsafe fn dot8_lanes_avx2(a: &[f32], b: &[f32], nv: usize) -> [f32; 8] {
 
     // SAFETY: `nv` groups of eight were bounds-checked by the caller.
     unsafe {
-        let mut acc = _mm256_mul_ps(
-            _mm256_loadu_ps(a.as_ptr()),
-            _mm256_loadu_ps(b.as_ptr()),
-        );
+        let mut acc = _mm256_mul_ps(_mm256_loadu_ps(a.as_ptr()), _mm256_loadu_ps(b.as_ptr()));
         for v in 1..nv {
             acc = _mm256_fmadd_ps(
                 _mm256_loadu_ps(a.as_ptr().add(v * 8)),
@@ -1621,6 +1618,132 @@ unsafe fn weighted_accumulate_avx2(acc: &mut [f32], v: &[f32], weight: f32) {
             i += 1;
         }
     }
+}
+
+// ---------------------------------------------------------- fused attention
+
+thread_local! {
+    /// One attention score row per worker.
+    ///
+    /// The fused kernel normalises a row in place instead of materialising a
+    /// `batch * heads * seq * seq` score matrix. A row is `seq` floats -- for
+    /// a long sequence the difference between that and the matrix is the
+    /// difference between kilobytes and tens of megabytes.
+    static ATTN_ROW: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The fused host attention: QK^T, the softmax and softmax.V in one pass over
+/// one query row at a time.
+///
+/// WHY THE BYTES ARE THE SAME
+/// --------------------------
+/// Every arithmetic operation is the one the separate kernels use, in the
+/// same order: `dot8` for each score, the additive mask folded in with the
+/// same `+`, `softmax_row_impl` (the exact body behind `softmax_row_on` on
+/// every ISA) for the row, and `weighted_accumulate` over the keys from first
+/// to last. The bytes are therefore bit-identical to `qk` + `softmax_rows` +
+/// `av`; only the memory traffic changes.
+///
+/// WHY IT IS FASTER
+/// ----------------
+/// The three passes keep a full `batch * heads * seq * seq` score matrix
+/// alive between them. This kernel keeps ONE row: it writes that row's
+/// scores, normalises and consumes them, then overwrites it for the next
+/// query. For a long sequence that matrix is the largest temporary in the
+/// forward pass. Rows are independent (a query reads only K and V), so the
+/// work splits over the same row chunks as the separate kernels, with the
+/// same byte result.
+///
+/// `qkv` is the model's `[3 * hidden]`-per-row layout (Q, K, V concatenated),
+/// `ctx` is a row-major `batch * seq` by `hidden` output, and `add_mask` has
+/// one entry per token.
+pub fn fused_attention(
+    qkv: &[f32],
+    ctx: &mut [f32],
+    add_mask: &[f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    hidden: usize,
+) -> Result<()> {
+    if seq % 8 != 0 {
+        return Err(TensorError::WrongLength {
+            expected: seq.next_multiple_of(8),
+            found: seq,
+        }
+        .into());
+    }
+    let rows = batch * seq;
+    let span = rows * hidden;
+    if ctx.len() < span {
+        return Err(TensorError::WrongLength {
+            expected: span,
+            found: ctx.len(),
+        }
+        .into());
+    }
+    if add_mask.len() < rows {
+        return Err(TensorError::WrongLength {
+            expected: rows,
+            found: add_mask.len(),
+        }
+        .into());
+    }
+    let qkv_span = rows * 3 * hidden;
+    if qkv.len() < qkv_span || hidden != heads * head_dim {
+        return Err(TensorError::WrongLength {
+            expected: qkv_span,
+            found: qkv.len(),
+        }
+        .into());
+    }
+
+    let one_row = |row: usize, out: &mut [f32]| {
+        let b = row / seq;
+        let i = row % seq;
+        ATTN_ROW.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < seq {
+                scratch.resize(seq, 0.0);
+            }
+            for h in 0..heads {
+                let q_base = (b * seq + i) * 3 * hidden + h * head_dim;
+                let q = &qkv[q_base..q_base + head_dim];
+                let scores = &mut scratch[..seq];
+                // QK^T, with the mask added where the separate QK pass adds it.
+                for (j, slot) in scores.iter_mut().enumerate() {
+                    let k_base = (b * seq + j) * 3 * hidden + hidden + h * head_dim;
+                    *slot = dot8(q, &qkv[k_base..k_base + head_dim]) + add_mask[b * seq + j];
+                }
+                softmax_row_impl(scores);
+                let o = &mut out[h * head_dim..][..head_dim];
+                o.fill(0.0);
+                for (j, &weight) in scores.iter().enumerate() {
+                    let v_base = (b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim;
+                    weighted_accumulate(o, &qkv[v_base..v_base + head_dim], weight);
+                }
+            }
+        });
+    };
+
+    let work = (rows as i64) * (heads as i64) * (seq as i64) * (head_dim as i64) * 2;
+    match parallel::chunk_rows(rows, work, parallel::threads()) {
+        Some(chunk) => {
+            parallel::for_each_chunk_mut(&mut ctx[..span], chunk * hidden, |ci, part| {
+                let first = ci * chunk;
+                for (i, row) in part.chunks_exact_mut(hidden).enumerate() {
+                    one_row(first + i, row);
+                }
+            });
+        }
+        None => {
+            for (i, row) in ctx[..span].chunks_exact_mut(hidden).enumerate() {
+                one_row(i, row);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the trait

@@ -26,8 +26,8 @@
 
 use crate::kernels;
 use crate::kernels::Isa;
-use crate::parallel;
 use crate::ops::CpuOps;
+use crate::parallel;
 use npum_model::Ops;
 use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape};
 use npum_model::dispatcher::Placement;
@@ -1181,6 +1181,28 @@ impl BertModel {
                 timings.qk += after.0 - before.0;
                 timings.av += after.1 - before.1;
                 timings.attention += t_attn.elapsed().as_secs_f64();
+            } else if !sm_on && sc_cols == seq && seq % 8 == 0 && ops.place() == Placement::Host {
+                // THE HOST'S WHOLE ATTENTION IN ONE PASS.
+                //
+                // Only when no array or device owns any part of it: the
+                // softmax on an array normalises a design-width row, and the
+                // GPU's softmax is its own submission -- neither can be done
+                // inside this kernel. On the plain host path, though, the
+                // kernel keeps one score row instead of a whole
+                // batch*heads*seq*seq matrix. The arithmetic, the order and
+                // the bytes are the ones the three passes below produce.
+                let t_attn = std::time::Instant::now();
+                kernels::fused_attention(
+                    qkv_buf,
+                    ctx_buf,
+                    add_mask_buf,
+                    batch,
+                    seq,
+                    spec.heads,
+                    spec.head_dim,
+                    hidden,
+                )?;
+                timings.attention += t_attn.elapsed().as_secs_f64();
             } else {
                 let t_qk = std::time::Instant::now();
                 self.qk(qkv_buf, scores_buf, batch, seq, sc_cols);
@@ -1414,20 +1436,17 @@ impl BertModel {
         // OVER (batch, head, query) rows: one score row is a dot product of
         // its query against every key, independent of every other row. The
         // split crosses no reduction, so the bytes are the serial bytes.
-        parallel::for_each_chunk_mut(&mut scores[..rows * sc_cols], chunk * sc_cols, |ci, part| {
-            self.qk_rows(qkv, part, seq, sc_cols, ci * chunk);
-        });
+        parallel::for_each_chunk_mut(
+            &mut scores[..rows * sc_cols],
+            chunk * sc_cols,
+            |ci, part| {
+                self.qk_rows(qkv, part, seq, sc_cols, ci * chunk);
+            },
+        );
     }
 
     /// The score rows starting at `first`, with the same dot-product order.
-    fn qk_rows(
-        &self,
-        qkv: &[f32],
-        scores: &mut [f32],
-        seq: usize,
-        sc_cols: usize,
-        first: usize,
-    ) {
+    fn qk_rows(&self, qkv: &[f32], scores: &mut [f32], seq: usize, sc_cols: usize, first: usize) {
         let hidden = self.spec.hidden;
         let head_dim = self.spec.head_dim;
         for (r, row_view) in scores.chunks_exact_mut(sc_cols).enumerate() {

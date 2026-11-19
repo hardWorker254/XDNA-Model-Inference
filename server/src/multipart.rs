@@ -18,6 +18,8 @@
 //! over 70 characters. Each is an error with a reason, not a best-effort
 //! parse: the alternatives are a wrong transcript and a wrong transcript.
 
+use bytes::Bytes;
+
 /// One part of a multipart body.
 #[derive(Debug, Clone)]
 pub struct Part {
@@ -27,8 +29,9 @@ pub struct Part {
     pub filename: String,
     /// Empty unless the part declared one.
     pub content_type: String,
-    /// The bytes, verbatim.
-    pub data: Vec<u8>,
+    /// The bytes, verbatim: a refcounted slice of the request body, so a
+    /// 200 MB upload is not copied once per part at parse time.
+    pub data: Bytes,
 }
 
 /// The boundary out of a Content-Type header, or `None` when there is not
@@ -99,7 +102,7 @@ fn part_header(headers: &str, name: &str) -> String {
 /// Parse a multipart body.
 ///
 /// `err` receives the reason when the parse fails.
-pub fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, String> {
+pub fn parse(body: &Bytes, boundary: &str) -> Result<Vec<Part>, String> {
     let dash = format!("--{boundary}");
     let dash_bytes = dash.as_bytes();
     // A body that does not even open with the first boundary is not this
@@ -139,7 +142,7 @@ pub fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, String> {
             name: String::new(),
             filename: String::new(),
             content_type: String::new(),
-            data: Vec::new(),
+            data: Bytes::new(),
         };
         // Content-Disposition carries both the field name and the filename,
         // quoted.
@@ -165,7 +168,9 @@ pub fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, String> {
                 ));
             }
         };
-        part.data = body[pos..next].to_vec();
+        // A slice, not a copy: the body is refcounted `Bytes`, and the part
+        // keeps the whole buffer alive while it holds its own window of it.
+        part.data = body.slice(pos..next);
         out.push(part);
         pos = next + 2 + dash_bytes.len();
     }
@@ -187,8 +192,17 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if haystack.len() - from < needle.len() {
         return None;
     }
-    haystack[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|at| at + from)
+    // A boundary is tens of bytes; a WAV body is hundreds of megabytes.
+    // Scan for the first byte, then compare the rest only at the few places
+    // that could actually be a boundary.
+    let first = needle[0];
+    let mut at = from;
+    while let Some(rel) = haystack[at..].iter().position(|&b| b == first) {
+        let start = at + rel;
+        if haystack.get(start..start + needle.len()) == Some(needle) {
+            return Some(start);
+        }
+        at = start + 1;
+    }
+    None
 }

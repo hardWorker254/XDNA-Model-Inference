@@ -6,8 +6,8 @@
 //! and `CpuOps` can split independent rows over the pool.
 
 use npum_cpu::kernels::{
-    Isa, add_inplace, dot8, gelu_f32, gelu_row_on, gemm_nt, gemm_nt_on, gemm_nt_rows,
-    gemm_nt_rows_on, weighted_accumulate,
+    Isa, add_inplace, dot8, fused_attention, gelu_f32, gelu_row_on, gemm_nt, gemm_nt_on,
+    gemm_nt_rows, gemm_nt_rows_on, softmax_row, weighted_accumulate,
 };
 use npum_cpu::ops::CpuOps;
 use npum_model::{Ops, Tensor};
@@ -312,4 +312,62 @@ fn ops_row_kernels_agree_between_serial_and_pooled() {
         pooled.softmax_rows(&mut b, rows, width).unwrap();
         assert_eq!(bytes(&a), bytes(&b), "softmax rows differ on {isa:?}");
     }
+}
+
+#[test]
+fn fused_attention_is_bit_identical_to_the_three_separate_passes() {
+    const BATCH: usize = 2;
+    const SEQ: usize = 16;
+    const HEADS: usize = 2;
+    const HEAD_DIM: usize = 8;
+    const HIDDEN: usize = HEADS * HEAD_DIM;
+
+    let qkv = values(BATCH * SEQ * 3 * HIDDEN, 0xa11e);
+    let mut add_mask = vec![0.0f32; BATCH * SEQ];
+    for (i, slot) in add_mask.iter_mut().enumerate() {
+        if i % 7 == 3 || i % 11 == 5 {
+            *slot = -1.0e30;
+        }
+    }
+
+    // The three passes, as GTE runs them: QK with the mask folded in, a
+    // softmax over the whole row, then the weighted V accumulation.
+    let mut scores = vec![0.0f32; BATCH * HEADS * SEQ * SEQ];
+    for row in 0..BATCH * HEADS * SEQ {
+        let p = row / SEQ;
+        let i = row % SEQ;
+        let b = p / HEADS;
+        let h = p % HEADS;
+        let q = &qkv[(b * SEQ + i) * 3 * HIDDEN + h * HEAD_DIM..][..HEAD_DIM];
+        for (j, slot) in scores[row * SEQ..(row + 1) * SEQ].iter_mut().enumerate() {
+            let k = &qkv[(b * SEQ + j) * 3 * HIDDEN + HIDDEN + h * HEAD_DIM..][..HEAD_DIM];
+            *slot = dot8(q, k) + add_mask[b * SEQ + j];
+        }
+    }
+    for row in scores.chunks_exact_mut(SEQ) {
+        softmax_row(row).unwrap();
+    }
+    let mut want = vec![0.0f32; BATCH * SEQ * HIDDEN];
+    for row in 0..BATCH * SEQ {
+        let (b, i) = (row / SEQ, row % SEQ);
+        for h in 0..HEADS {
+            let a = &scores[((b * HEADS + h) * SEQ + i) * SEQ..][..SEQ];
+            let o = &mut want[row * HIDDEN + h * HEAD_DIM..][..HEAD_DIM];
+            for (j, &weight) in a.iter().enumerate() {
+                let v = &qkv[(b * SEQ + j) * 3 * HIDDEN + 2 * HIDDEN + h * HEAD_DIM..][..HEAD_DIM];
+                weighted_accumulate(o, v, weight);
+            }
+        }
+    }
+
+    let mut got = vec![0.0f32; BATCH * SEQ * HIDDEN];
+    fused_attention(
+        &qkv, &mut got, &add_mask, BATCH, SEQ, HEADS, HEAD_DIM, HIDDEN,
+    )
+    .unwrap();
+    assert_eq!(
+        bytes(&got),
+        bytes(&want),
+        "fused attention changed the bytes"
+    );
 }

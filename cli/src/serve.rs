@@ -174,9 +174,17 @@ pub fn serve(
             let encoder_design = crate::stt::read_design(&designs, false);
             let decoder_design = crate::stt::read_design(&designs, true);
             let started = std::time::Instant::now();
-            let transcriber = match npuembeddings_server::Transcriber::open(
+            // Each decoder owns its KV cache, so the pool is a memory choice
+            // as well as a concurrency one. `--threads` is the host's budget;
+            // cap it so a machine with 24 threads does not load 24 decoders.
+            let pool = args
+                .value_i64("--threads")
+                .map(|n| n.clamp(1, 4) as usize)
+                .unwrap_or(npuembeddings_server::DEFAULT_DECODER_POOL);
+            let transcriber = match npuembeddings_server::Transcriber::open_with_pool(
                 &path,
                 crate::stt::options_from(args),
+                pool,
             ) {
                 Ok(t) => t,
                 Err(reason) => {

@@ -46,7 +46,10 @@ pub mod routes;
 
 use axum::Router;
 
-pub use engines::{Classification, Classifier, Embedder, PoseDetector, PoseResult, Transcriber};
+pub use engines::{
+    Classification, Classifier, DEFAULT_DECODER_POOL, Embedder, PoseDetector, PoseResult,
+    Transcriber,
+};
 
 /// The result type of this crate.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

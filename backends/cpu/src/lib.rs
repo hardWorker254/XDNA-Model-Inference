@@ -64,7 +64,7 @@ use npum_model::caps::Precision as CapsPrecision;
 use npum_model::{Backend, Caps, ModelSpec, OpKind, Plan, Result, Tensor};
 
 pub use bert::BertModel;
-pub use gte::GteModel;
+pub use gte::{GteModel, GteWorkspace};
 pub use kernels::{gelu_f32, layernorm_row, softmax_row};
 
 /// The CPU backend.

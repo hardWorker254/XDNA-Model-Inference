@@ -283,6 +283,83 @@ pub struct GteModel {
     names: Vec<[String; 4]>,
 }
 
+/// The scratch a GTE forward pass needs, owned by the caller and reused across
+/// requests.
+///
+/// A host forward used to allocate seven multi-megabyte buffers and both RoPE
+/// tables on every call. The model's shapes are fixed once it is opened, so
+/// every one of those allocations can be grown once and then kept. The server
+/// holds one of these per engine and lends it to each batch; a short-lived
+/// caller (the CLI, a test) builds a local one and drops it afterwards.
+#[derive(Debug, Clone, Default)]
+pub struct GteWorkspace {
+    x: Vec<f32>,
+    add_mask: Vec<f32>,
+    attn_mask: Vec<f32>,
+    qkv: Vec<f32>,
+    ctx: Vec<f32>,
+    proj: Vec<f32>,
+    up_gate: Vec<f32>,
+    act: Vec<f32>,
+    down: Vec<f32>,
+    scores: Vec<f32>,
+    zeros_bias: Vec<f32>,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    /// How many positions of `cos`/`sin` are already filled. Positions are
+    /// computed from the first one onwards, so a later, longer sequence only
+    /// computes the NEW tail and a shorter one reuses the prefix.
+    rope_seq: usize,
+    pool_acc: Vec<f64>,
+}
+
+/// Grow `buf` to `len`, keeping what is already there.
+///
+/// Every buffer here is either overwritten in full by its kernel or, in the
+/// case of `zeros_bias`, only ever read as zeros. `resize` zero-fills only
+/// newly grown elements, so the steady state is a no-op and a shape change is
+/// still safe.
+#[inline]
+fn grown(buf: &mut Vec<f32>, len: usize) -> &mut [f32] {
+    buf.resize(len, 0.0);
+    buf
+}
+
+/// The RoPE tables up to `seq`, cached across forward passes.
+///
+/// `cos`/`sin` are a pure function of the token position, the model's baked
+/// inverse frequencies and the head size: none of them changes between
+/// requests. The server narrows `seq` per batch, so positions arrive in an
+/// order that a single "recompute if different" flag would rebuild every
+/// time; growing the table monotonically and keeping the prefix avoids that.
+fn ensure_rope<'a>(
+    cos: &'a mut Vec<f32>,
+    sin: &'a mut Vec<f32>,
+    cached: &mut usize,
+    seq: usize,
+    inv_freq: &[f32],
+    head_dim: usize,
+) -> (&'a [f32], &'a [f32]) {
+    let half = head_dim / 2;
+    if seq > *cached {
+        cos.resize(seq * head_dim, 0.0);
+        sin.resize(seq * head_dim, 0.0);
+        for t in *cached..seq {
+            for i in 0..half {
+                let angle = (t as f32) * inv_freq[i];
+                let c = angle.cos();
+                let s = angle.sin();
+                cos[t * head_dim + i] = c;
+                cos[t * head_dim + i + half] = c;
+                sin[t * head_dim + i] = s;
+                sin[t * head_dim + i + half] = s;
+            }
+        }
+        *cached = seq;
+    }
+    (&cos[..seq * head_dim], &sin[..seq * head_dim])
+}
+
 impl GteModel {
     pub fn open(path: &Path) -> Result<Self> {
         let container = npum_format::Container::open(path).map_err(|source| Error::Container {
@@ -438,6 +515,9 @@ impl GteModel {
         })
     }
 
+    /// Embed with a fresh workspace. Kept for callers that run one batch and
+    /// are gone (the CLI, tests); a server should keep a workspace and use
+    /// [`GteModel::embed_timed_with_workspace`] instead.
     pub fn embed_timed_with(
         &self,
         ops: &mut dyn Ops,
@@ -447,7 +527,35 @@ impl GteModel {
         batch: usize,
         seq: usize,
         array: ArrayTextRef<'_, '_>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+    ) -> Result<Vec<f32>> {
+        let mut workspace = GteWorkspace::default();
+        self.embed_timed_with_workspace(
+            ops,
+            timings,
+            ids,
+            mask,
+            batch,
+            seq,
+            array,
+            eltwise,
+            &mut workspace,
+        )
+    }
+
+    /// Embed, borrowing scratch from `workspace` so the buffers survive the
+    /// call and the next batch pays no allocation for them.
+    pub fn embed_timed_with_workspace(
+        &self,
+        ops: &mut dyn Ops,
+        timings: &mut Timings,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        array: ArrayTextRef<'_, '_>,
         _eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        workspace: &mut GteWorkspace,
     ) -> Result<Vec<f32>> {
         let rows = batch * seq;
         if ids.len() != rows || mask.len() != rows {
@@ -466,11 +574,31 @@ impl GteModel {
                 found: seq,
             });
         }
-        let hidden = self.spec.hidden;
+        let h = self.forward(ops, ids, mask, batch, seq, timings, array, workspace)?;
+        Ok(self.pool(&h, batch, seq, workspace))
+    }
+
+    fn forward(
+        &self,
+        ops: &mut dyn Ops,
+        ids: &[u32],
+        mask: &[u32],
+        batch: usize,
+        seq: usize,
+        timings: &mut Timings,
+        mut array: ArrayTextRef<'_, '_>,
+        ws: &mut GteWorkspace,
+    ) -> Result<Vec<f32>> {
+        let spec = &self.spec;
+        let hidden = spec.hidden;
+        let rows = batch * seq;
+        let three_hidden = 3 * hidden;
+        let score_rows = batch * spec.heads * seq;
+        let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
 
         // Embeddings: word + token_type[0], then embeddings.LayerNorm.
         // No absolute position addition (RoPE). position_embedding tensor in container is zeroed.
-        let mut x = vec![0.0f32; rows * hidden];
+        let x = grown(&mut ws.x, rows * hidden);
         for r in 0..rows {
             let id = ids[r] as usize;
             let wv = &self.weights.word[id * hidden..(id + 1) * hidden];
@@ -480,9 +608,8 @@ impl GteModel {
                 dst[c] = wv[c] + tv[c];
             }
         }
-
-        let mut add_mask = vec![0.0f32; rows];
-        let mut attn_mask = vec![0.0f32; rows];
+        let add_mask = grown(&mut ws.add_mask, rows);
+        let attn_mask = grown(&mut ws.attn_mask, rows);
         for r in 0..rows {
             if mask[r] > 0 {
                 attn_mask[r] = 1.0;
@@ -490,10 +617,9 @@ impl GteModel {
                 add_mask[r] = -1.0e30;
             }
         }
-
         let t0 = std::time::Instant::now();
         ops.layernorm_rows(
-            &mut x,
+            x,
             rows,
             hidden,
             &self.weights.ln_gamma,
@@ -501,44 +627,30 @@ impl GteModel {
         )?;
         timings.host_layernorm += t0.elapsed().as_secs_f64();
 
-        let cos_sin = rope_cos_sin(seq, &self.spec.rope_inv_freq, self.spec.head_dim);
-        let h = self.forward(ops, &mut x, &add_mask, batch, seq, timings, array, &cos_sin)?;
-        Ok(self.pool(&h, &attn_mask, batch, seq))
-    }
+        // The RoPE tables are their own cache: growing them mutably borrows
+        // only these three fields, leaving every scratch buffer below free.
+        let (cos, sin) = ensure_rope(
+            &mut ws.cos,
+            &mut ws.sin,
+            &mut ws.rope_seq,
+            seq,
+            &spec.rope_inv_freq,
+            spec.head_dim,
+        );
 
-    fn forward(
-        &self,
-        ops: &mut dyn Ops,
-        x: &mut [f32],
-        add_mask: &[f32],
-        batch: usize,
-        seq: usize,
-        timings: &mut Timings,
-        mut array: ArrayTextRef<'_, '_>,
-        cos_sin: &(Vec<f32>, Vec<f32>),
-    ) -> Result<Vec<f32>> {
-        let spec = &self.spec;
-        let hidden = spec.hidden;
-        let rows = batch * seq;
-        let three_hidden = 3 * hidden;
-        let score_rows = batch * spec.heads * seq;
-        let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
+        // Every one of these was a fresh multi-megabyte allocation per call.
+        // They are grown in place and reused; each is written IN FULL before
+        // it is read. `zeros_bias` is the exception -- it is READ as a bias --
+        // so it is only ever extended with zeros and never written.
+        let qkv = grown(&mut ws.qkv, rows * three_hidden);
+        let ctx = grown(&mut ws.ctx, rows * hidden);
+        let proj = grown(&mut ws.proj, rows * hidden);
+        let up_gate = grown(&mut ws.up_gate, rows * 2 * spec.ffn);
+        let act = grown(&mut ws.act, rows * spec.ffn);
+        let down = grown(&mut ws.down, rows * hidden);
+        let scores = grown(&mut ws.scores, score_rows * seq);
+        let zeros_bias = grown(&mut ws.zeros_bias, 2 * spec.ffn);
 
-        // Every one of these is written IN FULL before it is read: the GEMMs
-        // overwrite their output, `qk` writes every score row, and the GEGLU
-        // writes every activation. `zeros_bias` below is the exception -- it
-        // is READ as a bias -- so it stays a real zero-filled vector.
-        let mut qkv = kernels::scratch_f32(rows * three_hidden);
-        let mut ctx = kernels::scratch_f32(rows * hidden);
-        let mut proj = kernels::scratch_f32(rows * hidden);
-        let mut up_gate = kernels::scratch_f32(rows * 2 * spec.ffn);
-        let mut act = kernels::scratch_f32(rows * spec.ffn);
-        let mut down = kernels::scratch_f32(rows * hidden);
-        let mut scores = kernels::scratch_f32(score_rows * seq);
-
-        // The bias of a GEMM without one: one buffer per CALL, not one per
-        // layer. `gemm_nt` reads `bias[j]` for every column.
-        let zeros_bias = vec![0.0f32; 2 * spec.ffn];
         for (index, layer) in self.weights.layers.iter().enumerate() {
             let names = &self.names[index];
             // QKV projection
@@ -552,7 +664,7 @@ impl GteModel {
                         hidden,
                         three_hidden,
                         Some(&layer.qkv_bias),
-                        &mut qkv,
+                        qkv,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
@@ -565,7 +677,7 @@ impl GteModel {
                         hidden,
                         three_hidden,
                         &layer.qkv_bias,
-                        &mut qkv,
+                        qkv,
                     )?;
                     if ops.place() != npum_model::Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
@@ -573,27 +685,41 @@ impl GteModel {
                 }
             }
             // Apply RoPE to Q and K
-            apply_rope_qkv(
-                &mut qkv,
-                batch,
-                seq,
-                spec.heads,
-                spec.head_dim,
-                hidden,
-                cos_sin,
-            );
+            apply_rope_qkv(qkv, batch, seq, spec.heads, spec.head_dim, hidden, cos, sin);
 
-            // Attention (host path, correct semantics)
-            let t_qk = std::time::Instant::now();
-            self.qk(&qkv, &mut scores, batch, seq, add_mask);
-            timings.qk += t_qk.elapsed().as_secs_f64();
-            let t_sm = std::time::Instant::now();
-            ops.softmax_rows(&mut scores, score_rows, seq)?;
-            timings.host_softmax += t_sm.elapsed().as_secs_f64();
-            let t_av = std::time::Instant::now();
-            self.av(&scores, &qkv, &mut ctx, batch, seq);
-            timings.av += t_av.elapsed().as_secs_f64();
-            timings.attention += t_qk.elapsed().as_secs_f64() + t_av.elapsed().as_secs_f64();
+            // ATTENTION: one fused host kernel, or the three separate passes
+            // when a device owns the softmax.
+            let t_attn = std::time::Instant::now();
+            if ops.place() == npum_model::Placement::Host {
+                // QK^T + softmax + softmax.V in one pass over a single score
+                // row. Bit-identical to the three passes below (the same
+                // dot8, the same softmax body, the same V accumulation), but
+                // it never materialises the seq-by-seq score matrix.
+                kernels::fused_attention(
+                    qkv,
+                    ctx,
+                    add_mask,
+                    batch,
+                    seq,
+                    spec.heads,
+                    spec.head_dim,
+                    hidden,
+                )?;
+                timings.attention += t_attn.elapsed().as_secs_f64();
+            } else {
+                let t_qk = std::time::Instant::now();
+                self.qk(qkv, scores, batch, seq, add_mask);
+                let qk_s = t_qk.elapsed().as_secs_f64();
+                timings.qk += qk_s;
+                let t_sm = std::time::Instant::now();
+                ops.softmax_rows(scores, score_rows, seq)?;
+                timings.host_softmax += t_sm.elapsed().as_secs_f64();
+                let t_av = std::time::Instant::now();
+                self.av(scores, qkv, ctx, batch, seq);
+                let av_s = t_av.elapsed().as_secs_f64();
+                timings.av += av_s;
+                timings.attention += qk_s + av_s;
+            }
 
             // Output projection + residual
             match array.as_deref_mut().filter(|_| gemm_on) {
@@ -606,7 +732,7 @@ impl GteModel {
                         hidden,
                         hidden,
                         Some(&layer.attn_out_bias),
-                        &mut proj,
+                        proj,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
@@ -619,7 +745,7 @@ impl GteModel {
                         hidden,
                         hidden,
                         &layer.attn_out_bias,
-                        &mut proj,
+                        proj,
                     )?;
                     if ops.place() != npum_model::Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
@@ -636,7 +762,7 @@ impl GteModel {
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
                     let t = std::time::Instant::now();
-                    array.gemm(&names[2], x, rows, hidden, 2 * spec.ffn, None, &mut up_gate)?;
+                    array.gemm(&names[2], x, rows, hidden, 2 * spec.ffn, None, up_gate)?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
                 None => {
@@ -648,7 +774,7 @@ impl GteModel {
                         hidden,
                         2 * spec.ffn,
                         &zeros_bias,
-                        &mut up_gate,
+                        up_gate,
                     )?;
                     if ops.place() != npum_model::Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
@@ -666,11 +792,7 @@ impl GteModel {
             };
             // Every output element is one `erff` on its own gate, so a row
             // split crosses no reduction and keeps the exact libm result.
-            match parallel::chunk_rows(
-                rows,
-                (rows as i64) * (inter as i64),
-                parallel::threads(),
-            ) {
+            match parallel::chunk_rows(rows, (rows as i64) * (inter as i64), parallel::threads()) {
                 Some(chunk) => {
                     parallel::for_each_chunk_mut(
                         &mut act[..rows * inter],
@@ -699,7 +821,7 @@ impl GteModel {
                         inter,
                         hidden,
                         Some(&layer.ffn_down_bias),
-                        &mut down,
+                        down,
                     )?;
                     timings.array_gemm += t.elapsed().as_secs_f64();
                 }
@@ -712,7 +834,7 @@ impl GteModel {
                         inter,
                         hidden,
                         &layer.ffn_down_bias,
-                        &mut down,
+                        down,
                     )?;
                     if ops.place() != npum_model::Placement::Host {
                         timings.gpu += t.elapsed().as_secs_f64();
@@ -778,20 +900,24 @@ impl GteModel {
                 let o = &mut out[h * head_dim..][..head_dim];
                 o.fill(0.0);
                 for (j, &aj) in a.iter().enumerate() {
-                    let vrow = &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..]
-                        [..head_dim];
+                    let vrow =
+                        &qkv[(b * seq + j) * 3 * hidden + 2 * hidden + h * head_dim..][..head_dim];
                     kernels::weighted_accumulate(o, vrow, aj);
                 }
             }
         };
         match parallel::chunk_rows(rows, work, parallel::threads()) {
             Some(chunk) => {
-                parallel::for_each_chunk_mut(&mut ctx[..rows * hidden], chunk * hidden, |ci, part| {
-                    let first = ci * chunk;
-                    for (i, row) in part.chunks_exact_mut(hidden).enumerate() {
-                        av_row(first + i, row);
-                    }
-                });
+                parallel::for_each_chunk_mut(
+                    &mut ctx[..rows * hidden],
+                    chunk * hidden,
+                    |ci, part| {
+                        let first = ci * chunk;
+                        for (i, row) in part.chunks_exact_mut(hidden).enumerate() {
+                            av_row(first + i, row);
+                        }
+                    },
+                );
             }
             None => {
                 for (row, part) in ctx[..rows * hidden].chunks_exact_mut(hidden).enumerate() {
@@ -801,8 +927,9 @@ impl GteModel {
         }
     }
 
-    fn pool(&self, h: &[f32], mask: &[f32], batch: usize, seq: usize) -> Vec<f32> {
+    fn pool(&self, h: &[f32], batch: usize, seq: usize, ws: &mut GteWorkspace) -> Vec<f32> {
         let hidden = self.spec.hidden;
+        let mask = &ws.attn_mask[..batch * seq];
         let mut out = vec![0.0f32; batch * hidden];
         for b in 0..batch {
             if self.spec.cls_pooling {
@@ -811,7 +938,9 @@ impl GteModel {
                     out[b * hidden..(b + 1) * hidden].copy_from_slice(src);
                 }
             } else {
-                let mut acc = vec![0.0f64; hidden];
+                let acc = &mut ws.pool_acc;
+                acc.resize(hidden, 0.0);
+                acc.fill(0.0);
                 let mut count = 0.0f64;
                 for s in 0..seq {
                     if mask[b * seq + s] > 0.0 {
@@ -843,24 +972,6 @@ impl GteModel {
     }
 }
 
-fn rope_cos_sin(seq: usize, inv_freq: &[f32], head_dim: usize) -> (Vec<f32>, Vec<f32>) {
-    let half = head_dim / 2;
-    let mut cos = vec![0.0f32; seq * head_dim];
-    let mut sin = vec![0.0f32; seq * head_dim];
-    for t in 0..seq {
-        for i in 0..half {
-            let angle = (t as f32) * inv_freq[i];
-            let c = angle.cos();
-            let s = angle.sin();
-            cos[t * head_dim + i] = c;
-            cos[t * head_dim + i + half] = c;
-            sin[t * head_dim + i] = s;
-            sin[t * head_dim + i + half] = s;
-        }
-    }
-    (cos, sin)
-}
-
 fn apply_rope_qkv(
     qkv: &mut [f32],
     batch: usize,
@@ -868,9 +979,9 @@ fn apply_rope_qkv(
     heads: usize,
     head_dim: usize,
     hidden: usize,
-    cos_sin: &(Vec<f32>, Vec<f32>),
+    cos: &[f32],
+    sin: &[f32],
 ) {
-    let (cos, sin) = cos_sin;
     let half = head_dim / 2;
     for b in 0..batch {
         for s in 0..seq {
@@ -903,4 +1014,41 @@ fn rotate_inplace(x: &mut [f32], cos: &[f32], sin: &[f32], half: usize) {
 
 fn gelu_erf_f32(x: f32) -> f32 {
     0.5 * x * (1.0 + libm::erff(x / std::f32::consts::SQRT_2))
+}
+
+#[cfg(test)]
+mod rope_cache_tests {
+    use super::*;
+
+    #[test]
+    fn the_rope_cache_grows_without_recomputing_or_changing_the_prefix() {
+        let inv_freq = vec![0.5f32, 0.25, 0.125, 0.0625];
+        let head_dim = 8;
+        let (mut cos, mut sin, mut cached) = (Vec::new(), Vec::new(), 0usize);
+
+        let (c8, s8) = ensure_rope(&mut cos, &mut sin, &mut cached, 8, &inv_freq, head_dim);
+        assert_eq!(cached, 8);
+        let first = c8.to_vec();
+        assert_eq!(
+            c8[0],
+            (0.0f32 * inv_freq[0]).cos(),
+            "position zero is cos(0)"
+        );
+        assert_eq!(c8[1], c8[5], "the cos halves are duplicated");
+        assert_eq!(s8[0], 0.0, "position zero is sin(0)");
+
+        // A later, longer sequence keeps the prefix BIT for bit and only
+        // fills the new positions.
+        let (c16, _) = ensure_rope(&mut cos, &mut sin, &mut cached, 16, &inv_freq, head_dim);
+        assert_eq!(cached, 16);
+        assert_eq!(&c16[..8 * head_dim], &first, "the prefix was not recomputed");
+        assert_eq!(c16[8 * head_dim], (8.0f32 * inv_freq[0]).cos());
+        let c16_copy = c16.to_vec();
+
+        // A shorter sequence reads a prefix of the same table.
+        let (c4, _) = ensure_rope(&mut cos, &mut sin, &mut cached, 4, &inv_freq, head_dim);
+        assert_eq!(cached, 16, "shrinking does not rebuild the table");
+        assert_eq!(c4.len(), 4 * head_dim);
+        assert_eq!(c4, &c16_copy[..4 * head_dim]);
+    }
 }

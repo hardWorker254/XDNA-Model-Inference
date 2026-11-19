@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The speech endpoint's engine.
 ///
@@ -15,6 +15,71 @@ use std::time::Duration;
 /// lock. A pool larger than one allows independent requests to decode in
 /// parallel at the cost of loading the decoder weights/state multiple times.
 ///
+/// The sequence length one embedded batch actually needs.
+///
+/// Tokenisation pads every text to the model's design window. The trailing
+/// all-padding columns carry no information, and with the host/Vulkan softmax
+/// the score width follows the sequence: dropping them is the same answer
+/// with a much smaller attention matrix. The server passes no array attention
+/// or array softmax, so there is no design-fixed width to respect here.
+fn batch_seq(design_seq: usize, lengths: &[usize]) -> usize {
+    lengths
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1)
+        .min(design_seq)
+}
+
+/// Repack one batch's padded rows into `eff_seq` columns.
+fn pack_batch(
+    ids: &[u32],
+    mask: &[u32],
+    design_seq: usize,
+    begin: usize,
+    batch: usize,
+    eff_seq: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut out_ids = Vec::with_capacity(batch * eff_seq);
+    let mut out_mask = Vec::with_capacity(batch * eff_seq);
+    for i in 0..batch {
+        let base = (begin + i) * design_seq;
+        out_ids.extend_from_slice(&ids[base..base + eff_seq]);
+        out_mask.extend_from_slice(&mask[base..base + eff_seq]);
+    }
+    (out_ids, out_mask)
+}
+
+#[cfg(test)]
+mod seq_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_batch_drops_only_padding() {
+        assert_eq!(batch_seq(512, &[3, 5, 2]), 5);
+        assert_eq!(batch_seq(512, &[]), 1);
+        assert_eq!(batch_seq(4, &[9, 1]), 4);
+    }
+
+    #[test]
+    fn packing_keeps_each_texts_original_positions() {
+        // Three rows padded to seq 8, only the first three tokens real.
+        let ids: Vec<u32> = (0..24).collect();
+        let mask: Vec<u32> = (0..24).map(|i| u32::from(i % 8 < 3)).collect();
+        let (packed_ids, packed_mask) = pack_batch(&ids, &mask, 8, 1, 2, 4);
+        assert_eq!(packed_ids, vec![8, 9, 10, 11, 16, 17, 18, 19]);
+        assert_eq!(packed_mask, vec![1, 1, 1, 0, 1, 1, 1, 0]);
+    }
+}
+
+/// How many decoders the plain `open` builds.
+///
+/// Two is enough to overlap two transcriptions while keeping the decoder's
+/// KV-cache memory reasonable; a caller that knows its concurrency can ask
+/// for more with [`Transcriber::open_with_pool`].
+pub const DEFAULT_DECODER_POOL: usize = 2;
+
 /// The work is the CPU backend's and the numbers are the reference's numbers: the
 /// same container through the same arithmetic gives the same bytes.
 pub struct Transcriber {
@@ -36,7 +101,7 @@ impl Transcriber {
         path: &std::path::Path,
         options: npum_cpu::whisper_session::Options,
     ) -> std::result::Result<Self, String> {
-        Self::open_with_pool(path, options, 1)
+        Self::open_with_pool(path, options, DEFAULT_DECODER_POOL)
     }
 
     /// Build an engine from a container with a pool of decoder instances.
@@ -449,9 +514,40 @@ pub struct Embedder {
     /// Two slots let two requests run concurrently; a third allocates a
     /// local scratch instead of waiting.
     bert_scratch: Arc<Vec<std::sync::Mutex<BertSlot>>>,
+    /// GTE's scratch, shared across the engine's clones. GTE's forward used
+    /// to allocate seven buffers and both RoPE tables per request; one lock
+    /// here keeps a single set for the whole server.
+    gte_workspace: Arc<std::sync::Mutex<npum_cpu::GteWorkspace>>,
+    /// Requests that arrived while another caller is gathering a batch.
+    ///
+    /// `Arc` so every clone of the engine (every `ServerState`) feeds the
+    /// SAME queue: without that, ten concurrent requests would still run ten
+    /// forwards of batch one.
+    pending: Arc<Mutex<Vec<PendingEmbed>>>,
+    pending_cv: Arc<Condvar>,
 }
 
 type BertSlot = (npum_cpu::bert::BertWorkspace, Vec<f32>);
+
+/// The result one `/v1/embeddings` caller waits for.
+type EmbedResult = std::result::Result<(Vec<Vec<f32>>, usize), String>;
+
+/// One request waiting to be coalesced into a shared forward pass.
+struct PendingEmbed {
+    texts: Vec<String>,
+    reply: std::sync::mpsc::Sender<EmbedResult>,
+}
+
+/// How long the first arrival waits for company.
+///
+/// Long enough to gather the requests a burst of small clients sends in the
+/// same few milliseconds, short enough that a lone request is not delayed
+/// noticeably. The forward pass is what costs time here, not the wait.
+const COALESCE_WINDOW: Duration = Duration::from_millis(10);
+
+/// Stop gathering once this many texts are queued: a bigger forward pass
+/// would spend more time in one batch than it saves in dispatch overhead.
+const COALESCE_MAX_TEXTS: usize = 64;
 
 impl Embedder {
     /// Build an engine from a container (host arithmetic).
@@ -515,6 +611,9 @@ impl Embedder {
                     })
                     .collect(),
             ),
+            gte_workspace: Arc::new(std::sync::Mutex::new(npum_cpu::GteWorkspace::default())),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            pending_cv: Arc::new(Condvar::new()),
         })
     }
 
@@ -556,12 +655,14 @@ impl Embedder {
         }
     }
 
-    /// Embed the texts.
-    ///
-    /// The vectors and the token count, which the usage block reports.
-    pub fn embed(&self, texts: &[String]) -> std::result::Result<(Vec<Vec<f32>>, usize), String> {
+    /// Embed one coalesced batch. The vectors and the token count of EACH
+    /// input text, so the leader can hand every caller its own usage number.
+    fn embed_impl(
+        &self,
+        texts: &[String],
+    ) -> std::result::Result<(Vec<Vec<f32>>, Vec<usize>), String> {
         if texts.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // Tokenise and pad every text up front so the model can be run in
@@ -570,13 +671,16 @@ impl Embedder {
         // batches and requests; the CPU ops instance is per request.
         let mut all_ids = Vec::with_capacity(texts.len() * self.seq);
         let mut all_mask = Vec::with_capacity(texts.len() * self.seq);
-        let mut tokens = 0usize;
+        let mut lengths = Vec::with_capacity(texts.len());
+        let mut per_text = Vec::with_capacity(texts.len());
         for text in texts {
             let (encoding, _) = self
                 .tokenizer
                 .encode_padded(text, self.seq)
                 .map_err(|e| e.to_string())?;
-            tokens += encoding.mask.iter().filter(|m| **m > 0).count();
+            let real = encoding.mask.iter().filter(|m| **m > 0).count();
+            per_text.push(real);
+            lengths.push(real);
             all_ids.extend_from_slice(&encoding.ids);
             all_mask.extend_from_slice(&encoding.mask);
         }
@@ -615,41 +719,60 @@ impl Embedder {
             }
             while offset < texts.len() {
                 let batch = (texts.len() - offset).min(BATCH);
-                let start = offset * self.seq;
-                let end = (offset + batch) * self.seq;
-                let ids = &all_ids[start..end];
-                let mask = &all_mask[start..end];
+                let eff_seq = batch_seq(self.seq, &lengths[offset..offset + batch]);
+                let (ids, mask) = pack_batch(&all_ids, &all_mask, self.seq, offset, batch, eff_seq);
                 let mut guard = shared.lock().expect("the Vulkan device mutex was poisoned");
                 let ops = guard
                     .as_mut()
                     .expect("the Vulkan device was opened above and is never removed");
                 self.with_bert_slot(|(workspace, flat)| {
-                    match &self.model {
+                    let gte = match &self.model {
                         EmbedModel::Bert(model) => {
                             model
                                 .embed_into(
-                                    ids, mask, batch, self.seq, ops, None, None, workspace, flat,
+                                    &ids, &mask, batch, eff_seq, ops, None, None, workspace, flat,
                                 )
                                 .map_err(|e| e.to_string())?;
+                            None
                         }
                         EmbedModel::Gte(model) => {
                             let mut timings = npum_cpu::gte::Timings::default();
-                            model
-                                .embed_timed_with(
-                                    ops,
-                                    &mut timings,
-                                    ids,
-                                    mask,
-                                    batch,
-                                    self.seq,
-                                    None,
-                                    None,
-                                )
-                                .map_err(|e| e.to_string())?;
+                            let mut scratch = self
+                                .gte_workspace
+                                .lock()
+                                .expect("the GTE workspace mutex was poisoned");
+                            // GTE returns the pooled vectors. It never writes
+                            // `flat`, which is BERT's output slot.
+                            Some(
+                                model
+                                    .embed_timed_with_workspace(
+                                        ops,
+                                        &mut timings,
+                                        &ids,
+                                        &mask,
+                                        batch,
+                                        eff_seq,
+                                        None,
+                                        None,
+                                        &mut scratch,
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                            )
                         }
-                    }
-                    for i in 0..batch {
-                        vectors.push(flat[i * hidden..(i + 1) * hidden].to_vec());
+                    };
+                    match gte {
+                        Some(out) => {
+                            // GTE pools into one flat buffer, like BERT's
+                            // `flat`; split it into one vector per input.
+                            for row in out.chunks(hidden) {
+                                vectors.push(row.to_vec());
+                            }
+                        }
+                        None => {
+                            for i in 0..batch {
+                                vectors.push(flat[i * hidden..(i + 1) * hidden].to_vec());
+                            }
+                        }
                     }
                     Ok::<(), String>(())
                 })?;
@@ -659,35 +782,55 @@ impl Embedder {
             let mut ops = npum_cpu::ops::CpuOps::best();
             while offset < texts.len() {
                 let batch = (texts.len() - offset).min(BATCH);
-                let start = offset * self.seq;
-                let end = (offset + batch) * self.seq;
-                let ids = &all_ids[start..end];
-                let mask = &all_mask[start..end];
+                let eff_seq = batch_seq(self.seq, &lengths[offset..offset + batch]);
+                let (ids, mask) = pack_batch(&all_ids, &all_mask, self.seq, offset, batch, eff_seq);
                 self.with_bert_slot(|(workspace, flat)| {
-                    match &self.model {
-                        EmbedModel::Bert(model) => model
-                            .embed_into(
-                                ids, mask, batch, self.seq, &mut ops, None, None, workspace, flat,
-                            )
-                            .map_err(|e| e.to_string())?,
-                        EmbedModel::Gte(model) => {
-                            let mut timings = npum_cpu::gte::Timings::default();
+                    let gte = match &self.model {
+                        EmbedModel::Bert(model) => {
                             model
-                                .embed_timed_with(
-                                    &mut ops,
-                                    &mut timings,
-                                    ids,
-                                    mask,
-                                    batch,
-                                    self.seq,
-                                    None,
-                                    None,
+                                .embed_into(
+                                    &ids, &mask, batch, eff_seq, &mut ops, None, None, workspace,
+                                    flat,
                                 )
                                 .map_err(|e| e.to_string())?;
+                            None
                         }
-                    }
-                    for i in 0..batch {
-                        vectors.push(flat[i * hidden..(i + 1) * hidden].to_vec());
+                        EmbedModel::Gte(model) => {
+                            let mut timings = npum_cpu::gte::Timings::default();
+                            let mut scratch = self
+                                .gte_workspace
+                                .lock()
+                                .expect("the GTE workspace mutex was poisoned");
+                            Some(
+                                model
+                                    .embed_timed_with_workspace(
+                                        &mut ops,
+                                        &mut timings,
+                                        &ids,
+                                        &mask,
+                                        batch,
+                                        eff_seq,
+                                        None,
+                                        None,
+                                        &mut scratch,
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                            )
+                        }
+                    };
+                    match gte {
+                        Some(out) => {
+                            // GTE pools into one flat buffer, like BERT's
+                            // `flat`; split it into one vector per input.
+                            for row in out.chunks(hidden) {
+                                vectors.push(row.to_vec());
+                            }
+                        }
+                        None => {
+                            for i in 0..batch {
+                                vectors.push(flat[i * hidden..(i + 1) * hidden].to_vec());
+                            }
+                        }
                     }
                     Ok::<(), String>(())
                 })?;
@@ -695,6 +838,96 @@ impl Embedder {
             }
         }
 
-        Ok((vectors, tokens))
+        Ok((vectors, per_text))
+    }
+
+    /// Embed the texts, coalescing concurrent small requests into one forward.
+    ///
+    /// The first arrival becomes the leader: it gathers whatever arrives in
+    /// `COALESCE_WINDOW` (or until the batch is full), runs ONE forward for
+    /// all of it, and hands each caller back only its own vectors and token
+    /// count. The alternative -- every request running its own batch of one
+    /// -- wastes the NPU's batch width on a hundred small HTTP calls.
+    pub fn embed(&self, texts: &[String]) -> EmbedResult {
+        if texts.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (reply, receiver) = std::sync::mpsc::channel();
+        let leader = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let was_empty = pending.is_empty();
+            pending.push(PendingEmbed {
+                texts: texts.to_vec(),
+                reply,
+            });
+            was_empty
+        };
+        self.pending_cv.notify_one();
+        if !leader {
+            return receiver.recv().unwrap_or_else(|error| {
+                Err(format!(
+                    "the embedding batcher stopped before answering: {error}"
+                ))
+            });
+        }
+
+        // Gather. A `wait_timeout` that returns early because someone arrived
+        // re-checks the count; one that times out ends the wait with what we
+        // have. Both paths leave with the queue drained by this thread alone.
+        let started = Instant::now();
+        let batch = loop {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let queued: usize = pending.iter().map(|request| request.texts.len()).sum();
+            if queued >= COALESCE_MAX_TEXTS || started.elapsed() >= COALESCE_WINDOW {
+                break std::mem::take(&mut *pending);
+            }
+            let remaining = COALESCE_WINDOW.saturating_sub(started.elapsed());
+            let (guard, _) = self
+                .pending_cv
+                .wait_timeout(pending, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(guard);
+        };
+
+        let mut all_texts = Vec::new();
+        let mut owners = Vec::with_capacity(batch.len());
+        for request in batch {
+            all_texts.extend(request.texts.iter().cloned());
+            owners.push((request.texts.len(), request.reply));
+        }
+
+        // A panic in the forward pass must not leave the other callers blocked
+        // forever on a channel whose sender was dropped without a value.
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.embed_impl(&all_texts)))
+                .unwrap_or_else(|_| Err("the embedding forward pass panicked".to_string()));
+
+        match outcome {
+            Ok((vectors, per_text)) => {
+                let mut at = 0usize;
+                for (count, reply) in owners {
+                    let mine = vectors[at..at + count].to_vec();
+                    let tokens = per_text[at..at + count].iter().sum();
+                    at += count;
+                    let _ = reply.send(Ok((mine, tokens)));
+                }
+            }
+            Err(reason) => {
+                for (_, reply) in owners {
+                    let _ = reply.send(Err(reason.clone()));
+                }
+            }
+        }
+        receiver.recv().unwrap_or_else(|error| {
+            Err(format!(
+                "the embedding batcher stopped before answering: {error}"
+            ))
+        })
     }
 }
