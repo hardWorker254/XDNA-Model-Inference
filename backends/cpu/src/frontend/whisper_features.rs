@@ -50,6 +50,7 @@
 //! and the right side is the mirror of the left with the direction
 //! FLIPPED and starting AFTER the data.
 
+use crate::parallel;
 use std::path::Path;
 
 /// Whisper's own numbers. 30 s at 16 kHz is 480000 samples; / 160 is
@@ -279,112 +280,177 @@ fn reflect_pad(x: &[f64], pad: usize) -> Vec<f64> {
     out
 }
 
-/// The `(n_bins, frames)` power spectrum, channels-first.
-fn power_30s(padded: &[f64], num_frames: usize, window: &[f64]) -> Vec<f32> {
-    let n_bins = NFFT / 2 + 1;
-    let mut power = vec![0.0f32; n_bins * MEL_FRAMES];
-    // The windowed frame goes through FLOAT32 before the transform, and
-    // that rounding is part of the contract: the reference keeps the frames in
-    // a float32 matrix (it is the GEMM's A operand) and reads them back
-    // as float64 for the transform. A frame that stays in double all the
-    // way through is a different frame, and the log10 downstream turns a
-    // relative difference of 6e-08 into an absolute one of 3.6e-06.
-    let mut frame = vec![0.0f64; NFFT];
-    let mut windowed = vec![0.0f32; NFFT];
-    for t in 0..num_frames {
-        let src = &padded[t * HOP_LENGTH..t * HOP_LENGTH + NFFT];
-        for i in 0..NFFT {
-            windowed[i] = (src[i] * window[i]) as f32;
-        }
-        if t == num_frames - 1 {
-            continue; // the frame Whisper drops
-        }
-        for i in 0..NFFT {
-            frame[i] = windowed[i] as f64;
-        }
-        let spec = power_spectrum(&frame);
-        for (k, v) in spec.iter().enumerate() {
-            power[k * MEL_FRAMES + t] = *v as f32;
-        }
-    }
-    power
+type Complex = (f64, f64);
+
+/// The twiddles of one decimation level, computed ONCE for all 3000 frames.
+struct FftStage {
+    p: usize,
+    m: usize,
+    /// `exp(theta * q*k)`, indexed `q*m + k`.
+    tw1: Vec<Complex>,
+    /// `exp(theta * q*m*t)`, indexed `q*p + t`.
+    tw2: Vec<Complex>,
 }
 
-/// The power spectrum of one frame: `|X|^2` for the first 201 bins.
-fn power_spectrum(frame: &[f64]) -> Vec<f64> {
-    let n = frame.len();
-    let mut buf: Vec<(f64, f64)> = frame.iter().map(|v| (*v, 0.0)).collect();
-    fft_rec(&mut buf);
-    (0..n / 2 + 1)
-        .map(|i| {
-            let (re, im) = buf[i];
-            re * re + im * im
-        })
-        .collect()
-}
-
-/// A mixed-radix Cooley-Tukey over the factors 2 and 5.
+/// Every level of a 400-point transform, indexed by the level's length.
 ///
-/// Recursive rather than iterative because the permutation falls out of
-/// the decimation and a 400-point transform is small enough that the
-/// recursion is not the bottleneck; the arithmetic is.
-fn fft_rec(a: &mut [(f64, f64)]) {
+/// The old recursion recomputed `cos`/`sin` for every `(q, k)` on every
+/// frame -- 3000 times the same handful of numbers -- and allocated a
+/// `Vec<Vec<..>>` at each of its 111 nodes per frame. Both are hoisted here.
+struct FftTwiddles {
+    stages: Vec<Option<FftStage>>,
+}
+
+impl FftTwiddles {
+    fn new(n: usize) -> Self {
+        let mut stages: Vec<Option<FftStage>> = (0..=n).map(|_| None).collect();
+        let mut cur = n;
+        while cur > 1 {
+            // The SMALLEST prime factor: 2 if even, else 5.
+            let p = if cur % 2 == 0 { 2 } else { 5 };
+            assert_eq!(
+                cur % p,
+                0,
+                "whisper features: FFT length {cur} is not 2^a*5^b"
+            );
+            let m = cur / p;
+            let theta = -2.0 * std::f64::consts::PI / cur as f64;
+            let mut tw1 = Vec::with_capacity(p * m);
+            for q in 0..p {
+                for k in 0..m {
+                    let ph = theta * (q * k) as f64;
+                    tw1.push((ph.cos(), ph.sin()));
+                }
+            }
+            let mut tw2 = Vec::with_capacity(p * p);
+            for q in 0..p {
+                for t in 0..p {
+                    let ph = theta * (q * m * t) as f64;
+                    tw2.push((ph.cos(), ph.sin()));
+                }
+            }
+            stages[cur] = Some(FftStage { p, m, tw1, tw2 });
+            cur = m;
+        }
+        Self { stages }
+    }
+}
+
+/// One 400-point mixed-radix transform, into `a`.
+///
+/// `scratch` holds `2 * a.len()` complex values: the first half is the
+/// decimated `sub[q][k]` arena, the second half is the children's arena.
+/// The arithmetic and its order are exactly the old recursive version's --
+/// the twiddle is applied to `sub[q][k]` first, then combined with
+/// `exp(theta*q*m*t)` -- so the spectrum's bytes are unchanged.
+fn fft_into(a: &mut [Complex], scratch: &mut [Complex], tw: &FftTwiddles) {
     let n = a.len();
     if n <= 1 {
         return;
     }
-    // The radix is the SMALLEST prime factor, so: 2 if even, else 5.
-    // Growing p multiplicatively instead (2, 5, 10, 20, ...) walks off
-    // the end of size_t on a size this does not factor, and the division
-    // by zero that follows is a SIGFPE with no message.
-    let p = if n % 2 == 0 { 2 } else { 5 };
-    if n % p != 0 {
-        panic!("whisper features: FFT length {n} is not 2^a*5^b");
-    }
-    let m = n / p;
+    assert!(
+        scratch.len() >= 2 * n,
+        "the FFT scratch must hold two arenas of the transform's length"
+    );
+    let stage = tw.stages[n]
+        .as_ref()
+        .unwrap_or_else(|| panic!("whisper features: no twiddles for FFT length {n}"));
+    let (p, m) = (stage.p, stage.m);
+    let (sub, children) = scratch.split_at_mut(n);
 
-    let mut sub: Vec<Vec<(f64, f64)>> = Vec::with_capacity(p);
-    for q in 0..p {
-        let mut s = vec![(0.0, 0.0); m];
-        for k in 0..m {
-            s[k] = a[k * p + q];
-        }
-        fft_rec(&mut s);
-        sub.push(s);
-    }
-    // X[k + m*t] = sum_q A_q[k] * exp(-2*pi*i*q*(k + m*t)/n), and the
-    // exponent splits: exp(-2*pi*i*qk/n) * exp(-2*pi*i*qmt/n). The
-    // first factor is the usual per-level twiddle, the second depends
-    // only on (q, t) and is hoisted.
-    let theta = -2.0 * std::f64::consts::PI / n as f64;
     for q in 0..p {
         for k in 0..m {
-            let ph = theta * (q * k) as f64;
-            let (c, s) = (ph.cos(), ph.sin());
-            let (re, im) = sub[q][k];
-            sub[q][k] = (re * c - im * s, re * s + im * c);
+            sub[q * m + k] = a[k * p + q];
         }
     }
-    let mut v = vec![vec![(0.0f64, 0.0f64); p]; p];
     for q in 0..p {
-        for t in 0..p {
-            let ph = theta * (q * m * t) as f64;
-            v[q][t] = (ph.cos(), ph.sin());
-        }
+        let child = &mut sub[q * m..(q + 1) * m];
+        fft_into(child, &mut children[..2 * m], tw);
     }
-    let mut out = vec![(0.0, 0.0); n];
     for k in 0..m {
         for t in 0..p {
             let mut acc = (0.0f64, 0.0f64);
             for q in 0..p {
-                let (ar, ai) = sub[q][k];
-                let (vr, vi) = v[q][t];
-                acc = (acc.0 + ar * vr - ai * vi, acc.1 + ar * vi + ai * vr);
+                let (re, im) = sub[q * m + k];
+                let (c, s) = stage.tw1[q * m + k];
+                let (wr, wi) = (re * c - im * s, re * s + im * c);
+                let (vr, vi) = stage.tw2[q * p + t];
+                acc = (acc.0 + wr * vr - wi * vi, acc.1 + wr * vi + wi * vr);
             }
-            out[k + m * t] = acc;
+            a[k + m * t] = acc;
         }
     }
-    a.copy_from_slice(&out);
+}
+
+/// The `(n_bins, frames)` power spectrum, channels-first.
+fn power_30s(padded: &[f64], num_frames: usize, window: &[f64]) -> Vec<f32> {
+    let n_bins = NFFT / 2 + 1;
+    // The LAST frame is windowed and then dropped by Whisper: 3001 windows,
+    // 3000 transforms.
+    let frames = num_frames - 1;
+    let mut rows = vec![0.0f32; frames * n_bins];
+    let tw = FftTwiddles::new(NFFT);
+
+    let spectrum = |t: usize,
+                    out: &mut [f32],
+                    buf: &mut [Complex],
+                    scratch: &mut [Complex],
+                    frame: &mut [f64],
+                    windowed: &mut [f32]| {
+        let src = &padded[t * HOP_LENGTH..t * HOP_LENGTH + NFFT];
+        for i in 0..NFFT {
+            // The windowed frame goes through FLOAT32 before the transform,
+            // and that rounding is part of the contract: the reference keeps
+            // the frames in a float32 matrix (the GEMM's A operand) and reads
+            // them back as float64 for the transform.
+            windowed[i] = (src[i] * window[i]) as f32;
+            frame[i] = windowed[i] as f64;
+            buf[i] = (frame[i], 0.0);
+        }
+        fft_into(buf, scratch, &tw);
+        for (k, slot) in out.iter_mut().enumerate() {
+            let (re, im) = buf[k];
+            *slot = (re * re + im * im) as f32;
+        }
+    };
+
+    let work = (frames as i64) * (NFFT as i64) * 24;
+    match parallel::chunk_rows(frames, work, parallel::threads()) {
+        Some(chunk) => {
+            parallel::for_each_chunk_mut(&mut rows, chunk * n_bins, |ci, part| {
+                let first = ci * chunk;
+                // One scratch set PER WORKER, not per frame: the recursive
+                // transforms use no heap at all now.
+                let mut frame = vec![0.0f64; NFFT];
+                let mut windowed = vec![0.0f32; NFFT];
+                let mut buf = vec![(0.0, 0.0); NFFT];
+                let mut scratch = vec![(0.0, 0.0); 2 * NFFT];
+                for (r, out) in part.chunks_exact_mut(n_bins).enumerate() {
+                    spectrum(first + r, out, &mut buf, &mut scratch, &mut frame, &mut windowed);
+                }
+            });
+        }
+        None => {
+            let mut frame = vec![0.0f64; NFFT];
+            let mut windowed = vec![0.0f32; NFFT];
+            let mut buf = vec![(0.0, 0.0); NFFT];
+            let mut scratch = vec![(0.0, 0.0); 2 * NFFT];
+            for (t, out) in rows.chunks_exact_mut(n_bins).enumerate() {
+                spectrum(t, out, &mut buf, &mut scratch, &mut frame, &mut windowed);
+            }
+        }
+    }
+
+    // Transpose the row-major spectrum into the channels-first layout the mel
+    // projection expects. A linear pass over 600k floats, negligible next to
+    // 3000 transforms, and it lets the transforms split cleanly over frames.
+    let mut power = vec![0.0f32; n_bins * frames];
+    for t in 0..frames {
+        for k in 0..n_bins {
+            power[k * frames + t] = rows[t * n_bins + k];
+        }
+    }
+    power
 }
 
 /// The Slaney mel filter bank, `(201, n_mels)` row-major.
@@ -502,6 +568,233 @@ fn mel_floor_scale(mel: &mut [f32]) {
 /// The weights are the container's, in Conv1d order: `w1` is
 /// `[d, n_mels, 3]`, `w2` is `[d, d, 3]`. The result is `(1500, d)`
 /// row-major, which is the M x K the encoder's first GEMM wants.
+/// Repack `[cout, cin, k]` weights as `[cin, k, cout_padded]`.
+///
+/// Only the addresses change. The eight weights of one `(c, k)` tap for
+/// eight consecutive OUTPUT channels become contiguous, so one AVX2 load
+/// feeds one eight-lane FMA. Each lane still accumulates its own channel's
+/// taps in the original `(c, k)` order, so the bytes are unchanged.
+fn repack_conv_w(w: &[f32], cin: usize, cout: usize, k: usize) -> Vec<f32> {
+    let padded = cout.next_multiple_of(8);
+    let mut out = vec![0.0f32; cin * k * padded];
+    for o in 0..cout {
+        for c in 0..cin {
+            for tap in 0..k {
+                out[(c * k + tap) * padded + o] = w[(o * cin + c) * k + tap];
+            }
+        }
+    }
+    out
+}
+
+/// conv1's output channels `o0..o1`, into `part` (`(o1-o0)` rows of `t`).
+fn conv1_channels(
+    mel: &MelSpec,
+    w1p: &[f32],
+    b1: &[f32],
+    padded: usize,
+    cin: usize,
+    o0: usize,
+    o1: usize,
+    t: usize,
+    part: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::kernels::has_avx2_fma() {
+        // SAFETY: the host has the features; the helper only touches
+        // `o0..o1` channels and `..t` frames of `part`.
+        unsafe { conv1_channels_avx2(mel, w1p, b1, padded, cin, o0, o1, t, part) };
+        return;
+    }
+    conv1_channels_scalar(mel, w1p, b1, padded, cin, o0, o1, t, part);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv1_channels_avx2(
+    mel: &MelSpec,
+    w1p: &[f32],
+    b1: &[f32],
+    padded: usize,
+    cin: usize,
+    o0: usize,
+    o1: usize,
+    t: usize,
+    part: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let base = o0;
+    let mut o = o0;
+    // SAFETY: every load is inside b1/w1p/mel and every store inside this
+    // worker's slice of h1.
+    unsafe {
+        while o + 8 <= o1 {
+            let bias = _mm256_loadu_ps(b1.as_ptr().add(o));
+            for frame in 0..t {
+                let mut acc = bias;
+                for c in 0..cin {
+                    for tap in 0..3 {
+                        let ti = frame as isize + tap as isize - 1;
+                        if ti < 0 || ti >= t as isize {
+                            continue;
+                        }
+                        let wv = _mm256_loadu_ps(w1p.as_ptr().add((c * 3 + tap) * padded + o));
+                        let xv = _mm256_set1_ps(mel.at(c, ti as usize));
+                        acc = _mm256_fmadd_ps(wv, xv, acc);
+                    }
+                }
+                let mut lanes = [0.0f32; 8];
+                _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+                for l in 0..8 {
+                    part[(o + l - o0) * t + frame] = gelu_erf_exact(lanes[l]);
+                }
+            }
+            o += 8;
+        }
+    }
+    // The tail helper indexes from ITS slice's first channel, which is `o`
+    // here, so hand it only the rows it owns.
+    let tail = &mut part[(o - base) * t..];
+    conv1_channels_scalar(mel, w1p, b1, padded, cin, o, o1, t, tail);
+}
+
+fn conv1_channels_scalar(
+    mel: &MelSpec,
+    w1p: &[f32],
+    b1: &[f32],
+    padded: usize,
+    cin: usize,
+    o0: usize,
+    o1: usize,
+    t: usize,
+    part: &mut [f32],
+) {
+    for o in o0..o1 {
+        let dst = &mut part[(o - o0) * t..][..t];
+        for (frame, slot) in dst.iter_mut().enumerate() {
+            // One FMA per tap, in `(c, k)` order: the oracle is built with
+            // `-march=x86-64-v3` and contracts `acc += w * x`, so a plain
+            // multiply and add would round twice where it rounds once.
+            let mut acc = b1[o];
+            for c in 0..cin {
+                for tap in 0..3 {
+                    let ti = frame as isize + tap as isize - 1;
+                    if ti < 0 || ti >= t as isize {
+                        continue;
+                    }
+                    acc = w1p[(c * 3 + tap) * padded + o].mul_add(mel.at(c, ti as usize), acc);
+                }
+            }
+            *slot = gelu_erf_exact(acc);
+        }
+    }
+}
+
+/// conv2's output channels `o0..o1`, into `part` (`(o1-o0)` rows of `t2`).
+fn conv2_channels(
+    h1: &[f32],
+    w2p: &[f32],
+    b2: &[f32],
+    padded: usize,
+    cin: usize,
+    o0: usize,
+    o1: usize,
+    t: usize,
+    t2: usize,
+    part: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::kernels::has_avx2_fma() {
+        // SAFETY: the host has the features; the helper only touches
+        // `o0..o1` channels and `..t2` frames of `part`.
+        unsafe { conv2_channels_avx2(h1, w2p, b2, padded, cin, o0, o1, t, t2, part) };
+        return;
+    }
+    conv2_channels_scalar(h1, w2p, b2, padded, cin, o0, o1, t, t2, part);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv2_channels_avx2(
+    h1: &[f32],
+    w2p: &[f32],
+    b2: &[f32],
+    padded: usize,
+    cin: usize,
+    o0: usize,
+    o1: usize,
+    t: usize,
+    t2: usize,
+    part: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let base = o0;
+    let mut o = o0;
+    // SAFETY: every load is inside h1/w2p/b2 and every store inside this
+    // worker's slice of h2.
+    unsafe {
+        while o + 8 <= o1 {
+            let bias = _mm256_loadu_ps(b2.as_ptr().add(o));
+            for frame in 0..t2 {
+                let mut acc = bias;
+                for c in 0..cin {
+                    for tap in 0..3 {
+                        let ti = (frame * 2) as isize + tap as isize - 1;
+                        if ti < 0 || ti >= t as isize {
+                            continue;
+                        }
+                        let wv = _mm256_loadu_ps(w2p.as_ptr().add((c * 3 + tap) * padded + o));
+                        let xv = _mm256_set1_ps(h1[c * t + ti as usize]);
+                        acc = _mm256_fmadd_ps(wv, xv, acc);
+                    }
+                }
+                let mut lanes = [0.0f32; 8];
+                _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+                for l in 0..8 {
+                    part[(o + l - o0) * t2 + frame] = gelu_erf_exact(lanes[l]);
+                }
+            }
+            o += 8;
+        }
+    }
+    // The tail helper indexes from ITS slice's first channel, which is `o`
+    // here, so hand it only the rows it owns.
+    let tail = &mut part[(o - base) * t2..];
+    conv2_channels_scalar(h1, w2p, b2, padded, cin, o, o1, t, t2, tail);
+}
+
+fn conv2_channels_scalar(
+    h1: &[f32],
+    w2p: &[f32],
+    b2: &[f32],
+    padded: usize,
+    cin: usize,
+    o0: usize,
+    o1: usize,
+    t: usize,
+    t2: usize,
+    part: &mut [f32],
+) {
+    for o in o0..o1 {
+        let dst = &mut part[(o - o0) * t2..][..t2];
+        for (frame, slot) in dst.iter_mut().enumerate() {
+            let mut acc = b2[o];
+            for c in 0..cin {
+                for tap in 0..3 {
+                    let ti = (frame * 2) as isize + tap as isize - 1;
+                    if ti < 0 || ti >= t as isize {
+                        continue;
+                    }
+                    acc = w2p[(c * 3 + tap) * padded + o].mul_add(h1[c * t + ti as usize], acc);
+                }
+            }
+            *slot = gelu_erf_exact(acc);
+        }
+    }
+}
+
 pub fn conv_front_end(
     mel: &MelSpec,
     w1: &[f32],
@@ -513,58 +806,55 @@ pub fn conv_front_end(
     let t = mel.frames;
     let m = mel.n_mels;
     let t2 = t / 2;
+    let padded = hidden.next_multiple_of(8);
+    let w1p = repack_conv_w(w1, m, hidden, 3);
+    let w2p = repack_conv_w(w2, hidden, hidden, 3);
 
     // conv1: (M, T) -> (hidden, T), kernel 3, padding 1, GELU.
+    // OVER OUTPUT CHANNELS: a channel's taps never touch another channel's
+    // accumulator, so the split crosses no reduction. The eight AVX2 lanes
+    // are eight OUTPUT channels, which keeps each channel's `(c, k)` order.
     let mut h1 = vec![0.0f32; hidden * t];
-    for o in 0..hidden {
-        let w = &w1[o * m * 3..(o + 1) * m * 3];
-        for frame in 0..t {
-            let mut acc = b1[o];
-            for c in 0..m {
-                let wc = &w[c * 3..c * 3 + 3];
-                for k in 0..3 {
-                    let ti = frame as isize + k as isize - 1; // padding 1
-                    if ti < 0 || ti >= t as isize {
-                        continue;
-                    }
-                    // An FMA, and not a multiply and an add: the oracle
-                    // is built with `-march=x86-64-v3` and its compiler
-                    // contracts `acc += w * x` into one rounding. The
-                    // product's rounding is the difference between the
-                    // two, and 240 of them add up.
-                    acc = wc[k].mul_add(mel.at(c, ti as usize), acc);
-                }
-            }
-            h1[o * t + frame] = gelu_erf_exact(acc);
+    let work1 = (hidden as i64) * (t as i64) * (m as i64) * 3;
+    match parallel::chunk_rows(hidden, work1, parallel::threads()) {
+        Some(chunk) => {
+            parallel::for_each_chunk_mut(&mut h1, chunk * t, |ci, part| {
+                let first = ci * chunk;
+                conv1_channels(mel, &w1p, b1, padded, m, first, first + part.len() / t, t, part);
+            });
         }
+        None => conv1_channels(mel, &w1p, b1, padded, m, 0, hidden, t, &mut h1),
     }
 
     // conv2: (hidden, T) -> (hidden, T/2), kernel 3, stride 2, padding 1,
-    // GELU.
+    // GELU. Same output-channel split; the reduction is over all `hidden`
+    // input channels.
     let mut h2 = vec![0.0f32; hidden * t2];
-    for o in 0..hidden {
-        let w = &w2[o * hidden * 3..(o + 1) * hidden * 3];
-        for frame in 0..t2 {
-            let centre = frame * 2;
-            let mut acc = b2[o];
-            for c in 0..hidden {
-                let wc = &w[c * 3..c * 3 + 3];
-                for k in 0..3 {
-                    let ti = centre as isize + k as isize - 1;
-                    if ti < 0 || ti >= t as isize {
-                        continue;
-                    }
-                    acc = wc[k].mul_add(h1[c * t + ti as usize], acc);
-                }
-            }
-            h2[o * t2 + frame] = gelu_erf_exact(acc);
+    let work2 = (hidden as i64) * (t2 as i64) * (hidden as i64) * 3;
+    match parallel::chunk_rows(hidden, work2, parallel::threads()) {
+        Some(chunk) => {
+            parallel::for_each_chunk_mut(&mut h2, chunk * t2, |ci, part| {
+                let first = ci * chunk;
+                conv2_channels(
+                    &h1,
+                    &w2p,
+                    b2,
+                    padded,
+                    hidden,
+                    first,
+                    first + part.len() / t2,
+                    t,
+                    t2,
+                    part,
+                );
+            });
         }
+        None => conv2_channels(&h1, &w2p, b2, padded, hidden, 0, hidden, t, t2, &mut h2),
     }
 
-    // permute to (T2, hidden): Conv1d is channels-first, the encoder's
-    // GEMM is rows-are-tokens. Doing it here means the encoder never
-    // sees a transposed operand and cannot get the stride wrong by
-    // accident.
+    // Permute to (T2, hidden): Conv1d is channels-first, the encoder's GEMM
+    // is rows-are-tokens. Doing it here means the encoder never sees a
+    // transposed operand.
     let mut out = vec![0.0f32; t2 * hidden];
     for o in 0..hidden {
         for frame in 0..t2 {
@@ -704,4 +994,166 @@ fn ln_gamma(x: f64) -> f64 {
         a += g / (x + i as f64);
     }
     0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noise(count: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..count)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 8) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    // The ORIGINAL recursive transform, kept as the oracle: a fresh
+    // Vec<Vec<..>> at every node and a cos/sin per (q, k) per frame.
+    fn fft_rec_ref(a: &mut [Complex]) {
+        let n = a.len();
+        if n <= 1 {
+            return;
+        }
+        let p = if n % 2 == 0 { 2 } else { 5 };
+        assert_eq!(n % p, 0);
+        let m = n / p;
+        let mut sub = Vec::with_capacity(p);
+        for q in 0..p {
+            let mut s = vec![(0.0, 0.0); m];
+            for k in 0..m {
+                s[k] = a[k * p + q];
+            }
+            fft_rec_ref(&mut s);
+            sub.push(s);
+        }
+        let theta = -2.0 * std::f64::consts::PI / n as f64;
+        for q in 0..p {
+            for k in 0..m {
+                let ph = theta * (q * k) as f64;
+                let (c, s) = (ph.cos(), ph.sin());
+                let (re, im) = sub[q][k];
+                sub[q][k] = (re * c - im * s, re * s + im * c);
+            }
+        }
+        let mut v = vec![vec![(0.0f64, 0.0f64); p]; p];
+        for q in 0..p {
+            for t in 0..p {
+                let ph = theta * (q * m * t) as f64;
+                v[q][t] = (ph.cos(), ph.sin());
+            }
+        }
+        let mut out = vec![(0.0, 0.0); n];
+        for k in 0..m {
+            for t in 0..p {
+                let mut acc = (0.0f64, 0.0f64);
+                for q in 0..p {
+                    let (ar, ai) = sub[q][k];
+                    let (vr, vi) = v[q][t];
+                    acc = (acc.0 + ar * vr - ai * vi, acc.1 + ar * vi + ai * vr);
+                }
+                out[k + m * t] = acc;
+            }
+        }
+        a.copy_from_slice(&out);
+    }
+
+    #[test]
+    fn the_allocation_free_fft_matches_the_recursive_oracle_bit_for_bit() {
+        let tw = FftTwiddles::new(NFFT);
+        let input: Vec<Complex> = noise(2 * NFFT, 0xfeed)
+            .chunks_exact(2)
+            .map(|c| (c[0] as f64, c[1] as f64))
+            .collect();
+        let mut want = input.clone();
+        fft_rec_ref(&mut want);
+        let mut got = input.clone();
+        let mut scratch = vec![(0.0, 0.0); 2 * NFFT];
+        fft_into(&mut got, &mut scratch, &tw);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                (g.0.to_bits(), g.1.to_bits()),
+                (w.0.to_bits(), w.1.to_bits()),
+                "FFT bin {i}"
+            );
+        }
+    }
+
+    // The ORIGINAL scalar convolutions, for the byte gate below.
+    fn conv_ref(mel: &MelSpec, w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32], hidden: usize) -> Vec<f32> {
+        let t = mel.frames;
+        let m = mel.n_mels;
+        let t2 = t / 2;
+        let mut h1 = vec![0.0f32; hidden * t];
+        for o in 0..hidden {
+            let w = &w1[o * m * 3..(o + 1) * m * 3];
+            for frame in 0..t {
+                let mut acc = b1[o];
+                for c in 0..m {
+                    for k in 0..3 {
+                        let ti = frame as isize + k as isize - 1;
+                        if ti < 0 || ti >= t as isize {
+                            continue;
+                        }
+                        acc = w[c * 3 + k].mul_add(mel.at(c, ti as usize), acc);
+                    }
+                }
+                h1[o * t + frame] = gelu_erf_exact(acc);
+            }
+        }
+        let mut h2 = vec![0.0f32; hidden * t2];
+        for o in 0..hidden {
+            let w = &w2[o * hidden * 3..(o + 1) * hidden * 3];
+            for frame in 0..t2 {
+                let mut acc = b2[o];
+                for c in 0..hidden {
+                    for k in 0..3 {
+                        let ti = (frame * 2) as isize + k as isize - 1;
+                        if ti < 0 || ti >= t as isize {
+                            continue;
+                        }
+                        acc = w[c * 3 + k].mul_add(h1[c * t + ti as usize], acc);
+                    }
+                }
+                h2[o * t2 + frame] = gelu_erf_exact(acc);
+            }
+        }
+        let mut out = vec![0.0f32; t2 * hidden];
+        for o in 0..hidden {
+            for frame in 0..t2 {
+                out[frame * hidden + o] = h2[o * t2 + frame];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_vectorised_conv_front_end_matches_the_scalar_oracle_bit_for_bit() {
+        for (hidden, m, t) in [(8usize, 4usize, 64usize), (12, 3, 40), (16, 5, 33)] {
+            let mel = MelSpec {
+                n_mels: m,
+                frames: t,
+                data: noise(m * t, 0x1234 + t as u64),
+            };
+            let w1 = noise(hidden * m * 3, 0xaaaa + hidden as u64);
+            let b1 = noise(hidden, 0xbbbb);
+            let w2 = noise(hidden * hidden * 3, 0xcccc);
+            let b2 = noise(hidden, 0xdddd);
+            let want = conv_ref(&mel, &w1, &b1, &w2, &b2, hidden);
+            let got = conv_front_end(&mel, &w1, &b1, &w2, &b2, hidden);
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "conv front end differs at hidden={hidden}, m={m}, t={t}"
+            );
+        }
+    }
 }
