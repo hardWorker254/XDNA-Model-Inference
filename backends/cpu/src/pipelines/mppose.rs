@@ -65,6 +65,7 @@
 //! division refuses the model's own first convolution.
 
 use crate::kernels;
+use crate::parallel;
 use crate::pose::Tensor;
 use npum_format::Container;
 use npum_model::array::{ArrayRef, ConvSpec};
@@ -1692,22 +1693,57 @@ fn im2col_into(
     let len = (m * k) as usize;
     a.resize(len, 0.0);
     a.fill(0.0);
-    for y in 0..oh {
-        for x in 0..ow {
-            let row = &mut a[((y * ow + x) * k) as usize..][..k as usize];
-            for i in 0..kh {
-                let sy = y * sh + i - pad[0];
-                if sy < 0 || sy >= h {
-                    continue;
-                }
-                for j in 0..kw {
-                    let sx = x * sw + j - pad[1];
-                    if sx < 0 || sx >= w {
-                        continue;
+    // OVER OUTPUT ROWS: one row's im2col reads the source and writes its own
+    // run of A. No row reads another's, so the split crosses no reduction.
+    let row_floats = (ow * k) as usize;
+    match parallel::chunk_rows(oh as usize, m * k, parallel::threads()) {
+        Some(rows_per) => {
+            parallel::for_each_chunk_mut(&mut a[..], rows_per * row_floats, |ci, chunk| {
+                let first = ci as i64 * rows_per as i64;
+                let rows = (chunk.len() / row_floats) as i64;
+                for y in first..first + rows {
+                    for x in 0..ow {
+                        let row = &mut chunk[(((y - first) * ow + x) * k) as usize..]
+                            [..k as usize];
+                        for i in 0..kh {
+                            let sy = y * sh + i - pad[0];
+                            if sy < 0 || sy >= h {
+                                continue;
+                            }
+                            for j in 0..kw {
+                                let sx = x * sw + j - pad[1];
+                                if sx < 0 || sx >= w {
+                                    continue;
+                                }
+                                for ch in 0..c {
+                                    row[((ch * kh + i) * kw + j) as usize] =
+                                        input.d[((ch * h + sy) * w + sx) as usize];
+                                }
+                            }
+                        }
                     }
-                    for ch in 0..c {
-                        row[((ch * kh + i) * kw + j) as usize] =
-                            input.d[((ch * h + sy) * w + sx) as usize];
+                }
+            });
+        }
+        None => {
+            for y in 0..oh {
+                for x in 0..ow {
+                    let row = &mut a[((y * ow + x) * k) as usize..][..k as usize];
+                    for i in 0..kh {
+                        let sy = y * sh + i - pad[0];
+                        if sy < 0 || sy >= h {
+                            continue;
+                        }
+                        for j in 0..kw {
+                            let sx = x * sw + j - pad[1];
+                            if sx < 0 || sx >= w {
+                                continue;
+                            }
+                            for ch in 0..c {
+                                row[((ch * kh + i) * kw + j) as usize] =
+                                    input.d[((ch * h + sy) * w + sx) as usize];
+                            }
+                        }
                     }
                 }
             }
@@ -2188,14 +2224,12 @@ impl MpPose {
         let (pt, pl) = (layer.pad[0], layer.pad[1]);
         let plane_in = (h * wd) as usize;
         let plane_out = (oh * ow) as usize;
-        for c in 0..input.c {
-            let src = &input.d[(c as usize) * plane_in..][..plane_in];
+        let run_channel = |c: i64, src: &[f32], dst: &mut [f32]| {
             let filt = &w.w[(c * w.kh * w.kw) as usize..][..(w.kh * w.kw) as usize];
             let b = w.b.get(c as usize).copied().unwrap_or(0.0);
             let sl = slope
                 .and_then(|s| s.get(c as usize).copied())
                 .unwrap_or(0.0);
-            let dst = &mut out.d[(c as usize) * plane_out..][..plane_out];
             for y in 0..oh {
                 for x in 0..ow {
                     let mut acc = b;
@@ -2217,6 +2251,31 @@ impl MpPose {
                         }
                     }
                     dst[(y * ow + x) as usize] = act1(layer.act, acc, sl);
+                }
+            }
+        };
+        let cout = w.cout as usize;
+        let work = (w.cout * oh * ow) as i64;
+        match parallel::chunk_rows(cout, work, parallel::threads()) {
+            Some(chunk) => {
+                // OVER CHANNELS, like OCR's dwconv: one filter reads one input
+                // channel and writes one output channel, so the split crosses
+                // no reduction and is bit-identical to the serial loop.
+                let ins: Vec<&[f32]> = input.d.chunks(plane_in.max(1)).collect();
+                let mut outs: Vec<&mut [f32]> = out.d.chunks_mut(plane_out.max(1)).collect();
+                parallel::for_each_chunk_mut(&mut outs, chunk.max(1), |gi, group| {
+                    let first = gi * chunk;
+                    for (i, dst) in group.iter_mut().enumerate() {
+                        let c = first + i;
+                        run_channel(c as i64, ins[c], dst);
+                    }
+                });
+            }
+            None => {
+                for c in 0..input.c {
+                    let src = &input.d[(c as usize) * plane_in..][..plane_in];
+                    let dst = &mut out.d[(c as usize) * plane_out..][..plane_out];
+                    run_channel(c, src, dst);
                 }
             }
         }

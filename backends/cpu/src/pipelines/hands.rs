@@ -61,6 +61,7 @@
 //! this reader.
 
 use crate::kernels;
+use crate::parallel;
 use crate::pose::Tensor;
 use npum_format::Container;
 use npum_model::array::{ArrayRef, ConvSpec};
@@ -2121,14 +2122,12 @@ impl Hands {
         let (pt, pl) = (layer.pad[0], layer.pad[1]);
         let plane_in = (h * wd) as usize;
         let plane_out = (oh * ow) as usize;
-        for c in 0..input.c {
-            let src = &input.d[(c as usize) * plane_in..][..plane_in];
+        let run_channel = |c: i64, src: &[f32], dst: &mut [f32]| {
             let filt = &w.w[(c * w.kh * w.kw) as usize..][..(w.kh * w.kw) as usize];
             let b = w.b.get(c as usize).copied().unwrap_or(0.0);
             let sl = slope
                 .and_then(|s| s.get(c as usize).copied())
                 .unwrap_or(0.0);
-            let dst = &mut out.d[(c as usize) * plane_out..][..plane_out];
             for y in 0..oh {
                 for x in 0..ow {
                     let mut acc = b;
@@ -2150,6 +2149,31 @@ impl Hands {
                         }
                     }
                     dst[(y * ow + x) as usize] = act1(layer.act, acc, sl);
+                }
+            }
+        };
+        let cout = w.cout as usize;
+        let work = (w.cout * oh * ow) as i64;
+        match parallel::chunk_rows(cout, work, parallel::threads()) {
+            Some(chunk) => {
+                // OVER CHANNELS: a channel's output is independent of every
+                // other channel's, so the split crosses no reduction and the
+                // FMA order inside a tap is untouched.
+                let ins: Vec<&[f32]> = input.d.chunks(plane_in.max(1)).collect();
+                let mut outs: Vec<&mut [f32]> = out.d.chunks_mut(plane_out.max(1)).collect();
+                parallel::for_each_chunk_mut(&mut outs, chunk.max(1), |gi, group| {
+                    let first = gi * chunk;
+                    for (i, dst) in group.iter_mut().enumerate() {
+                        let c = first + i;
+                        run_channel(c as i64, ins[c], dst);
+                    }
+                });
+            }
+            None => {
+                for c in 0..input.c {
+                    let src = &input.d[(c as usize) * plane_in..][..plane_in];
+                    let dst = &mut out.d[(c as usize) * plane_out..][..plane_out];
+                    run_channel(c, src, dst);
                 }
             }
         }

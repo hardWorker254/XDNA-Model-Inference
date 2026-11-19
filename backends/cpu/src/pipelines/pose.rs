@@ -42,6 +42,7 @@
 //! this checkpoint, so reading `w[b]` as `b` would give the same number
 //! -- for this checkpoint.
 
+use crate::parallel;
 use npum_format::Container;
 use npum_model::array::{ArrayRef, ConvSpec};
 use serde_json::Value;
@@ -1215,22 +1216,58 @@ fn im2col_into(
     let len = (m * k) as usize;
     a.resize(len, 0.0);
     a.fill(0.0);
-    for y in 0..oh {
-        for x in 0..ow {
-            let row = &mut a[((y * ow + x) * k) as usize..][..k as usize];
-            for i in 0..kh {
-                let sy = y * sh + i - ph;
-                if sy < 0 || sy >= h {
-                    continue;
-                }
-                for j in 0..kw {
-                    let sx = x * sw + j - pw;
-                    if sx < 0 || sx >= w {
-                        continue;
+    // OVER OUTPUT ROWS, like OCR's im2col: a row reads the source and writes
+    // its own run of A, and no row reads another's. The split crosses no
+    // reduction, so a worker's bytes are the serial bytes.
+    let row_floats = (ow * k) as usize;
+    match parallel::chunk_rows(oh as usize, m * k, parallel::threads()) {
+        Some(rows_per) => {
+            parallel::for_each_chunk_mut(&mut a[..], rows_per * row_floats, |ci, chunk| {
+                let first = ci as i64 * rows_per as i64;
+                let rows = (chunk.len() / row_floats) as i64;
+                for y in first..first + rows {
+                    for x in 0..ow {
+                        let row = &mut chunk[(((y - first) * ow + x) * k) as usize..]
+                            [..k as usize];
+                        for i in 0..kh {
+                            let sy = y * sh + i - ph;
+                            if sy < 0 || sy >= h {
+                                continue;
+                            }
+                            for j in 0..kw {
+                                let sx = x * sw + j - pw;
+                                if sx < 0 || sx >= w {
+                                    continue;
+                                }
+                                for ch in 0..c {
+                                    row[((ch * kh + i) * kw + j) as usize] =
+                                        input.d[((ch * h + sy) * w + sx) as usize];
+                                }
+                            }
+                        }
                     }
-                    for ch in 0..c {
-                        row[((ch * kh + i) * kw + j) as usize] =
-                            input.d[((ch * h + sy) * w + sx) as usize];
+                }
+            });
+        }
+        None => {
+            for y in 0..oh {
+                for x in 0..ow {
+                    let row = &mut a[((y * ow + x) * k) as usize..][..k as usize];
+                    for i in 0..kh {
+                        let sy = y * sh + i - ph;
+                        if sy < 0 || sy >= h {
+                            continue;
+                        }
+                        for j in 0..kw {
+                            let sx = x * sw + j - pw;
+                            if sx < 0 || sx >= w {
+                                continue;
+                            }
+                            for ch in 0..c {
+                                row[((ch * kh + i) * kw + j) as usize] =
+                                    input.d[((ch * h + sy) * w + sx) as usize];
+                            }
+                        }
                     }
                 }
             }

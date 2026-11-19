@@ -2417,47 +2417,68 @@ impl Network {
         // probability map by an ulp per tap.
         let cout = w.cout as usize;
         let khkw = (w.kh * w.kw) as usize;
-        let mut pixel = vec![0.0f32; w.cin as usize];
         let tap = |i: i64, j: i64| (i * w.kw + j) as usize;
-        for i in 0..w.kh {
-            for j in 0..w.kw {
-                for iy in 0..h {
-                    let oy = iy * l.stride[0] - l.pad[0] + i * l.dilation[0];
-                    if oy < 0 || oy >= oh {
-                        continue;
-                    }
-                    for ix in 0..width {
-                        let ox = ix * l.stride[1] - l.pad[1] + j * l.dilation[1];
-                        if ox < 0 || ox >= ow {
+        let plane_out = (oh * ow) as usize;
+        // OVER OUTPUT CHANNELS, in groups. A channel's plane is written by
+        // one worker and read by no other, so the split crosses no reduction.
+        // The input pixel is still gathered ONCE per group rather than once
+        // per (channel, output channel) pair -- the old inner loop did 24
+        // times more slice builds than values it read.
+        let run_group = |first: usize, group: &mut [&mut [f32]]| {
+            let mut pixel = vec![0.0f32; w.cin as usize];
+            for i in 0..w.kh {
+                for j in 0..w.kw {
+                    let t = tap(i, j);
+                    for iy in 0..h {
+                        let oy = iy * l.stride[0] - l.pad[0] + i * l.dilation[0];
+                        if oy < 0 || oy >= oh {
                             continue;
                         }
-                        // THE INPUT PIXEL, PER CHANNEL, GATHERED ONCE.
-                        //
-                        // The channel's plane is a SLICE, and building a
-                        // slice means an index computation and a bounds
-                        // check -- and the inner loop used to build one per
-                        // (channel, output channel) pair, which is 24 times
-                        // more of them than the values it read.
-                        for (ci, v) in pixel.iter_mut().enumerate() {
-                            *v = input.chw(ci as i64)[(iy * width + ix) as usize];
-                        }
-                        for co in 0..w.cout as usize {
-                            let mut acc = 0.0f32;
-                            for ci in 0..w.cin as usize {
-                                acc += pixel[ci] * w.w[(ci * cout + co) * khkw + tap(i, j)];
+                        for ix in 0..width {
+                            let ox = ix * l.stride[1] - l.pad[1] + j * l.dilation[1];
+                            if ox < 0 || ox >= ow {
+                                continue;
                             }
-                            out.chw_mut(co as i64)[(oy * ow + ox) as usize] += acc;
+                            for (ci, v) in pixel.iter_mut().enumerate() {
+                                *v = input.chw(ci as i64)[(iy * width + ix) as usize];
+                            }
+                            for (local, dst) in group.iter_mut().enumerate() {
+                                let co = first + local;
+                                let mut acc = 0.0f32;
+                                for ci in 0..w.cin as usize {
+                                    // NOT FUSED, like the oracle: vmulss then
+                                    // vaddss. A `mul_add` would move the
+                                    // probability map by an ulp per tap.
+                                    acc += pixel[ci] * w.w[(ci * cout + co) * khkw + t];
+                                }
+                                dst[(oy * ow + ox) as usize] += acc;
+                            }
                         }
                     }
                 }
             }
-        }
-        if let Some(b) = &w.b {
-            for co in 0..w.cout {
-                for i in 0..(oh * ow) {
-                    out.chw_mut(co)[i as usize] += b[co as usize];
+            if let Some(b) = &w.b {
+                for (local, dst) in group.iter_mut().enumerate() {
+                    let bias = b[(first + local) as usize];
+                    for v in dst.iter_mut() {
+                        *v += bias;
+                    }
                 }
             }
+        };
+        let mut outs: Vec<&mut [f32]> = out.d.chunks_mut(plane_out.max(1)).collect();
+        let work = (cout as i64)
+            * (w.cin as i64)
+            * (khkw as i64)
+            * (h as i64)
+            * (width as i64);
+        match parallel::chunk_rows(cout, work, parallel::threads()) {
+            Some(chunk) => {
+                parallel::for_each_chunk_mut(&mut outs, chunk, |gi, group| {
+                    run_group(gi * chunk, group)
+                });
+            }
+            None => run_group(0, &mut outs),
         }
         scratch.cost.t_transposed += t0.elapsed().as_secs_f64();
         scratch.cost.transposed_convs += 1;
