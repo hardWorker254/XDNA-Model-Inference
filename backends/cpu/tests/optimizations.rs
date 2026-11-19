@@ -5,7 +5,10 @@
 //! do not see: the generic tensor convolutions now go through im2col + GEMM,
 //! and `CpuOps` can split independent rows over the pool.
 
-use npum_cpu::kernels::{add_inplace, gemm_nt, gemm_nt_on, gemm_nt_rows, gemm_nt_rows_on};
+use npum_cpu::kernels::{
+    Isa, add_inplace, dot8, gelu_f32, gelu_row_on, gemm_nt, gemm_nt_on, gemm_nt_rows,
+    gemm_nt_rows_on, weighted_accumulate,
+};
 use npum_cpu::ops::CpuOps;
 use npum_model::{Ops, Tensor};
 
@@ -216,6 +219,72 @@ fn row_parallel_gemm_agrees_with_the_serial_one_above_the_threshold() {
                 "named-ISA row-parallel GEMM differs at {threads} workers"
             );
         }
+    }
+}
+
+#[test]
+fn reduction_helpers_agree_with_the_scalar_loops_bit_for_bit() {
+    // Eight-lane dot product: the first group is plain multiplies, the rest
+    // are FMAs, and the tree is hsum8. Both paths must produce the same bytes.
+    for n in [8usize, 16, 32, 64, 132] {
+        let a = values(n, 0x1000 + n as u32);
+        let b = values(n, 0x2000 + n as u32);
+        let nv = n / 8;
+        let mut lanes = [0.0f32; 8];
+        for l in 0..8 {
+            lanes[l] = a[l] * b[l];
+        }
+        for v in 1..nv {
+            for l in 0..8 {
+                lanes[l] = a[v * 8 + l].mul_add(b[v * 8 + l], lanes[l]);
+            }
+        }
+        let mut want = npum_cpu::kernels::hsum8(lanes);
+        let mut j = nv * 8;
+        while j < n {
+            want += a[j] * b[j];
+            j += 1;
+        }
+        assert_eq!(
+            dot8(&a, &b).to_bits(),
+            want.to_bits(),
+            "dot8 differs at n = {n}"
+        );
+    }
+
+    // Weighted accumulation (the attention V path).
+    for n in [3usize, 8, 9, 65] {
+        let v = values(n, 0x3000 + n as u32);
+        let mut got = values(n, 0x4000 + n as u32);
+        let mut want = got.clone();
+        for (d, &x) in want.iter_mut().zip(&v) {
+            *d = 0.375f32.mul_add(x, *d);
+        }
+        weighted_accumulate(&mut got, &v, 0.375);
+        assert_eq!(bytes(&got), bytes(&want), "weighted_accumulate at n = {n}");
+    }
+}
+
+#[test]
+fn gelu_avx2_row_is_bit_identical_to_the_scalar_polynomial() {
+    for n in [1usize, 7, 8, 9, 32, 257] {
+        let x = values(n, 0x5000 + n as u32);
+        let mut scalar = x.clone();
+        for v in scalar.iter_mut() {
+            *v = gelu_f32(*v);
+        }
+        for isa in npum_cpu::kernels::available_isas() {
+            let mut got = x.clone();
+            gelu_row_on(isa, &mut got);
+            assert_eq!(
+                bytes(&got),
+                bytes(&scalar),
+                "GELU differs on {isa:?} at n = {n}"
+            );
+        }
+        // Keep the unused import honest on non-x86 hosts, where the gate
+        // above can only ever run the portable path.
+        let _ = Isa::Portable;
     }
 }
 

@@ -1505,6 +1505,122 @@ unsafe fn add_inplace_avx2(dst: &mut [f32], src: &[f32]) {
     }
 }
 
+// ------------------------------------------------------ reduction helpers
+
+/// The reference's eight-lane dot product, bit-exact on every path.
+///
+/// The first eight products are plain multiplies, each subsequent group of
+/// eight is one FMA per lane, and the lanes are folded with [`hsum8`]. That is
+/// the order the attention score and the vocabulary projection use; changing
+/// it changes the last bit of the goldens. Splitting a dot product into eight
+/// vector lanes keeps the per-lane order intact, so the AVX2 path computes the
+/// same number as the scalar one, eight elements at a time.
+#[inline]
+pub fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let nv = n / 8;
+    if nv == 0 {
+        return 0.0;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        // SAFETY: the host has AVX2/FMA, and `nv = n / 8` groups of eight are
+        // all inside both slices.
+        let lanes = unsafe { dot8_lanes_avx2(a, b, nv) };
+        let mut acc = hsum8(lanes);
+        let mut j = nv * 8;
+        while j < n {
+            acc += a[j] * b[j];
+            j += 1;
+        }
+        return acc;
+    }
+    let mut lanes = [0.0f32; 8];
+    for l in 0..8 {
+        lanes[l] = a[l] * b[l];
+    }
+    for v in 1..nv {
+        for l in 0..8 {
+            lanes[l] = a[v * 8 + l].mul_add(b[v * 8 + l], lanes[l]);
+        }
+    }
+    let mut acc = hsum8(lanes);
+    let mut j = nv * 8;
+    while j < n {
+        acc += a[j] * b[j];
+        j += 1;
+    }
+    acc
+}
+
+/// The vector lanes of [`dot8`], before the horizontal sum.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot8_lanes_avx2(a: &[f32], b: &[f32], nv: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+
+    // SAFETY: `nv` groups of eight were bounds-checked by the caller.
+    unsafe {
+        let mut acc = _mm256_mul_ps(
+            _mm256_loadu_ps(a.as_ptr()),
+            _mm256_loadu_ps(b.as_ptr()),
+        );
+        for v in 1..nv {
+            acc = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.as_ptr().add(v * 8)),
+                _mm256_loadu_ps(b.as_ptr().add(v * 8)),
+                acc,
+            );
+        }
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        lanes
+    }
+}
+
+/// `acc[i] = weight * v[i] + acc[i]`, eight lanes at a time when possible.
+///
+/// The softmax-weighted value accumulation in attention. Each element is
+/// independent, so the vector path computes the same FMA as the scalar loop.
+#[inline]
+pub fn weighted_accumulate(acc: &mut [f32], v: &[f32], weight: f32) {
+    let n = acc.len().min(v.len());
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        // SAFETY: the host has AVX2/FMA; the helper touches only `..n`.
+        unsafe { weighted_accumulate_avx2(&mut acc[..n], &v[..n], weight) };
+        return;
+    }
+    for (d, &x) in acc[..n].iter_mut().zip(v.iter()) {
+        *d = weight.mul_add(x, *d);
+    }
+}
+
+/// Eight lanes at a time, with a scalar tail.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn weighted_accumulate_avx2(acc: &mut [f32], v: &[f32], weight: f32) {
+    use std::arch::x86_64::*;
+
+    let n = acc.len().min(v.len());
+    // SAFETY: `n` is within both slices and the loop bounds keep every load
+    // and store in range.
+    unsafe {
+        let w = _mm256_set1_ps(weight);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let a = _mm256_loadu_ps(acc.as_ptr().add(i));
+            let x = _mm256_loadu_ps(v.as_ptr().add(i));
+            _mm256_storeu_ps(acc.as_mut_ptr().add(i), _mm256_fmadd_ps(x, w, a));
+            i += 8;
+        }
+        while i < n {
+            *acc.get_unchecked_mut(i) = weight.mul_add(*v.get_unchecked(i), *acc.get_unchecked(i));
+            i += 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the trait
 
 /// The GELU, on a named ISA.
@@ -1526,20 +1642,66 @@ pub fn gelu_row_on(isa: Isa, x: &mut [f32]) {
 }
 
 /// The GELU, compiled for a host with AVX2 and FMA.
+///
+/// Eight lanes at a time, and the SAME polynomial in the SAME FMA order as
+/// [`gelu_f32`]: `pl = C0`, then `pl = fma(pl, u, C1)` ... `C8`, then
+/// `max(v, 0) + pl`. The earlier body had the target feature but none of the
+/// intrinsics -- it called the scalar polynomial eight times in a loop, so it
+/// paid for the wide build and got none of the width. This one is genuinely
+/// eight-wide, and bit-identical to the scalar path for every finite input.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn gelu_row_avx2(x: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    const C0: f32 = -7.234_028_217_1e-05;
+    const C1: f32 = 1.817_951_800_5e-03;
+    const C2: f32 = -1.770_738_337_9e-02;
+    const C3: f32 = 8.457_714_764_1e-02;
+    const C4: f32 = -1.922_867_183_4e-01;
+    const C5: f32 = 9.843_112_445_8e-02;
+    const C6: f32 = 3.613_785_206_2e-01;
+    const C7: f32 = -4.945_412_893_6e-01;
+    const C8: f32 = -1.300_701_011_7e-04;
+
     let n = x.len();
-    let mut i = 0usize;
-    while i + 8 <= n {
-        for l in 0..8 {
-            x[i + l] = gelu_f32(x[i + l]);
+    // SAFETY: the caller checked the host for AVX2/FMA. All loads/stores below
+    // are within `x` because of the loop bounds.
+    unsafe {
+        let c0 = _mm256_set1_ps(C0);
+        let c1 = _mm256_set1_ps(C1);
+        let c2 = _mm256_set1_ps(C2);
+        let c3 = _mm256_set1_ps(C3);
+        let c4 = _mm256_set1_ps(C4);
+        let c5 = _mm256_set1_ps(C5);
+        let c6 = _mm256_set1_ps(C6);
+        let c7 = _mm256_set1_ps(C7);
+        let c8 = _mm256_set1_ps(C8);
+        let zero = _mm256_setzero_ps();
+        let four = _mm256_set1_ps(4.0);
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(x.as_ptr().add(i));
+            let u = _mm256_min_ps(_mm256_and_ps(v, abs_mask), four);
+            let mut pl = c0;
+            pl = _mm256_fmadd_ps(pl, u, c1);
+            pl = _mm256_fmadd_ps(pl, u, c2);
+            pl = _mm256_fmadd_ps(pl, u, c3);
+            pl = _mm256_fmadd_ps(pl, u, c4);
+            pl = _mm256_fmadd_ps(pl, u, c5);
+            pl = _mm256_fmadd_ps(pl, u, c6);
+            pl = _mm256_fmadd_ps(pl, u, c7);
+            pl = _mm256_fmadd_ps(pl, u, c8);
+            let r = _mm256_add_ps(_mm256_max_ps(v, zero), pl);
+            _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
+            i += 8;
         }
-        i += 8;
-    }
-    while i < n {
-        x[i] = gelu_f32(x[i]);
-        i += 1;
+        while i < n {
+            *x.get_unchecked_mut(i) = gelu_f32(*x.get_unchecked(i));
+            i += 1;
+        }
     }
 }
 
@@ -1904,19 +2066,22 @@ pub fn conv2d(
     Ok(())
 }
 
-/// The multimodal projection: a matrix multiply into `out`.
+/// The multimodal projection, into `out`.
+///
+/// The backend trait hands this operation only the input and the output: the
+/// projection's weights are not an argument, and no family keeps them behind
+/// this method. What the operation owes the graph is therefore the input's
+/// values in `out` (the same identity projection `logit` performs) -- NOT a
+/// copy of `out` into itself. The old body read `out`, ignored `x`, and wrote
+/// those same bytes back, so a caller that moved a tensor through `mproj`
+/// silently lost its input. That was a correctness bug, not a slow path.
 pub fn mproj(x: &Tensor, out: &mut Tensor) -> Result<()> {
     let xv = x.to_f32();
-    let ov = out.to_f32();
-    // The projection is a 1x1 convolution over the last axis, which is what
-    // it is in every family that has one: a matrix whose rows are the
-    // projection's weights.
-    let width = x.shape().last().copied().unwrap_or(0) as usize;
-    if width == 0 {
-        return Ok(());
+    let mut ov = out.to_f32();
+    for (i, slot) in ov.iter_mut().enumerate() {
+        *slot = xv.get(i).copied().unwrap_or(0.0);
     }
     copy_into(out, &ov);
-    let _ = xv;
     Ok(())
 }
 
