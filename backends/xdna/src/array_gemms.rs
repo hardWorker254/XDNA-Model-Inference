@@ -51,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use npum_format::Container;
 use npum_model::array::PipelinedGemm;
@@ -58,7 +59,8 @@ use npum_model::array::PipelinedGemm;
 use crate::array::{ArrayDesign, ArrayError as DesignError};
 use crate::attention::Attention;
 use crate::gemm::{
-    Datapath, GemmDispatch, GemmScratch, check_fit, complete_gemm, gemm_with_scratch, submit_gemm,
+    Datapath, DatapathKind, GemmDispatch, GemmScratch, QuantScales, check_fit, complete_gemm,
+    gemm_quant_with_scratch, gemm_with_scratch, submit_gemm, submit_gemm_quant,
 };
 use crate::transport::Transport;
 
@@ -67,6 +69,45 @@ use crate::transport::Transport;
 /// The design's data buffers are A, B and C, in that order: the activations,
 /// the weights, the result.
 const BUFFER_WEIGHTS: usize = 1;
+
+/// Read one container tensor as little-endian f32 values.
+///
+/// The dequantisation scales are metadata, not weights: they are small, and
+/// reading them once at `open` is what keeps them off the dispatch path. A
+/// wrong dtype or length is refused here, before any panel is staged.
+fn read_f32_tensor(
+    file: &Container,
+    name: &str,
+    container: &Path,
+) -> Result<Vec<f32>, DesignError> {
+    let entry = file.directory().tensor(name).ok_or_else(|| {
+        DesignError::Design(format!(
+            "{}: the container has no {name}, which an int8 projection needs to dequantise",
+            container.display()
+        ))
+    })?;
+    if entry.dtype != "F32" {
+        return Err(DesignError::Design(format!(
+            "{}: {name} is {} and not F32 -- the int8 scale must be a float vector",
+            container.display(),
+            entry.dtype
+        )));
+    }
+    let bytes = file.tensor_bytes(name).map_err(|e| {
+        DesignError::Design(format!("{}: cannot read {name}: {e}", container.display()))
+    })?;
+    if bytes.len() % 4 != 0 {
+        return Err(DesignError::Design(format!(
+            "{}: {name} is {} bytes, not a whole number of f32 values",
+            container.display(),
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
 
 /// One projection the array will run.
 #[derive(Debug, Clone)]
@@ -101,6 +142,12 @@ struct Panel {
     k: usize,
     /// The projection's own output width.
     n: usize,
+    /// The int8 scales for this panel, by index in `ArrayGemms::quant`.
+    ///
+    /// `None` on a bf16 design, whose panel is the whole story. An index rather
+    /// than an `Arc` here keeps `ResolvedGemm` `Copy`, which the two-slot
+    /// pipeline relies on.
+    quant: Option<usize>,
 }
 
 /// A projection submitted with [`ArrayGemms::gemm_submit`] and not yet read.
@@ -134,6 +181,8 @@ struct ResolvedGemm {
     rows: usize,
     k: usize,
     n: usize,
+    /// The int8 scales for this projection, by index in `ArrayGemms::quant`.
+    quant: Option<usize>,
 }
 
 /// The array's projections.
@@ -176,6 +225,11 @@ pub struct ArrayGemms<T: Transport> {
     /// takes the validation, tier search and `check_fit` off the steady-state
     /// path. Errors are never cached -- only successful resolutions are.
     resolved_cache: HashMap<ResolvedKey, ResolvedGemm>,
+    /// The container's int8 scales, one entry per projection that needs them.
+    ///
+    /// Read once at `open`, shared with each submitted ticket as an `Arc`, and
+    /// never looked up again in the dispatch loop.
+    quant: Vec<Arc<QuantScales>>,
 }
 
 impl<T: Transport> ArrayGemms<T> {
@@ -203,6 +257,13 @@ impl<T: Transport> ArrayGemms<T> {
         let file = Container::open(container).map_err(|e| {
             DesignError::Design(format!("cannot open {}: {e}", container.display()))
         })?;
+        // The design set is fixed for all panels of one backend, so the
+        // datapath is decided once here. An int8 set needs the container's
+        // per-channel weight scale and SmoothQuant factors for EVERY panel;
+        // reading them here means a missing one is refused before the first
+        // dispatch rather than at the first projection that uses it.
+        let dp = Datapath::of(&design)?;
+        let mut quant: Vec<Arc<QuantScales>> = Vec::new();
 
         let mut panels: HashMap<String, Panel> = HashMap::new();
         let mut staged = 0usize;
@@ -269,6 +330,36 @@ impl<T: Transport> ArrayGemms<T> {
                 )));
             }
 
+            // THE INT8 SCALES, WHEN THE DESIGN'S DATAPATH NEEDS THEM.
+            //
+            // `.wscale` is one float per output column and `.asmooth` one per
+            // input channel. Both ship with every I8 panel, even when the
+            // smoothing was calibrated as all ones, so there is one code path
+            // and no container whose smoothing is silently skipped.
+            let quant_index = if dp.kind == DatapathKind::Int8I32 {
+                let wscale = read_f32_tensor(&file, &format!("{}.wscale", spec.weight), container)?;
+                let asmooth =
+                    read_f32_tensor(&file, &format!("{}.asmooth", spec.weight), container)?;
+                if wscale.len() != spec.n || asmooth.len() != spec.k {
+                    return Err(DesignError::Design(format!(
+                        "{}: {} has {} weight scales and {} smoothing factors, and the \
+                         projection is {}x{}. Int8 scales must follow the panel's shape.",
+                        container.display(),
+                        spec.weight,
+                        wscale.len(),
+                        asmooth.len(),
+                        spec.k,
+                        spec.n
+                    )));
+                }
+                let scales = QuantScales::new(&asmooth, wscale)?;
+                let index = quant.len();
+                quant.push(Arc::new(scales));
+                Some(index)
+            } else {
+                None
+            };
+
             let slot = design.stage(BUFFER_WEIGHTS, bytes)?;
             staged += bytes.len();
             panels.insert(
@@ -278,6 +369,7 @@ impl<T: Transport> ArrayGemms<T> {
                     tiers,
                     k: spec.k,
                     n: spec.n,
+                    quant: quant_index,
                 },
             );
         }
@@ -312,6 +404,7 @@ impl<T: Transport> ArrayGemms<T> {
             slot_busy: [false; 2],
             resolved_buf: Vec::new(),
             resolved_cache: HashMap::new(),
+            quant,
         })
     }
 
@@ -398,6 +491,7 @@ impl<T: Transport> ArrayGemms<T> {
             rows,
             k,
             n,
+            quant: panel.quant,
         };
         self.resolved_cache.insert(key, resolved);
         Ok(resolved)
@@ -456,18 +550,43 @@ impl<T: Transport> ArrayGemms<T> {
         self.design.bind(BUFFER_WEIGHTS, resolved.weight_slot)?;
         self.design.bind(0, slot)?;
         self.design.bind(2, slot)?;
-        let dispatch = submit_gemm(
-            &mut self.design,
-            resolved.instr,
-            a,
-            resolved.rows,
-            resolved.tier_rows,
-            resolved.k,
-            resolved.dp,
-            bias,
-            resolved.n,
-            &mut self.scratch,
-        )?;
+        let dispatch = if resolved.dp.kind == DatapathKind::Int8I32 {
+            let quant = resolved
+                .quant
+                .and_then(|index| self.quant.get(index))
+                .ok_or_else(|| {
+                    DesignError::Design(format!(
+                        "the int8 projection {} lost its container scales",
+                        resolved.weight_slot
+                    ))
+                })?;
+            submit_gemm_quant(
+                &mut self.design,
+                resolved.instr,
+                a,
+                resolved.rows,
+                resolved.tier_rows,
+                resolved.k,
+                resolved.dp,
+                bias,
+                resolved.n,
+                Arc::clone(quant),
+                &mut self.scratch,
+            )?
+        } else {
+            submit_gemm(
+                &mut self.design,
+                resolved.instr,
+                a,
+                resolved.rows,
+                resolved.tier_rows,
+                resolved.k,
+                resolved.dp,
+                bias,
+                resolved.n,
+                &mut self.scratch,
+            )?
+        };
 
         self.slot_busy[slot] = true;
         self.dispatches += 1;
@@ -676,19 +795,44 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         self.design
             .bind(2, slot)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
-        gemm_with_scratch(
-            &mut self.design,
-            resolved.instr,
-            a,
-            rows,
-            resolved.tier_rows,
-            k,
-            bias,
-            n,
-            out,
-            &mut self.scratch,
-        )
-        .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        if resolved.dp.kind == DatapathKind::Int8I32 {
+            let quant = resolved
+                .quant
+                .and_then(|index| self.quant.get(index))
+                .ok_or_else(|| {
+                    npum_model::array::ArrayError(
+                        "the int8 projection lost its container scales".to_string(),
+                    )
+                })?;
+            gemm_quant_with_scratch(
+                &mut self.design,
+                resolved.instr,
+                a,
+                rows,
+                resolved.tier_rows,
+                k,
+                bias,
+                n,
+                out,
+                &mut self.scratch,
+                quant,
+            )
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        } else {
+            gemm_with_scratch(
+                &mut self.design,
+                resolved.instr,
+                a,
+                rows,
+                resolved.tier_rows,
+                k,
+                bias,
+                n,
+                out,
+                &mut self.scratch,
+            )
+            .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        }
         self.dispatches += 1;
         Ok(())
     }
@@ -749,6 +893,234 @@ impl<T: Transport> npum_model::array::ArrayAttention for ArrayGemms<T> {
 }
 
 impl<T: Transport> npum_model::array::ArrayText for ArrayGemms<T> {}
+
+#[cfg(test)]
+mod int8_tests {
+    use super::*;
+    use crate::array::ArrayDesign;
+    use crate::transport::{BufferFlags, TransportError};
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Buf {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct Int8Run {
+        a: Buf,
+        b: Buf,
+        c: Buf,
+    }
+
+    unsafe extern "C" fn free_run(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr as *mut Int8Run)) };
+        }
+    }
+
+    struct Int8Transport {
+        counts: Mutex<HashMap<i32, usize>>,
+    }
+
+    impl Transport for Int8Transport {
+        type Buffer = Buf;
+
+        fn open(_index: u32) -> Result<Self, TransportError> {
+            Ok(Self {
+                counts: Mutex::new(HashMap::new()),
+            })
+        }
+        fn open_context(&mut self, _xclbin: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn open_kernel(&mut self, _name: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn group_id(&self, argno: i32) -> Result<i32, TransportError> {
+            Ok(argno)
+        }
+        fn alloc(
+            &mut self,
+            bytes: u64,
+            _flags: BufferFlags,
+            group: i32,
+        ) -> Result<Self::Buffer, TransportError> {
+            let mut counts = self.counts.lock().unwrap();
+            let slot = counts.entry(group).or_insert(0);
+            *slot += 1;
+            Ok(Buf {
+                bytes: Arc::new(Mutex::new(vec![0u8; bytes as usize])),
+            })
+        }
+        fn write(bo: &Self::Buffer, data: &[u8], offset: u64) -> Result<(), TransportError> {
+            bo.bytes.lock().unwrap()[offset as usize..offset as usize + data.len()]
+                .copy_from_slice(data);
+            Ok(())
+        }
+        fn size(bo: &Self::Buffer) -> u64 {
+            bo.bytes.lock().unwrap().len() as u64
+        }
+        fn read(bo: &Self::Buffer, data: &mut [u8], offset: u64) -> Result<(), TransportError> {
+            data.copy_from_slice(
+                &bo.bytes.lock().unwrap()[offset as usize..offset as usize + data.len()],
+            );
+            Ok(())
+        }
+        fn sync_to_device(
+            _bo: &Self::Buffer,
+            _bytes: u64,
+            _offset: u64,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn sync_from_device(
+            _bo: &Self::Buffer,
+            _bytes: u64,
+            _offset: u64,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn start(
+            &mut self,
+            _instr: &Self::Buffer,
+            _words: u32,
+            args: &[&Self::Buffer],
+        ) -> Result<crate::transport::Run, TransportError> {
+            Ok(crate::transport::Run::new(
+                Box::into_raw(Box::new(Int8Run {
+                    a: args[0].clone(),
+                    b: args[1].clone(),
+                    c: args[2].clone(),
+                })) as *mut c_void,
+                free_run,
+            ))
+        }
+        fn wait(run: &crate::transport::Run) -> Result<(), TransportError> {
+            let r = unsafe { &*(run.handle() as *const Int8Run) };
+            let a = r.a.bytes.lock().unwrap();
+            let b = r.b.bytes.lock().unwrap();
+            let mut c = r.c.bytes.lock().unwrap();
+            // An exact int8 x int8 -> int32 dot: no rounding in the reduction.
+            let k = 4usize;
+            let n = 2usize;
+            let rows = a.len() / k;
+            for row in 0..rows {
+                for col in 0..n {
+                    let mut acc = 0i32;
+                    for kk in 0..k {
+                        acc += (a[row * k + kk] as i8 as i32) * (b[kk * n + col] as i8 as i32);
+                    }
+                    let at = (row * n + col) * 4;
+                    c[at..at + 4].copy_from_slice(&acc.to_le_bytes());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// An int8 design, panel and scales: the whole int8 dispatch in one test.
+    #[test]
+    fn int8_projection_uses_the_container_scales_end_to_end() {
+        let dir = std::env::temp_dir().join(format!(
+            "npum_int8_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let design = dir.join("design");
+        std::fs::create_dir_all(&design).unwrap();
+        let manifest = r#"{
+            "name": "fake-i8", "kernel": "MLIR_AIE", "arch": 1, "device": "npu1",
+            "buffers": [8, 8, 16], "a_dtype": "i8", "c_dtype": "i32",
+            "tile": { "m": 2, "k": 4, "n": 2, "rows": 1 },
+            "slot0": { "op": "qkv", "batch": 0, "slot": 0, "file": "insts.bin",
+                       "M": 2, "K": 4, "N": 2 },
+            "streams": [ { "op": "qkv", "batch": 0, "slot": 0, "file": "insts.bin",
+                           "M": 2, "K": 4, "N": 2 } ]
+        }"#;
+        std::fs::write(design.join("design.json"), manifest).unwrap();
+        std::fs::write(design.join("final.xclbin"), b"xclbin").unwrap();
+        std::fs::write(design.join("insts.bin"), vec![0u8; 4]).unwrap();
+
+        let mut writer = npum_format::Writer::new(
+            npum_format::directory::Config::from_value(serde_json::json!({})),
+            1,
+            0,
+        );
+        let panel = vec![1u8; 8]; // all weights quantise to 1
+        writer.add(npum_format::writer::Staged {
+            name: "w".into(),
+            role: "gemm_b".into(),
+            dtype: "I8".into(),
+            logical_shape: vec![4, 2],
+            padded_shape: vec![4, 2],
+            blob: panel,
+            layout: None,
+        });
+        writer.add(npum_format::writer::Staged {
+            name: "w.wscale".into(),
+            role: "quant_scale".into(),
+            dtype: "F32".into(),
+            logical_shape: vec![2],
+            padded_shape: vec![2],
+            blob: [2.0f32, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            layout: None,
+        });
+        writer.add(npum_format::writer::Staged {
+            name: "w.asmooth".into(),
+            role: "quant_smooth".into(),
+            dtype: "F32".into(),
+            logical_shape: vec![4],
+            padded_shape: vec![4],
+            blob: [1.0f32, 2.0, 4.0, 8.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            layout: None,
+        });
+        let container = dir.join("model.npum");
+        writer.write(&container).unwrap();
+
+        let design = ArrayDesign::open(
+            &design,
+            Int8Transport {
+                counts: Mutex::new(HashMap::new()),
+            },
+        )
+        .unwrap();
+        let mut gemms = ArrayGemms::open(
+            &container,
+            design,
+            &[GemmSpec {
+                weight: "w".into(),
+                op: "qkv".into(),
+                k: 4,
+                n: 2,
+            }],
+            false,
+        )
+        .unwrap();
+
+        let a = [1.0f32, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+        let bias = [1.0f32, 2.0];
+        let mut out = [0.0f32; 4];
+        npum_model::array::ArrayGemm::gemm(&mut gemms, "w", &a, 2, 4, 2, Some(&bias), &mut out)
+            .unwrap();
+
+        // Row 0 quantises to [127,127,95,64], so the exact dot is 413; the
+        // container's wscale is [2,4], and the row scale is 1/127.
+        let sa = 1.0f32 / 127.0;
+        let expected = [413.0 * sa * 2.0 + 1.0, 413.0 * sa * 4.0 + 2.0, 1.0, 2.0];
+        for (got, want) in out.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod async_tests {
@@ -939,6 +1311,7 @@ mod async_tests {
                 tiers: vec![(rows, 0)],
                 k,
                 n,
+                quant: None,
             },
         );
         (
@@ -953,6 +1326,7 @@ mod async_tests {
                 slot_busy: [false; 2],
                 resolved_buf: Vec::new(),
                 resolved_cache: HashMap::new(),
+                quant: Vec::new(),
             },
             log,
         )

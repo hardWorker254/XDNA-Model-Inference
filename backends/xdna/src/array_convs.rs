@@ -104,7 +104,22 @@ impl<T: Transport> ArrayConvs<T> {
             DesignError::Design(format!("cannot open {}: {e}", container.display()))
         })?;
 
-        let mut panels: HashMap<String, Panel> = HashMap::new();
+        // One scan of the design's streams instead of a linear string search
+        // per convolution, and one allocation for the panel map instead of
+        // growing it a convolution at a time. Both are init-path work, but a
+        // detector has hundreds of convolutions and opens once per request.
+        let streams: HashMap<String, (usize, usize, usize, usize)> = design
+            .info()
+            .streams
+            .iter()
+            .map(|s| {
+                (
+                    s.op.clone(),
+                    (s.slot as usize, s.m as usize, s.k as usize, s.n as usize),
+                )
+            })
+            .collect();
+        let mut panels: HashMap<String, Panel> = HashMap::with_capacity(convs.len());
         let mut staged = 0usize;
         for spec in convs {
             let panel_name = panel_name(&spec.weight)?;
@@ -124,12 +139,8 @@ impl<T: Transport> ArrayConvs<T> {
             // is dispatched against: a design set exported for another model
             // has streams of other names, and a convolution dispatched
             // against a missing slot is a wrong answer rather than an error.
-            let stream = design
-                .info()
-                .streams
-                .iter()
-                .find(|s| s.op == spec.stream)
-                .ok_or_else(|| {
+            let (instr, rows, padded_k, padded_n) =
+                streams.get(spec.stream.as_str()).copied().ok_or_else(|| {
                     DesignError::Design(format!(
                         "{}: the design set has no stream named '{}'. The design set was \
                          exported for a different model, or the container names a stream its \
@@ -138,12 +149,6 @@ impl<T: Transport> ArrayConvs<T> {
                         spec.stream
                     ))
                 })?;
-            let (instr, rows, padded_k, padded_n) = (
-                stream.slot as usize,
-                stream.m as usize,
-                stream.k as usize,
-                stream.n as usize,
-            );
             if rows == 0 || padded_k == 0 || padded_n == 0 {
                 return Err(DesignError::Design(format!(
                     "{}: the design's stream '{}' reports no shape (M {rows}, K {padded_k}, \

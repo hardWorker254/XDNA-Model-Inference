@@ -48,6 +48,7 @@
 //! larger run appears.
 
 use crate::array::{ArrayDesign, ArrayError};
+use crate::gemm::{Datapath, DatapathKind};
 use crate::transport::Transport;
 
 /// The data buffer the panels live in.
@@ -116,12 +117,17 @@ struct AttentionScratch {
     a_q: Vec<f32>,
     /// A zero block for the padded batch's activations and mask.
     zeros: Vec<f32>,
-    /// The K panel in row-major f32, `[k_qk, n_kv]`.
-    k_panel: Vec<f32>,
     /// Staging for the K-panel's blocked transpose, `[K_PANEL_BLOCK, head_dim]`.
     k_stage: Vec<f32>,
-    /// The V panel in row-major f32, `[n_kv, ctx_cols]`.
-    v_panel: Vec<f32>,
+    /// The transposed block, component-major, `[head_dim, K_PANEL_BLOCK]`.
+    stage_t: Vec<f32>,
+    /// bf16 bytes for one transposed block, `[K_PANEL_BLOCK, head_dim]`.
+    ///
+    /// The gather writes f32 values here in contiguous component runs, then
+    /// converts each run once and copies the bytes into the row-major panel.
+    /// The old path materialised a full f32 panel AND converted it in a
+    /// second pass over the whole array.
+    bf16_stage: Vec<u8>,
     /// The K panel as bf16 bytes, before tiling.
     k_bf16: Vec<u8>,
     /// The V panel as bf16 bytes, before tiling.
@@ -157,9 +163,9 @@ impl AttentionScratch {
         ensure_f32(&mut self.ctx_rows, tier_rows * ctx_cols);
         ensure_f32(&mut self.a_q, tier_rows * k_qk);
         ensure_f32(&mut self.zeros, seq * 3 * hidden);
-        ensure_f32(&mut self.k_panel, k_qk * n_kv);
         ensure_f32(&mut self.k_stage, K_PANEL_BLOCK * head_dim);
-        ensure_f32(&mut self.v_panel, n_kv * ctx_cols);
+        ensure_f32(&mut self.stage_t, K_PANEL_BLOCK * head_dim);
+        ensure_u8(&mut self.bf16_stage, K_PANEL_BLOCK * head_dim * 2);
         ensure_u8(&mut self.k_bf16, k_qk * n_kv * 2);
         ensure_u8(&mut self.v_bf16, n_kv * ctx_cols * 2);
         ensure_u8(&mut self.k_tiled, k_qk * n_kv * 2);
@@ -169,15 +175,19 @@ impl AttentionScratch {
         ensure_u8(&mut self.a_packed, a_max);
         ensure_u8(&mut self.c_packed, c_max);
 
-        // THE PADDING IS ZERO, NOT STALE.
-        //
-        // The gathered Q is written per chunk but its columns past a head are
-        // never touched, the panels only fill their real head/key/value parts,
-        // and the padded batch reads a block of zeros -- so these stay zero
-        // for the whole run. The scores and context rows are fully written
-        // for the rows each chunk reads, so they need no clearing here.
-        self.a_q.fill(0.0);
-        self.zeros.fill(0.0);
+        // THE PADDING IS ZERO, NOT STALE -- but only clear what gather never
+        // writes. `gather_q` overwrites `[0..n] x [0..head_dim]` for every real
+        // chunk, so the columns past a head and the rows past the sequence are
+        // the only places a previous run's activations could survive. The
+        // zero block is never written at all: `ensure_f32` already zero-fills
+        // any growth, so a full `fill` there is work nothing observes.
+        let a = &mut self.a_q[..tier_rows * k_qk];
+        if head_dim < k_qk {
+            for row in a[..seq * k_qk].chunks_exact_mut(k_qk) {
+                row[head_dim..].fill(0.0);
+            }
+        }
+        a[seq * k_qk..].fill(0.0);
     }
 }
 
@@ -249,6 +259,20 @@ impl Attention {
     /// staged once so the next head's panels can be uploaded while the current
     /// head's last dispatch is in flight.
     pub fn open<T: Transport>(design: &mut ArrayDesign<T>) -> Result<Self, ArrayError> {
+        // The attention's K/V panels are built on the host as bf16 and tiled
+        // into the bf16 MMAC's byte order. An int8 design needs every one of
+        // those panels quantised against the SAME per-channel scales as the
+        // weight panels, and those scales are per projection -- the attention
+        // has none. Refuse here, by name, rather than feeding bf16 bytes to an
+        // int8 MMAC; an int8 run keeps its attention on the host.
+        let dp = Datapath::of(design)?;
+        if dp.kind != DatapathKind::Bf16 {
+            return Err(ArrayError::Design(format!(
+                "{}: the attention's on-array panels are bf16 and this design's datapath is \
+                 int8. Keep the attention on the host for an int8 run.",
+                design.info().name
+            )));
+        }
         let qk = find_stream(design, "attn_qk")?;
         let av = find_stream(design, "attn_av")?;
 
@@ -526,9 +550,9 @@ pub fn run<T: Transport>(
         let v_bytes = n_kv * ctx_cols * 2;
         let mut cur = 0usize;
         build_panels(
-            &mut attn.scratch.k_panel[..k_qk * n_kv],
             &mut attn.scratch.k_stage,
-            &mut attn.scratch.v_panel[..n_kv * ctx_cols],
+            &mut attn.scratch.stage_t,
+            &mut attn.scratch.bf16_stage,
             &mut attn.scratch.k_tiled,
             &mut attn.scratch.k_bf16,
             &mut attn.scratch.v_tiled,
@@ -612,9 +636,9 @@ pub fn run<T: Transport>(
                 if !next_prepared && head + 1 < heads {
                     let next_slots = attn.panel_slots[1 - cur];
                     build_panels(
-                        &mut attn.scratch.k_panel[..k_qk * n_kv],
                         &mut attn.scratch.k_stage,
-                        &mut attn.scratch.v_panel[..n_kv * ctx_cols],
+                        &mut attn.scratch.stage_t,
+                        &mut attn.scratch.bf16_stage,
                         &mut attn.scratch.k_tiled,
                         &mut attn.scratch.k_bf16,
                         &mut attn.scratch.v_tiled,
@@ -864,9 +888,9 @@ fn write_ctx_out(
 /// separately keeps that read-only borrow alive across the calls.
 #[allow(clippy::too_many_arguments)]
 fn build_panels(
-    k_panel: &mut [f32],
     k_stage: &mut [f32],
-    v_panel: &mut [f32],
+    stage_t: &mut [f32],
+    bf16_stage: &mut [u8],
     k_tiled: &mut Vec<u8>,
     k_bf16: &mut Vec<u8>,
     v_tiled: &mut Vec<u8>,
@@ -884,13 +908,16 @@ fn build_panels(
     mac_s: usize,
     mac_t: usize,
 ) -> Result<(), ArrayError> {
-    fill_k_panel(k_panel, k_stage, src, seq, hidden, head, head_dim, n_kv);
-    fill_v_panel(v_panel, src, seq, hidden, head, head_dim, ctx_cols);
+    // The panels are built straight into bf16 bytes: there is no materialised
+    // f32 panel and no second conversion pass over the whole array. The tiler
+    // reads the row-major bf16 buffer exactly as it reads a container panel.
+    fill_k_panel_bf16(
+        k_bf16, k_stage, stage_t, bf16_stage, src, seq, hidden, head, head_dim, n_kv,
+    );
+    fill_v_panel_bf16(v_bf16, src, seq, hidden, head, head_dim, ctx_cols);
+    tile_into(k_tiled, k_bf16, k_qk, n_kv, tile_k, tile_n, mac_s, mac_t)?;
     tile_into(
-        k_tiled, k_bf16, k_panel, k_qk, n_kv, tile_k, tile_n, mac_s, mac_t,
-    )?;
-    tile_into(
-        v_tiled, v_bf16, v_panel, n_kv, ctx_cols, tile_k, tile_n, mac_s, mac_t,
+        v_tiled, v_bf16, n_kv, ctx_cols, tile_k, tile_n, mac_s, mac_t,
     )?;
     Ok(())
 }
@@ -953,9 +980,12 @@ fn sync_panels<T: Transport>(
 /// padding instead of `fill(0.0)`-ing the whole panel and rewriting the real
 /// block a second time. `stage` only covers the real keys/components, so it
 /// needs no clearing.
-fn fill_k_panel(
-    m: &mut [f32],
+#[allow(clippy::too_many_arguments)]
+fn fill_k_panel_bf16(
+    m: &mut [u8],
     stage: &mut [f32],
+    stage_t: &mut [f32],
+    bf16_stage: &mut [u8],
     qkv: &[f32],
     seq: usize,
     hidden: usize,
@@ -963,12 +993,13 @@ fn fill_k_panel(
     head_dim: usize,
     n_kv: usize,
 ) {
-    let mut rows = m.chunks_exact_mut(n_kv);
+    let bytes_per_row = n_kv * 2;
+    let mut rows = m.chunks_exact_mut(bytes_per_row);
     for row in rows.by_ref().take(head_dim) {
-        row[seq..].fill(0.0);
+        row[seq * 2..].fill(0);
     }
     for row in rows {
-        row.fill(0.0);
+        row.fill(0);
     }
     let k_base = hidden + head * head_dim;
     let mut j0 = 0;
@@ -976,19 +1007,35 @@ fn fill_k_panel(
         let j1 = (j0 + K_PANEL_BLOCK).min(seq);
         let cnt = j1 - j0;
 
-        // Gather: each key's head slice is contiguous in the Q|K|V block.
+        // Gather each key's head slice contiguously, as before.
         for (b, j) in (j0..j1).enumerate() {
             let src = j * 3 * hidden + k_base;
             stage[b * head_dim..(b + 1) * head_dim].copy_from_slice(&qkv[src..src + head_dim]);
         }
 
-        // Transpose: each component's `cnt` values are contiguous in the panel.
+        // Transpose into component-major order first. `stage` is key-major
+        // (`[key][component]`), while the panel's row t is component t across
+        // all keys; copying 2-byte bf16 values strided would be a scalar job.
         for t in 0..head_dim {
-            let mut dst = t * n_kv + j0;
             for b in 0..cnt {
-                m[dst] = stage[b * head_dim + t];
-                dst += 1;
+                stage_t[t * cnt + b] = stage[b * head_dim + t];
             }
+        }
+
+        // Convert the whole block ONCE. `f32_to_bf16_bytes` takes the SIMD fast
+        // path for a run this size; converting component by component would
+        // pay the feature check per value and scatter single bytes.
+        npum_format::bf16::f32_to_bf16_bytes(
+            &stage_t[..cnt * head_dim],
+            &mut bf16_stage[..cnt * head_dim * 2],
+        );
+
+        // Component t's `cnt` bytes are now one contiguous run in both the
+        // staging buffer and the row-major panel.
+        for t in 0..head_dim {
+            let src = &bf16_stage[t * cnt * 2..(t + 1) * cnt * 2];
+            let at = (t * n_kv + j0) * 2;
+            m[at..at + cnt * 2].copy_from_slice(src);
         }
 
         j0 = j1;
@@ -1003,8 +1050,8 @@ fn fill_k_panel(
 /// Only the `[0..seq] x [0..head_dim]` block is overwritten below. The rest is
 /// padding -- every column of the rows past the real keys, and the value-tail
 /// columns of the real rows -- so zero just that, as in `fill_k_panel`.
-fn fill_v_panel(
-    m: &mut [f32],
+fn fill_v_panel_bf16(
+    m: &mut [u8],
     qkv: &[f32],
     seq: usize,
     hidden: usize,
@@ -1012,19 +1059,21 @@ fn fill_v_panel(
     head_dim: usize,
     ctx_cols: usize,
 ) {
-    let mut rows = m.chunks_exact_mut(ctx_cols);
+    let bytes_per_row = ctx_cols * 2;
+    let mut rows = m.chunks_exact_mut(bytes_per_row);
     for row in rows.by_ref().take(seq) {
-        row[head_dim..].fill(0.0);
+        row[head_dim * 2..].fill(0);
     }
     for row in rows {
-        row.fill(0.0);
+        row.fill(0);
     }
     let v_base = 2 * hidden + head * head_dim;
-    // Each value row is disjoint, so the copies can be split across the host
-    // pool. The padding zeroed above is outside the row slice written here.
-    crate::parallel::for_each_row(&mut m[..seq * ctx_cols], ctx_cols, |j, row| {
+    // Each value row is disjoint, so the conversion can be split across the
+    // host pool. The gather and the bf16 conversion happen in the same pass
+    // straight into the panel: no f32 row, no second visit to the array.
+    crate::parallel::for_each_row(&mut m[..seq * bytes_per_row], bytes_per_row, |j, row| {
         let src = j * 3 * hidden + v_base;
-        row[..head_dim].copy_from_slice(&qkv[src..src + head_dim]);
+        npum_format::bf16::f32_to_bf16_bytes(&qkv[src..src + head_dim], &mut row[..head_dim * 2]);
     });
 }
 
@@ -1032,14 +1081,14 @@ fn fill_v_panel(
 ///
 /// The same order the container's own panels are stored in, and the same
 /// one the reference's `tile_b_panel` produces: `[K,N] -> [K/tile_k][N/tile_n]
-/// [tile_k/mac_s][tile_n/mac_t][s][t]`. The bf16 staging buffer and the tiled
-/// output are the caller's, so a run that builds many panels reuses them
-/// instead of allocating per head.
+/// [tile_k/mac_s][tile_n/mac_t][s][t]`. `panel` is already the row-major bf16
+/// buffer built by `fill_k_panel_bf16`/`fill_v_panel_bf16`; this is only the
+/// layout pass, so no conversion and no f32 panel are needed here. The tiled
+/// output is the caller's and is reused across heads.
 #[allow(clippy::too_many_arguments)]
 fn tile_into(
     tiled: &mut Vec<u8>,
-    bf16: &mut Vec<u8>,
-    panel: &[f32],
+    panel: &[u8],
     k: usize,
     n: usize,
     tile_k: usize,
@@ -1047,17 +1096,13 @@ fn tile_into(
     mac_s: usize,
     mac_t: usize,
 ) -> Result<(), ArrayError> {
-    let bytes = panel.len() * 2;
-    if bf16.len() < bytes {
-        bf16.resize(bytes, 0);
-    }
+    let bytes = panel.len();
     if tiled.len() < bytes {
         tiled.resize(bytes, 0);
     }
-    npum_format::bf16::f32_to_bf16_bytes(panel, &mut bf16[..bytes]);
     npum_format::tiling::tile_b_into(
         &mut tiled[..bytes],
-        &bf16[..bytes],
+        &panel[..bytes],
         k,
         n,
         tile_k,
@@ -1147,14 +1192,27 @@ mod tests {
                 .collect();
             let want = scatter_k_panel(&qkv, seq, hidden, head, head_dim, n_kv, k_qk);
 
-            // Start from NaN so an unwritten byte of padding is caught as well.
-            let mut got = vec![f32::NAN; k_qk * n_kv];
+            // Start from 0xCD so an unwritten byte of padding is caught as well.
+            let mut got = vec![0xCDu8; k_qk * n_kv * 2];
             let mut stage = vec![0.0f32; K_PANEL_BLOCK * head_dim];
-            fill_k_panel(
-                &mut got, &mut stage, &qkv, seq, hidden, head, head_dim, n_kv,
+            let mut stage_t = vec![0.0f32; K_PANEL_BLOCK * head_dim];
+            let mut bf16_stage = vec![0u8; K_PANEL_BLOCK * head_dim * 2];
+            fill_k_panel_bf16(
+                &mut got,
+                &mut stage,
+                &mut stage_t,
+                &mut bf16_stage,
+                &qkv,
+                seq,
+                hidden,
+                head,
+                head_dim,
+                n_kv,
             );
 
-            assert_eq!(got, want, "seq={seq} head={head} head_dim={head_dim}");
+            let mut want_bytes = vec![0u8; want.len() * 2];
+            npum_format::bf16::f32_to_bf16_bytes(&want, &mut want_bytes);
+            assert_eq!(got, want_bytes, "seq={seq} head={head} head_dim={head_dim}");
         }
     }
 
@@ -1193,11 +1251,13 @@ mod tests {
                 .collect();
             let want = scatter_v_panel(&qkv, seq, hidden, head, head_dim, n_kv, ctx_cols);
 
-            // Start from NaN so an unwritten cell of padding is caught as well.
-            let mut got = vec![f32::NAN; n_kv * ctx_cols];
-            fill_v_panel(&mut got, &qkv, seq, hidden, head, head_dim, ctx_cols);
+            // Start from 0xCD so an unwritten cell of padding is caught as well.
+            let mut got = vec![0xCDu8; n_kv * ctx_cols * 2];
+            fill_v_panel_bf16(&mut got, &qkv, seq, hidden, head, head_dim, ctx_cols);
 
-            assert_eq!(got, want, "seq={seq} head={head} head_dim={head_dim}");
+            let mut want_bytes = vec![0u8; want.len() * 2];
+            npum_format::bf16::f32_to_bf16_bytes(&want, &mut want_bytes);
+            assert_eq!(got, want_bytes, "seq={seq} head={head} head_dim={head_dim}");
         }
     }
 

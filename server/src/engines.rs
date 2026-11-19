@@ -5,6 +5,8 @@
 //! in `routes`; this layer focuses on turning requests into model outputs.
 
 use std::sync::Arc;
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// The speech endpoint's engine.
 ///
@@ -17,10 +19,15 @@ use std::sync::Arc;
 /// same container through the same arithmetic gives the same bytes.
 pub struct Transcriber {
     encoder: npum_cpu::whisper::Encoder,
-    decoders: Vec<std::sync::Mutex<npum_cpu::whisper::Decoder>>,
+    decoders: Vec<Mutex<npum_cpu::whisper::Decoder>>,
     tokenizer: npum_cpu::whisper_tokenizer::Tokenizer,
     weights: npum_cpu::whisper_session::FrontEndWeights,
     options: npum_cpu::whisper_session::Options,
+    /// Bumped every time a decoder is released, and the predicate the waiters
+    /// sleep on. The counter is read BEFORE the `try_lock` sweep, so a release
+    /// in the window between that sweep and the wait cannot be missed.
+    avail_gen: Mutex<u64>,
+    avail_cv: Condvar,
 }
 
 impl Transcriber {
@@ -49,7 +56,7 @@ impl Transcriber {
         let pool = pool.max(1);
         let mut decoders = Vec::with_capacity(pool);
         for _ in 0..pool {
-            decoders.push(std::sync::Mutex::new(
+            decoders.push(Mutex::new(
                 npum_cpu::whisper::Decoder::open(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?,
             ));
@@ -70,6 +77,8 @@ impl Transcriber {
             tokenizer,
             weights,
             options,
+            avail_gen: Mutex::new(0),
+            avail_cv: Condvar::new(),
         })
     }
 
@@ -88,6 +97,51 @@ impl Transcriber {
         self.encoder.geometry().mel_bins
     }
 
+    /// Wait for ANY free decoder, not just the first one.
+    ///
+    /// The old strategy tried every instance once and then queued on
+    /// `decoders[0]`. With a pool larger than one that turns all overflow
+    /// requests into a FIFO behind decoder0 even when decoder1 frees up first;
+    /// this waits on a condition variable that EVERY release signals, so the
+    /// next request takes whichever instance actually becomes idle. The
+    /// timeout is a guard against a lost wake-up, not the scheduling policy:
+    /// the counter read before the sweep closes the race with a release that
+    /// lands between the sweep and the wait.
+    fn acquire_decoder(
+        &self,
+    ) -> std::result::Result<MutexGuard<'_, npum_cpu::whisper::Decoder>, String> {
+        let poisoned = || format!("all {} decoder instances are poisoned", self.decoders.len());
+        loop {
+            let generation = *self.avail_gen.lock().map_err(|_| poisoned())?;
+            if let Some(guard) = self.decoders.iter().find_map(|m| m.try_lock().ok()) {
+                return Ok(guard);
+            }
+            if self.decoders.iter().all(Mutex::is_poisoned) {
+                return Err(poisoned());
+            }
+            let guard = self.avail_gen.lock().map_err(|_| poisoned())?;
+            let (guard, _) = self
+                .avail_cv
+                .wait_timeout_while(guard, Duration::from_millis(20), |current| {
+                    *current == generation
+                })
+                .map_err(|_| poisoned())?;
+            drop(guard);
+        }
+    }
+
+    /// Publish a release to every waiter. Called after the guard is dropped,
+    /// so a woken waiter can actually take the instance it raced for.
+    fn notify_decoder_free(&self) {
+        let mut generation = match self.avail_gen.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        *generation += 1;
+        drop(generation);
+        self.avail_cv.notify_all();
+    }
+
     /// Transcribe the audio in a WAV file's BYTES.
     ///
     /// The name is what the refusals name: the upload's name, so a client
@@ -99,29 +153,19 @@ impl Transcriber {
         options: &npum_cpu::whisper_session::Options,
     ) -> std::result::Result<npum_cpu::whisper_session::Transcript, String> {
         let read = npum_cpu::whisper_features::read_wav_bytes(audio, name).map_err(|r| r.0)?;
-        // Prefer an idle decoder so pooled engines can serve requests in
-        // parallel; fall back to waiting on the first instance.
-        let mut decoder = None;
-        for mutex in &self.decoders {
-            if let Ok(guard) = mutex.try_lock() {
-                decoder = Some(guard);
-                break;
-            }
-        }
-        let mut decoder = match decoder {
-            Some(guard) => guard,
-            None => self.decoders[0]
-                .lock()
-                .map_err(|_| "the decoder's state is poisoned".to_string())?,
+        let result = {
+            let mut decoder = self.acquire_decoder()?;
+            npum_cpu::whisper_session::transcribe_samples(
+                &self.encoder,
+                &mut decoder,
+                &self.tokenizer,
+                &read.samples,
+                options,
+                &self.weights,
+            )
         };
-        npum_cpu::whisper_session::transcribe_samples(
-            &self.encoder,
-            &mut decoder,
-            &self.tokenizer,
-            &read.samples,
-            options,
-            &self.weights,
-        )
+        self.notify_decoder_free();
+        result
     }
 
     /// The options this engine runs with by default.
