@@ -7,12 +7,14 @@
 //! arithmetic the host does, computed by a different machine: the GPU's f32
 //! is not the host's f32, and the difference is a tolerance, not a bug.
 //!
-//! # The bias is added on the host
+//! # The bias is added in the GEMM shader's epilogue
 //!
-//! The GEMM shader has no bias: it computes `a * b` and the epilogue adds
-//! the bias, in the host's order -- a plain addition AFTER the whole
-//! reduction. Folding the bias into the reduction would be a different
-//! number, and the array's GEMM adds it in the epilogue too.
+//! The GEMM shader computes `a * b` and then adds `bias[col]` as a plain
+//! addition AFTER the whole reduction -- the host's order, and the array's
+//! GEMM order too. Folding the bias into the reduction would be a different
+//! number. Keeping the addition on the device avoids reading the whole
+//! `m x n` result back merely to add a vector; a short/empty bias that does
+//! not cover every column still uses the host epilogue byte-for-byte.
 //!
 //! # The dispatch count
 //!
@@ -111,21 +113,27 @@ impl Ops for VulkanOps {
             npum_cpu::kernels::gemm_nt(a, m, b, k, n, bias, out);
             return Ok(());
         };
-        let mut values = gpu
-            .gemm(a, b, m, k, n)
-            .map_err(|d| Self::failed("gemm", d))?;
-        // The bias, in the epilogue: after the whole reduction, as a plain
-        // addition. The host does the same, and the array's GEMM does too.
-        //
-        // AND IT IS PER ROW: the bias has `n` values and every row of the
-        // output gets all of them. A bias added to the first row only is
-        // a different network, and it is the kind of difference that looks
-        // like a precision problem until it is measured.
-        for row in values.chunks_mut(n) {
-            for (value, b) in row.iter_mut().zip(bias) {
-                *value += *b;
+        // The normal case -- one bias per output column -- is fused into the
+        // shader's epilogue, so the result is never read back just to add a
+        // vector. A bias that does not cover every column keeps the host
+        // epilogue: its zip semantics (and the -0.0 of an untouched column)
+        // are the contract, and are not worth changing for an unusual shape.
+        let values = if bias.len() == n {
+            gpu.gemm_with_bias(a, b, Some(bias), m, k, n)
+                .map_err(|d| Self::failed("gemm", d))?
+        } else {
+            let mut values = gpu
+                .gemm(a, b, m, k, n)
+                .map_err(|d| Self::failed("gemm", d))?;
+            // AND IT IS PER ROW: every row gets all `n` bias values. Adding
+            // it to the first row only is a different network.
+            for row in values.chunks_mut(n) {
+                for (value, b) in row.iter_mut().zip(bias) {
+                    *value += *b;
+                }
             }
-        }
+            values
+        };
         out.copy_from_slice(&values);
         self.dispatches += 1;
         Ok(())

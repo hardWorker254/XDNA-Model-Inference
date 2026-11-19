@@ -64,6 +64,14 @@ pub struct VulkanBackend {
     gpu: Option<Gpu>,
     caps: Caps,
     plan: Plan,
+    /// Reusable host staging for tensor -> f32 conversions. The tensor API
+    /// used to allocate a fresh `Vec` per operand per call; these four slots
+    /// cover the widest op (a, b, accumulator/gamma/beta) and grow once.
+    scratch_a: Vec<f32>,
+    scratch_b: Vec<f32>,
+    scratch_c: Vec<f32>,
+    /// Reusable staging for f32 -> tensor byte assembly.
+    bytes: Vec<u8>,
 }
 
 impl Default for VulkanBackend {
@@ -93,6 +101,10 @@ impl VulkanBackend {
             gpu,
             caps,
             plan: Plan::default(),
+            scratch_a: Vec::new(),
+            scratch_b: Vec::new(),
+            scratch_c: Vec::new(),
+            bytes: Vec::new(),
         }
     }
 
@@ -117,11 +129,6 @@ impl VulkanBackend {
         ]
     }
 
-    /// The GPU, when this operation is one it runs for these tensors.
-    fn gpu(&mut self) -> Option<&mut Gpu> {
-        self.gpu.as_mut()
-    }
-
     /// The device itself, when there is one.
     ///
     /// The seam (`crate::ops`) works on flat slices, and the device's own
@@ -143,6 +150,22 @@ impl VulkanBackend {
     /// Whether every one of these tensors is f32, which is what the GPU runs.
     fn all_f32(tensors: &[&Tensor]) -> bool {
         tensors.iter().all(|t| t.dtype() == DType::F32)
+    }
+
+    /// Decode a tensor into one of the reusable f32 staging buffers.
+    fn decode<'a>(tensor: &Tensor, out: &'a mut Vec<f32>) -> &'a mut Vec<f32> {
+        tensor.to_f32_into(out);
+        out
+    }
+
+    /// Encode f32 values into a tensor's bytes, reusing the byte buffer.
+    fn encode(tensor: &mut Tensor, values: &[f32], bytes: &mut Vec<u8>) {
+        bytes.clear();
+        bytes.reserve(values.len() * 4);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        tensor.bytes_mut().copy_from_slice(bytes);
     }
 }
 
@@ -198,23 +221,21 @@ impl Backend for VulkanBackend {
         }
         let (m, k) = (a.shape()[0] as usize, a.shape()[1] as usize);
         let n = c.shape().last().copied().unwrap_or(0) as usize;
-        let Some(gpu) = self.gpu() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return npum_cpu::kernels::gemm(a, b, c, acc);
         };
+        let a_values = Self::decode(a, &mut self.scratch_a);
+        let b_values = Self::decode(b, &mut self.scratch_b);
         let mut values = gpu
-            .gemm(&a.to_f32(), &b.to_f32(), m, k, n)
+            .gemm(a_values, b_values, m, k, n)
             .map_err(|d| Self::failed("gemm", d))?;
         if let Some(acc) = acc {
-            let summed = gpu
-                .add(&values, &acc.to_f32())
+            let acc_values = Self::decode(acc, &mut self.scratch_c);
+            values = gpu
+                .add(&values, acc_values)
                 .map_err(|d| Self::failed("gemm", d))?;
-            values = summed;
         }
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in &values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        c.bytes_mut().copy_from_slice(&bytes);
+        Self::encode(c, &values, &mut self.bytes);
         Ok(())
     }
 
@@ -222,16 +243,12 @@ impl Backend for VulkanBackend {
         if x.dtype() != DType::F32 {
             return npum_cpu::kernels::gelu_(x);
         }
-        let Some(gpu) = self.gpu() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return npum_cpu::kernels::gelu_(x);
         };
-        let mut values = x.to_f32();
-        gpu.gelu(&mut values).map_err(|d| Self::failed("gelu", d))?;
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in &values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        x.bytes_mut().copy_from_slice(&bytes);
+        let values = Self::decode(x, &mut self.scratch_a);
+        gpu.gelu(values).map_err(|d| Self::failed("gelu", d))?;
+        Self::encode(x, values, &mut self.bytes);
         Ok(())
     }
 
@@ -243,26 +260,22 @@ impl Backend for VulkanBackend {
         if width == 0 {
             return Ok(());
         }
-        let Some(gpu) = self.gpu() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return npum_cpu::kernels::layernorm_(x, gamma, beta, eps);
         };
         let rows = x.len() / width;
-        let mut values = x.to_f32();
-        let g = gamma.to_f32();
-        let b = beta.to_f32();
+        let values = Self::decode(x, &mut self.scratch_a);
+        let g = Self::decode(gamma, &mut self.scratch_b);
+        let b = Self::decode(beta, &mut self.scratch_c);
         gpu.layernorm(
-            &mut values,
+            values,
             rows,
             width,
             (!g.is_empty()).then_some(&g[..]),
             (!b.is_empty()).then_some(&b[..]),
         )
         .map_err(|d| Self::failed("layernorm", d))?;
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in &values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        x.bytes_mut().copy_from_slice(&bytes);
+        Self::encode(x, values, &mut self.bytes);
         Ok(())
     }
 
@@ -274,18 +287,14 @@ impl Backend for VulkanBackend {
         if width == 0 {
             return Ok(());
         }
-        let Some(gpu) = self.gpu() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return npum_cpu::kernels::softmax_(x);
         };
         let rows = x.len() / width;
-        let mut values = x.to_f32();
-        gpu.softmax(&mut values, rows, width)
+        let values = Self::decode(x, &mut self.scratch_a);
+        gpu.softmax(values, rows, width)
             .map_err(|d| Self::failed("softmax", d))?;
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in &values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        x.bytes_mut().copy_from_slice(&bytes);
+        Self::encode(x, values, &mut self.bytes);
         Ok(())
     }
 
@@ -301,17 +310,16 @@ impl Backend for VulkanBackend {
         if k.len() / d > MAX_ATTENTION_KEYS {
             return npum_cpu::kernels::attention(q, k, v, out);
         }
-        let Some(gpu) = self.gpu() else {
+        let Some(gpu) = self.gpu.as_mut() else {
             return npum_cpu::kernels::attention(q, k, v, out);
         };
+        let q_values = Self::decode(q, &mut self.scratch_a);
+        let k_values = Self::decode(k, &mut self.scratch_b);
+        let v_values = Self::decode(v, &mut self.scratch_c);
         let values = gpu
-            .attention(&q.to_f32(), &k.to_f32(), &v.to_f32(), d)
+            .attention(q_values, k_values, v_values, d)
             .map_err(|d| Self::failed("attn", d))?;
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for value in &values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        out.bytes_mut().copy_from_slice(&bytes);
+        Self::encode(out, &values, &mut self.bytes);
         Ok(())
     }
 

@@ -29,12 +29,16 @@ struct Params {
     m: u32,
     k: u32,
     n: u32,
-    _pad: u32,
+    has_bias: u32,
 }
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+// The bias is per output COLUMN and added after the whole reduction, in the
+// same order as the host's `value += bias[col]`. Binding 3 is otherwise unused
+// by this shader, so the epilogue costs no descriptor layout change.
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
 @group(0) @binding(5) var<uniform> params: Params;
 
 const TILE: u32 = 16u;
@@ -77,6 +81,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
 
     if (row_ok && col_ok) {
-        c[row * params.n + col] = sum;
+        var value = sum;
+        if (params.has_bias != 0u) {
+            value = value + bias[col];
+        }
+        c[row * params.n + col] = value;
     }
 }

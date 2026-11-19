@@ -247,8 +247,18 @@ pub(crate) fn pack_a_into(
     if packed.len() < total {
         packed.resize(total, 0);
     }
-    // The real rows, in the design's dtype.
-    npum_format::bf16::f32_to_bf16_bytes(&a[..n_real * k], &mut packed[..real_bytes]);
+    // The real rows, in the design's dtype. Row-local conversion, so the
+    // pool splits it across cores for large operands; the bytes per row are
+    // identical to one whole-buffer conversion. The bf16 helper always emits
+    // two bytes per value, so the row-split path is only valid for a 2-byte A.
+    if a_bytes == 2 {
+        crate::parallel::for_each_row(&mut packed[..real_bytes], k * 2, |r, dst| {
+            let src = r * k;
+            npum_format::bf16::f32_to_bf16_bytes(&a[src..src + k], dst);
+        });
+    } else {
+        npum_format::bf16::f32_to_bf16_bytes(&a[..n_real * k], &mut packed[..real_bytes]);
+    }
     // The padded tail is a padded ROW: zero it so a stale row from a
     // previous dispatch cannot be mistaken for a real position.
     if total > real_bytes {
@@ -384,6 +394,8 @@ pub(crate) fn read_dispatched<T: Transport>(
     }
     design.read(2, &mut c_packed[..c_need])?;
 
+    let row_bytes = n * dp.c_bytes;
+    let c = &c_packed[..c_need];
     match bias {
         None => {
             // NO BIAS: widen straight into the output's final place. The old
@@ -392,13 +404,10 @@ pub(crate) fn read_dispatched<T: Transport>(
             // helper already writes f32 values in order, so handing it the
             // destination slice removes the intermediate copy entirely. The
             // `row` scratch is left untouched (and need not even be sized).
-            for r in 0..n_real {
-                let src = r * n * dp.c_bytes;
-                npum_format::bf16::bf16_to_f32_bytes(
-                    &c_packed[src..src + n * dp.c_bytes],
-                    &mut out[r * n..r * n + n],
-                );
-            }
+            crate::parallel::for_each_row(&mut out[..n_real * n], n, |r, dst| {
+                let src = r * row_bytes;
+                npum_format::bf16::bf16_to_f32_bytes(&c[src..src + row_bytes], dst);
+            });
         }
         Some(bias) => {
             // BIAS: widen straight into the output with the bias added, in one
@@ -406,14 +415,10 @@ pub(crate) fn read_dispatched<T: Transport>(
             // row again for the add -- two visits to every output value. The
             // fused helper writes the final f32 value in one visit, so the
             // scratch row is gone from this path entirely.
-            for r in 0..n_real {
-                let src = r * n * dp.c_bytes;
-                npum_format::bf16::bf16_to_f32_add_bias_bytes(
-                    &c_packed[src..src + n * dp.c_bytes],
-                    &mut out[r * n..r * n + n],
-                    bias,
-                );
-            }
+            crate::parallel::for_each_row(&mut out[..n_real * n], n, |r, dst| {
+                let src = r * row_bytes;
+                npum_format::bf16::bf16_to_f32_add_bias_bytes(&c[src..src + row_bytes], dst, bias);
+            });
         }
     }
     Ok(())

@@ -561,7 +561,7 @@ fn build_state(
                 state.model_id
             );
             state.not_found = "this model serves /v1/embeddings. `npuembeddings serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
-            state.encoder = Some(encoder);
+            state.encoder = Some(std::sync::Arc::new(encoder));
         }
         Err(reason) => {
             eprintln!("error: {reason}");

@@ -653,24 +653,31 @@ pub fn run<T: Transport>(
                     &mut attn.scratch.scores,
                 )?;
 
-                // Mask and softmax. The two loops stay in the same order as
-                // before: add the real keys' mask, then pin the padding cols.
-                for i in 0..n {
-                    let row = &mut attn.scratch.scores[i * n_kv..(i + 1) * n_kv];
-                    for (score, m) in row[..seq].iter_mut().zip(&mk[..seq]) {
-                        *score += *m;
-                    }
-                    row[seq..].fill(-1.0e30);
-                }
+                // Mask and softmax. Each score row is independent, so the
+                // host work is split across the pool when the panel is large
+                // enough to pay for it. The per-row order is unchanged: add
+                // the real keys' mask, pin the padding columns, then (on the
+                // host path) normalise -- so the exp/sum order the numerics gate
+                // pins is identical to the serial loop.
                 match softmax.as_deref_mut() {
-                    Some(softmax) => softmax
-                        .attention_softmax(&mut attn.scratch.scores[..n * n_kv], n)
-                        .map_err(|e| ArrayError::Design(e.to_string()))?,
-                    None => {
-                        for i in 0..n {
-                            host_softmax_row(&mut attn.scratch.scores[i * n_kv..(i + 1) * n_kv]);
-                        }
+                    Some(softmax) => {
+                        crate::parallel::for_each_row(
+                            &mut attn.scratch.scores[..n * n_kv],
+                            n_kv,
+                            |_i, row| mask_row(row, mk, seq),
+                        );
+                        softmax
+                            .attention_softmax(&mut attn.scratch.scores[..n * n_kv], n)
+                            .map_err(|e| ArrayError::Design(e.to_string()))?;
                     }
+                    None => crate::parallel::for_each_row(
+                        &mut attn.scratch.scores[..n * n_kv],
+                        n_kv,
+                        |_i, row| {
+                            mask_row(row, mk, seq);
+                            host_softmax_row(row);
+                        },
+                    ),
                 }
                 attn.qk_seconds += t0.elapsed().as_secs_f64();
                 attn.dispatches += 1;
@@ -785,13 +792,16 @@ fn read_gemm_f32<T: Transport>(
         c_packed.resize(c_need, 0);
     }
     design.read(2, &mut c_packed[..c_need])?;
-    for r in 0..n_real {
-        let src = r * n * dp.c_bytes;
-        npum_format::bf16::bf16_to_f32_bytes(
-            &c_packed[src..src + n * dp.c_bytes],
-            &mut out[r * n..r * n + n],
-        );
-    }
+    // Widening is row-local: each output row is decoded straight into its
+    // final place. Splitting the rows keeps the byte order (and therefore the
+    // numerics) identical to the serial loop while using the host cores that
+    // would otherwise idle behind the device's readback.
+    let bytes_per_row = n * dp.c_bytes;
+    let c = &c_packed[..c_need];
+    crate::parallel::for_each_row(&mut out[..n_real * n], n, |r, dst| {
+        let src = r * bytes_per_row;
+        npum_format::bf16::bf16_to_f32_bytes(&c[src..src + bytes_per_row], dst);
+    });
     Ok(())
 }
 
@@ -1010,11 +1020,12 @@ fn fill_v_panel(
         row.fill(0.0);
     }
     let v_base = 2 * hidden + head * head_dim;
-    for j in 0..seq {
+    // Each value row is disjoint, so the copies can be split across the host
+    // pool. The padding zeroed above is outside the row slice written here.
+    crate::parallel::for_each_row(&mut m[..seq * ctx_cols], ctx_cols, |j, row| {
         let src = j * 3 * hidden + v_base;
-        let dst = j * ctx_cols;
-        m[dst..dst + head_dim].copy_from_slice(&qkv[src..src + head_dim]);
-    }
+        row[..head_dim].copy_from_slice(&qkv[src..src + head_dim]);
+    });
 }
 
 /// The panel, in the MMAC's byte order, written into reused buffers.
@@ -1057,6 +1068,19 @@ fn tile_into(
         npum_format::tiling::TileOrder::Kn,
     )
     .map_err(|e| ArrayError::Design(format!("the attention's panel: {e}")))
+}
+
+/// Apply the attention mask to one score row.
+///
+/// Split out of the row loop so the same per-row work can be run in parallel
+/// by the host work pool; the order of operations inside the row is exactly
+/// the one the serial loop used.
+#[inline]
+fn mask_row(row: &mut [f32], mask: &[f32], seq: usize) {
+    for (score, m) in row[..seq].iter_mut().zip(&mask[..seq]) {
+        *score += *m;
+    }
+    row[seq..].fill(-1.0e30);
 }
 
 /// The softmax over one score row, on the host.

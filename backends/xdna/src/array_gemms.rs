@@ -112,6 +112,12 @@ struct Panel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmTicket(pub usize);
 
+/// The key of a validated projection in the resolve cache.
+///
+/// Everything the design's resolution reads is either fixed after `open` or
+/// named here, so a hit needs no re-validation.
+type ResolvedKey = (String, usize, usize, usize, usize, usize, usize);
+
 /// A submitted run and the A slot it owns until it is completed.
 struct Outstanding {
     dispatch: GemmDispatch,
@@ -162,6 +168,14 @@ pub struct ArrayGemms<T: Transport> {
     /// resolving them into a fresh `Vec` each call would allocate in the
     /// inference loop. The buffer is cleared and refilled in place.
     resolved_buf: Vec<ResolvedGemm>,
+    /// Validated projections, keyed by everything that can affect the result.
+    ///
+    /// The panels and the design are fixed after `open`, so `resolve` is a
+    /// pure function of its arguments. A transformer resolves the same few
+    /// projections every layer and every step; remembering the first result
+    /// takes the validation, tier search and `check_fit` off the steady-state
+    /// path. Errors are never cached -- only successful resolutions are.
+    resolved_cache: HashMap<ResolvedKey, ResolvedGemm>,
 }
 
 impl<T: Transport> ArrayGemms<T> {
@@ -297,6 +311,7 @@ impl<T: Transport> ArrayGemms<T> {
             outstanding: Vec::new(),
             slot_busy: [false; 2],
             resolved_buf: Vec::new(),
+            resolved_cache: HashMap::new(),
         })
     }
 
@@ -314,7 +329,7 @@ impl<T: Transport> ArrayGemms<T> {
     /// submission.
     #[allow(clippy::too_many_arguments)]
     fn resolve(
-        &self,
+        &mut self,
         weight: &str,
         a_len: usize,
         rows: usize,
@@ -323,6 +338,13 @@ impl<T: Transport> ArrayGemms<T> {
         bias: Option<&[f32]>,
         out_len: usize,
     ) -> Result<ResolvedGemm, DesignError> {
+        // Everything this function reads is fixed after `open` (the panels and
+        // the design) or is in the key, so a successful resolution is reusable.
+        let bias_len = bias.map_or(0, |b| b.len());
+        let key = (weight.to_owned(), a_len, rows, k, n, bias_len, out_len);
+        if let Some(hit) = self.resolved_cache.get(&key) {
+            return Ok(*hit);
+        }
         let panel = self.panels.get(weight).ok_or_else(|| {
             DesignError::Design(format!(
                 "the array has no panel for {weight}. The projection was not staged, and a \
@@ -368,7 +390,7 @@ impl<T: Transport> ArrayGemms<T> {
 
         let dp = Datapath::of(&self.design)?;
         check_fit(&self.design, tier_rows, k, n, dp)?;
-        Ok(ResolvedGemm {
+        let resolved = ResolvedGemm {
             weight_slot: panel.slot,
             instr,
             tier_rows,
@@ -376,7 +398,9 @@ impl<T: Transport> ArrayGemms<T> {
             rows,
             k,
             n,
-        })
+        };
+        self.resolved_cache.insert(key, resolved);
+        Ok(resolved)
     }
 
     /// Submit one projection to the array WITHOUT waiting for it.
@@ -928,6 +952,7 @@ mod async_tests {
                 outstanding: Vec::new(),
                 slot_busy: [false; 2],
                 resolved_buf: Vec::new(),
+                resolved_cache: HashMap::new(),
             },
             log,
         )

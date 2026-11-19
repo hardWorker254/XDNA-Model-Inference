@@ -49,6 +49,7 @@ pub mod eltwise;
 pub mod gemm;
 pub mod geometry;
 pub mod manifest;
+pub mod parallel;
 pub mod transport;
 
 // The direct transport is compiled WHATEVER the build has: it needs no XRT

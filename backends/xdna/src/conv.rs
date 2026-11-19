@@ -132,6 +132,8 @@ pub struct ConvScratch {
     a_packed: Vec<u8>,
     /// The padded C operand, in f32.
     c: Vec<f32>,
+    /// The bias widened to the design's padded width, reused across calls.
+    padded_bias: Vec<f32>,
     /// Read-back and widening buffers for each dispatch.
     gemm: GemmScratch,
     /// The conversion's own time, in seconds.
@@ -151,6 +153,7 @@ impl ConvScratch {
         Self {
             a_packed: vec![0u8; rows * k * 2],
             c: Vec::new(),
+            padded_bias: Vec::new(),
             gemm: GemmScratch::new(),
             convert_seconds: 0.0,
         }
@@ -220,15 +223,18 @@ fn pack_chunk(
         // a row's values are contiguous on both sides, and the columns past
         // the convolution's own K are zeros.
         let pad_values = (row_bytes - shape.k * 2) / 2;
-        for r in 0..chunk {
-            let src = (done + r) * shape.k;
-            let dst = r * row_bytes;
-            npum_format::bf16::f32_to_bf16_bytes_padded(
-                &a[src..src + shape.k],
-                &mut scratch.a_packed[dst..dst + row_bytes],
-                pad_values,
-            );
-        }
+        crate::parallel::for_each_row(
+            &mut scratch.a_packed[..chunk * row_bytes],
+            row_bytes,
+            |r, dst| {
+                let src = (done + r) * shape.k;
+                npum_format::bf16::f32_to_bf16_bytes_padded(
+                    &a[src..src + shape.k],
+                    dst,
+                    pad_values,
+                );
+            },
+        );
     }
     scratch.convert_seconds += t_convert.elapsed().as_secs_f64();
 }
@@ -315,8 +321,12 @@ pub fn conv<T: Transport>(
     //
     // The design's output has `padded_n` columns and the convolution has
     // `n` channels; the tail is zero, which is exact.
+    // The padded bias buffer is taken from the reusable scratch instead of
+    // allocated per convolution; it is handed back at the end of the run.
     let padded_bias: Option<Vec<f32>> = bias.map(|bias| {
-        let mut padded = vec![0f32; shape.padded_n];
+        let mut padded = std::mem::take(&mut scratch.padded_bias);
+        padded.resize(shape.padded_n, 0.0);
+        padded.fill(0.0);
         padded[..shape.n].copy_from_slice(bias);
         padded
     });
@@ -465,6 +475,11 @@ pub fn conv<T: Transport>(
     // Leave both bindings on slot 0 for the next op.
     design.bind(0, 0)?;
     design.bind(2, 0)?;
+
+    // Return the padded-bias buffer to the scratch for the next convolution.
+    if let Some(padded) = padded_bias {
+        scratch.padded_bias = padded;
+    }
 
     Ok(dispatches)
 }

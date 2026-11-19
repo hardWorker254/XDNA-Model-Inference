@@ -552,17 +552,22 @@ impl Embedder {
             (self.vulkan_ops, self.vulkan.as_ref())
         {
             // OPEN ONCE. Every later request reuses the same device context
-            // instead of paying Vulkan setup again, and the lock keeps one
-            // request at a time on it.
-            let mut guard = shared.lock().expect("the Vulkan device mutex was poisoned");
-            let ops = guard.get_or_insert_with(|| {
-                npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm)
-            });
-            if !ops.has_gpu() {
-                return Err(
-                    "no Vulkan device was opened on this machine for --vk-ops/--backend vulkan"
-                        .to_string(),
-                );
+            // instead of paying Vulkan setup again. The open/check is a short
+            // critical section; below, the lock is taken PER BATCH so a second
+            // request can slip in between this one's batches instead of
+            // waiting for the whole request to finish. The device is still
+            // touched by only one thread at a time.
+            {
+                let mut guard = shared.lock().expect("the Vulkan device mutex was poisoned");
+                let ops = guard.get_or_insert_with(|| {
+                    npum_vulkan::ops::VulkanOps::with_ops(gemm, layn, gelu, softm)
+                });
+                if !ops.has_gpu() {
+                    return Err(
+                        "no Vulkan device was opened on this machine for --vk-ops/--backend vulkan"
+                            .to_string(),
+                    );
+                }
             }
             while offset < texts.len() {
                 let batch = (texts.len() - offset).min(BATCH);
@@ -570,6 +575,10 @@ impl Embedder {
                 let end = (offset + batch) * self.seq;
                 let ids = &all_ids[start..end];
                 let mask = &all_mask[start..end];
+                let mut guard = shared.lock().expect("the Vulkan device mutex was poisoned");
+                let ops = guard
+                    .as_mut()
+                    .expect("the Vulkan device was opened above and is never removed");
                 self.with_bert_slot(|(workspace, flat)| {
                     match &self.model {
                         EmbedModel::Bert(model) => {

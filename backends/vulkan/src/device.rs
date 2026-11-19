@@ -51,6 +51,8 @@ const STORAGE_BINDINGS: u32 = 5;
 pub struct Buf {
     buf: vk::Buffer,
     mem: vk::DeviceMemory,
+    /// The requested size, used to return the buffer to the right pool bucket.
+    size: u64,
 }
 
 /// An open Vulkan device with a compute queue.
@@ -69,6 +71,15 @@ pub struct Gpu {
     pipelines: HashMap<&'static str, vk::Pipeline>,
     /// A valid one-word buffer for the bindings a shader does not use.
     dummy: Buf,
+    /// The 16-byte uniform block, reused for every dispatch.
+    uniform: Buf,
+    /// One descriptor pool and set, reused for every dispatch.
+    desc_pool: vk::DescriptorPool,
+    desc_set: vk::DescriptorSet,
+    /// Retired buffers, bucketed by size, for reuse by the next op.
+    pool: HashMap<u64, Vec<Buf>>,
+    /// Reusable host staging for the GEMM bias epilogue, padded to `n`.
+    bias_scratch: Vec<f32>,
     name: String,
 }
 
@@ -149,12 +160,24 @@ impl Gpu {
                     pipeline_layout: rest.pipeline_layout,
                     pipelines: rest.pipelines,
                     dummy: rest.dummy,
+                    uniform: Buf {
+                        buf: vk::Buffer::null(),
+                        mem: vk::DeviceMemory::null(),
+                        size: 0,
+                    },
+                    desc_pool: rest.desc_pool,
+                    desc_set: rest.desc_set,
+                    pool: HashMap::new(),
+                    bias_scratch: Vec::new(),
                     name,
                 };
-                // The dummy buffer is what a shader's unused bindings point
-                // at. It is made here and not in `build_inner` because it
-                // needs the memory properties, which need the whole struct.
+                // The dummy and uniform buffers are what a shader's unused
+                // bindings and its parameters point at. They are made here and
+                // not in `build_inner` because they need the memory properties,
+                // which need the whole struct. Both live for the device's whole
+                // lifetime, so a dispatch never creates or destroys them.
                 gpu.dummy = gpu.make(4)?;
+                gpu.uniform = gpu.make(16)?;
                 Ok(gpu)
             }
             Err(e) => {
@@ -229,6 +252,34 @@ impl Gpu {
         }
         .map_err(|e| format!("cannot create a pipeline layout: {e}"))?;
 
+        // ONE pool and ONE set for the device's whole life: a dispatch only
+        // rewrites the descriptors in the set. Creating and destroying a pool
+        // per dispatch was the largest per-op allocation in the old path.
+        let desc_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(STORAGE_BINDINGS),
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1),
+                    ]),
+                None,
+            )
+        }
+        .map_err(|e| format!("cannot create a descriptor pool: {e}"))?;
+        let desc_set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(desc_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(|e| format!("cannot allocate a descriptor set: {e}"))?[0];
+
         Ok(GpuRest {
             device,
             queue,
@@ -241,7 +292,10 @@ impl Gpu {
             dummy: Buf {
                 buf: vk::Buffer::null(),
                 mem: vk::DeviceMemory::null(),
+                size: 0,
             },
+            desc_pool,
+            desc_set,
         })
     }
 
@@ -253,8 +307,9 @@ impl Gpu {
     /// A buffer of `len` f32, host visible.
     fn make(&self, bytes: u64) -> Result<Buf, String> {
         unsafe {
+            let size = bytes.max(4);
             let create = vk::BufferCreateInfo::default()
-                .size(bytes.max(4))
+                .size(size)
                 .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buf = self
@@ -286,8 +341,26 @@ impl Gpu {
             self.device
                 .bind_buffer_memory(buf, mem, 0)
                 .map_err(|e| format!("cannot bind memory: {e}"))?;
-            Ok(Buf { buf, mem })
+            Ok(Buf { buf, mem, size })
         }
+    }
+
+    /// Take a buffer of at least `bytes` from the pool, or make a new one.
+    ///
+    /// The pool is keyed by the exact requested size, so a buffer is never
+    /// exposed to a shader with more memory than the op asked for (all buffer
+    /// descriptors use `WHOLE_SIZE`).
+    fn acquire(&mut self, bytes: u64) -> Result<Buf, String> {
+        let key = bytes.max(4);
+        if let Some(buf) = self.pool.get_mut(&key).and_then(Vec::pop) {
+            return Ok(buf);
+        }
+        self.make(key)
+    }
+
+    /// Return a buffer to the pool for the next op to reuse.
+    fn release(&mut self, buf: Buf) {
+        self.pool.entry(buf.size).or_default().push(buf);
     }
 
     /// Write f32 values into a buffer.
@@ -325,6 +398,26 @@ impl Gpu {
             self.device.unmap_memory(b.mem);
         }
         Ok(out)
+    }
+
+    /// Read f32 values back directly into the caller's slice.
+    ///
+    /// The old in-place ops read into a temporary `Vec` and then copied it
+    /// into the caller. Mapping straight into the destination removes both
+    /// the allocation and the copy.
+    fn read_into(&self, b: &Buf, out: &mut [f32]) -> Result<(), String> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(b.mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("cannot map a buffer: {e}"))?;
+            std::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr() as *mut u8, out.len() * 4);
+            self.device.unmap_memory(b.mem);
+        }
+        Ok(())
     }
 
     /// Free a buffer and its memory.
@@ -384,51 +477,29 @@ impl Gpu {
         if groups.0 == 0 || groups.1 == 0 || groups.2 == 0 {
             return Ok(());
         }
+        // The uniform block is a persistent buffer; rewrite only the four
+        // parameter words. The old path allocated and freed one per dispatch.
+        let words: [u32; 4] = params;
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, 16) };
         unsafe {
-            let uniform = self.make(16)?;
-            let words: [u32; 4] = params;
-            let bytes: &[u8] = std::slice::from_raw_parts(words.as_ptr() as *const u8, 16);
-            {
-                let ptr = self
-                    .device
-                    .map_memory(uniform.mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                    .map_err(|e| format!("cannot map the uniform buffer: {e}"))?;
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, 16);
-                self.device.unmap_memory(uniform.mem);
-            }
+            let ptr = self
+                .device
+                .map_memory(self.uniform.mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("cannot map the uniform buffer: {e}"))?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, 16);
+            self.device.unmap_memory(self.uniform.mem);
 
-            let pool = self
-                .device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&[
-                            vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                                .descriptor_count(STORAGE_BINDINGS),
-                            vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                                .descriptor_count(1),
-                        ]),
-                    None,
-                )
-                .map_err(|e| format!("cannot create a descriptor pool: {e}"))?;
-            let layouts = [self.set_layout];
-            let set = self
-                .device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )
-                .map_err(|e| format!("cannot allocate a descriptor set: {e}"))?[0];
+            // The descriptor pool and set are also persistent. Updating the
+            // set in place is legal because the previous dispatch's fence was
+            // waited on before this call returned.
+            let set = self.desc_set;
 
             // Two passes: the `DescriptorBufferInfo`s have to be in place
             // (and not reallocated) before the writes point at them.
-            let mut infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+            let mut infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(STORAGE_BINDINGS as usize + 1);
             for binding in 0..=UNIFORM_BINDING {
                 let buffer = if binding == UNIFORM_BINDING {
-                    uniform.buf
+                    self.uniform.buf
                 } else {
                     storage
                         .get(binding as usize)
@@ -510,9 +581,6 @@ impl Gpu {
             self.device
                 .reset_fences(&[self.fence])
                 .map_err(|e| format!("cannot reset the fence: {e}"))?;
-
-            self.device.destroy_descriptor_pool(pool, None);
-            self.free(&uniform);
         }
         Ok(())
     }
@@ -526,39 +594,78 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>, String> {
-        let ab = self.make((a.len() * 4) as u64)?;
-        let bb = self.make((b.len() * 4) as u64)?;
-        let cb = self.make((m * n * 4) as u64)?;
+        self.gemm_with_bias(a, b, None, m, k, n)
+    }
+
+    /// `c = a * b + bias[col]`, with the bias added in the shader epilogue.
+    ///
+    /// The host seam used to read the whole `m x n` result back and add the
+    /// bias in a second pass over every output value. Adding it here keeps the
+    /// result on the device and removes that pass; the addition is after the
+    /// full reduction and in the same order as the host's `value += bias[col]`.
+    pub fn gemm_with_bias(
+        &mut self,
+        a: &[f32],
+        b: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        let ab = self.acquire((a.len() * 4) as u64)?;
+        let bb = self.acquire((b.len() * 4) as u64)?;
+        let cb = self.acquire((m * n * 4) as u64)?;
+        let bias_buf = bias.map(|_| self.acquire((n * 4) as u64)).transpose()?;
         self.write(&ab, a)?;
         self.write(&bb, b)?;
+        if let (Some(values), Some(buf)) = (bias, bias_buf.as_ref()) {
+            // `values.len() == n` is checked by the caller. Pad defensively so
+            // the shader can always read `bias[col]` for a real column.
+            self.bias_scratch.resize(n, 0.0);
+            self.bias_scratch.fill(0.0);
+            self.bias_scratch[..values.len().min(n)]
+                .copy_from_slice(&values[..values.len().min(n)]);
+            self.write(buf, &self.bias_scratch)?;
+        }
+
+        let mut storage: Vec<&Buf> = vec![&ab, &bb, &cb];
+        if let Some(buf) = bias_buf.as_ref() {
+            storage.push(buf);
+        }
         let result = self
             .run(
                 "gemm",
-                &[&ab, &bb, &cb],
-                [m as u32, k as u32, n as u32, 0],
+                &storage,
+                [
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    u32::from(bias_buf.is_some()),
+                ],
                 ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1),
             )
             .and_then(|()| self.read(&cb, m * n));
-        self.free(&ab);
-        self.free(&bb);
-        self.free(&cb);
+        self.release(ab);
+        self.release(bb);
+        self.release(cb);
+        if let Some(buf) = bias_buf {
+            self.release(buf);
+        }
         result
     }
 
     /// GELU, in place.
     pub fn gelu(&mut self, x: &mut [f32]) -> Result<(), String> {
-        let xb = self.make((x.len() * 4) as u64)?;
+        let xb = self.acquire((x.len() * 4) as u64)?;
         self.write(&xb, x)?;
-        let result = self
-            .run(
-                "gelu",
-                &[&xb],
-                [x.len() as u32, 0, 0, 0],
-                ((x.len() as u32).div_ceil(64), 1, 1),
-            )
-            .and_then(|()| self.read(&xb, x.len()));
-        self.free(&xb);
-        x.copy_from_slice(&result?);
+        self.run(
+            "gelu",
+            &[&xb],
+            [x.len() as u32, 0, 0, 0],
+            ((x.len() as u32).div_ceil(64), 1, 1),
+        )?;
+        self.read_into(&xb, x)?;
+        self.release(xb);
         Ok(())
     }
 
@@ -571,46 +678,42 @@ impl Gpu {
         gamma: Option<&[f32]>,
         beta: Option<&[f32]>,
     ) -> Result<(), String> {
-        let xb = self.make((x.len() * 4) as u64)?;
-        let gb = self.make((gamma.map_or(1, |g| g.len()) * 4) as u64)?;
-        let bb = self.make((beta.map_or(1, |b| b.len()) * 4) as u64)?;
+        let xb = self.acquire((x.len() * 4) as u64)?;
+        let gb = self.acquire((gamma.map_or(1, |g| g.len()) * 4) as u64)?;
+        let bb = self.acquire((beta.map_or(1, |b| b.len()) * 4) as u64)?;
         self.write(&xb, x)?;
         self.write(&gb, gamma.unwrap_or(&[0.0]))?;
         self.write(&bb, beta.unwrap_or(&[0.0]))?;
-        let result = self
-            .run(
-                "layernorm",
-                &[&xb, &gb, &bb],
-                [
-                    width as u32,
-                    rows as u32,
-                    u32::from(gamma.is_some()),
-                    u32::from(beta.is_some()),
-                ],
-                (rows as u32, 1, 1),
-            )
-            .and_then(|()| self.read(&xb, x.len()));
-        self.free(&xb);
-        self.free(&gb);
-        self.free(&bb);
-        x.copy_from_slice(&result?);
+        self.run(
+            "layernorm",
+            &[&xb, &gb, &bb],
+            [
+                width as u32,
+                rows as u32,
+                u32::from(gamma.is_some()),
+                u32::from(beta.is_some()),
+            ],
+            (rows as u32, 1, 1),
+        )?;
+        self.read_into(&xb, x)?;
+        self.release(xb);
+        self.release(gb);
+        self.release(bb);
         Ok(())
     }
 
     /// Softmax over rows of `width`.
     pub fn softmax(&mut self, x: &mut [f32], rows: usize, width: usize) -> Result<(), String> {
-        let xb = self.make((x.len() * 4) as u64)?;
+        let xb = self.acquire((x.len() * 4) as u64)?;
         self.write(&xb, x)?;
-        let result = self
-            .run(
-                "softmax",
-                &[&xb],
-                [width as u32, rows as u32, 0, 0],
-                (rows as u32, 1, 1),
-            )
-            .and_then(|()| self.read(&xb, x.len()));
-        self.free(&xb);
-        x.copy_from_slice(&result?);
+        self.run(
+            "softmax",
+            &[&xb],
+            [width as u32, rows as u32, 0, 0],
+            (rows as u32, 1, 1),
+        )?;
+        self.read_into(&xb, x)?;
+        self.release(xb);
         Ok(())
     }
 
@@ -624,10 +727,10 @@ impl Gpu {
     ) -> Result<Vec<f32>, String> {
         let q_len = q.len() / d;
         let kv_len = k.len() / d;
-        let qb = self.make((q.len() * 4) as u64)?;
-        let kb = self.make((k.len() * 4) as u64)?;
-        let vb = self.make((v.len() * 4) as u64)?;
-        let ob = self.make((q.len() * 4) as u64)?;
+        let qb = self.acquire((q.len() * 4) as u64)?;
+        let kb = self.acquire((k.len() * 4) as u64)?;
+        let vb = self.acquire((v.len() * 4) as u64)?;
+        let ob = self.acquire((q.len() * 4) as u64)?;
         self.write(&qb, q)?;
         self.write(&kb, k)?;
         self.write(&vb, v)?;
@@ -639,18 +742,18 @@ impl Gpu {
                 ((q_len as u32).div_ceil(64), 1, 1),
             )
             .and_then(|()| self.read(&ob, q.len()));
-        self.free(&qb);
-        self.free(&kb);
-        self.free(&vb);
-        self.free(&ob);
+        self.release(qb);
+        self.release(kb);
+        self.release(vb);
+        self.release(ob);
         result
     }
 
     /// `z = x + y`.
     pub fn add(&mut self, x: &[f32], y: &[f32]) -> Result<Vec<f32>, String> {
-        let xb = self.make((x.len() * 4) as u64)?;
-        let yb = self.make((y.len() * 4) as u64)?;
-        let zb = self.make((x.len() * 4) as u64)?;
+        let xb = self.acquire((x.len() * 4) as u64)?;
+        let yb = self.acquire((y.len() * 4) as u64)?;
+        let zb = self.acquire((x.len() * 4) as u64)?;
         self.write(&xb, x)?;
         self.write(&yb, y)?;
         let result = self
@@ -661,9 +764,9 @@ impl Gpu {
                 ((x.len() as u32).div_ceil(64), 1, 1),
             )
             .and_then(|()| self.read(&zb, x.len()));
-        self.free(&xb);
-        self.free(&yb);
-        self.free(&zb);
+        self.release(xb);
+        self.release(yb);
+        self.release(zb);
         result
     }
 }
@@ -679,6 +782,8 @@ struct GpuRest {
     pipeline_layout: vk::PipelineLayout,
     pipelines: HashMap<&'static str, vk::Pipeline>,
     dummy: Buf,
+    desc_pool: vk::DescriptorPool,
+    desc_set: vk::DescriptorSet,
 }
 
 impl Drop for Gpu {
@@ -688,6 +793,13 @@ impl Drop for Gpu {
                 self.device.destroy_pipeline(p, None);
             }
             self.free(&self.dummy);
+            self.free(&self.uniform);
+            // Return every pooled allocation before the device goes away.
+            let retired: Vec<Buf> = self.pool.drain().flat_map(|(_, v)| v).collect();
+            for b in &retired {
+                self.free(b);
+            }
+            self.device.destroy_descriptor_pool(self.desc_pool, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device

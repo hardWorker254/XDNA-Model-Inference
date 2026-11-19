@@ -29,6 +29,30 @@ fn values(count: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
+/// How many independent timing trials each shape gets. The machine is
+/// shared and frequencies move; a median over trials is far steadier than
+/// one long run.
+const TRIALS: usize = 5;
+
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs[xs.len() / 2]
+}
+
+fn time_ms(mut f: impl FnMut()) -> f64 {
+    let t0 = Instant::now();
+    f();
+    t0.elapsed().as_secs_f64() * 1e3
+}
+
+fn fmt_ms(ms: f64) -> String {
+    if ms < 0.01 {
+        format!("{:.1} us", ms * 1e3)
+    } else {
+        format!("{ms:8.3} ms")
+    }
+}
+
 fn bench(name: &str, m: usize, k: usize, n: usize, reps: usize) {
     let a = values(m * k, 0x1234_5678);
     let b = values(k * n, 0x9abc_def0);
@@ -40,42 +64,49 @@ fn bench(name: &str, m: usize, k: usize, n: usize, reps: usize) {
         gemm_nt(&a, m, &b, k, n, &bias, &mut out);
     }
 
-    let t0 = Instant::now();
-    for _ in 0..reps {
-        black_box(gemm_nt(
-            black_box(&a),
-            m,
-            black_box(&b),
-            k,
-            n,
-            &bias,
-            black_box(&mut out),
-        ));
+    let mut serial_trials = Vec::with_capacity(TRIALS);
+    let mut pooled_trials = Vec::with_capacity(TRIALS);
+    for _ in 0..TRIALS {
+        serial_trials.push(time_ms(|| {
+            for _ in 0..reps {
+                black_box(gemm_nt(
+                    black_box(&a),
+                    m,
+                    black_box(&b),
+                    k,
+                    n,
+                    &bias,
+                    black_box(&mut out),
+                ));
+            }
+        }) / reps as f64);
+        pooled_trials.push(time_ms(|| {
+            for _ in 0..reps {
+                gemm_nt_rows(
+                    black_box(&a),
+                    m,
+                    black_box(&b),
+                    k,
+                    n,
+                    &bias,
+                    black_box(&mut out),
+                    parallel::threads(),
+                );
+            }
+        }) / reps as f64);
     }
-    let serial = t0.elapsed().as_secs_f64() / reps as f64;
+    let serial = median(serial_trials);
+    let pooled = median(pooled_trials);
 
-    let t0 = Instant::now();
-    for _ in 0..reps {
-        gemm_nt_rows(
-            black_box(&a),
-            m,
-            black_box(&b),
-            k,
-            n,
-            &bias,
-            black_box(&mut out),
-            parallel::threads(),
-        );
-    }
-    let pooled = t0.elapsed().as_secs_f64() / reps as f64;
-
-    let gflops = 2.0 * (m * k * n) as f64 / 1e9;
+    // 2 FLOPs per multiply-add, in GFLOP; time is in ms.
+    let gflops = 2.0 * (m * k * n) as f64 / 1e6;
     println!(
-        "{name:<24} M={m:<5} K={k:<5} N={n:<5}  serial {:>8.3} ms ({:>7.1} GFLOP/s)   pooled {:>8.3} ms ({:>7.1} GFLOP/s)",
-        serial * 1e3,
+        "{name:<22} M={m:<5} K={k:<5} N={n:<5}  serial {:>12} ({:>6.1} GF/s)   pooled {:>12} ({:>6.1} GF/s)  x{:.2}",
+        fmt_ms(serial),
         gflops / serial,
-        pooled * 1e3,
+        fmt_ms(pooled),
         gflops / pooled,
+        serial / pooled.max(1e-12),
     );
 }
 

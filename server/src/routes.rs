@@ -32,6 +32,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// What the server knows about the model it is serving.
@@ -54,7 +55,11 @@ pub struct ServerState {
     /// The message a path this family does not answer gets.
     pub not_found: String,
     /// The embedding endpoint's engine, for the text family.
-    pub encoder: Option<crate::Embedder>,
+    ///
+    /// An `Arc`, like the other three engines, so a request can clone a cheap
+    /// handle into `spawn_blocking` instead of blocking a Tokio worker (and
+    /// without deep-copying the model's weights on every request).
+    pub encoder: Option<Arc<crate::Embedder>>,
     /// The speech endpoint's engine, for the speech family.
     pub transcriber: Option<Arc<crate::Transcriber>>,
     /// The classifier endpoint's engine, for the image family.
@@ -148,22 +153,29 @@ pub fn json_escape(text: &str) -> String {
 /// below -4 or at least the precision, the fixed form otherwise, and the
 /// trailing zeros removed in both.
 pub fn format_g(value: f32, precision: usize) -> String {
+    let mut out = String::with_capacity(precision + 8);
+    format_g_into(&mut out, value, precision);
+    out
+}
+
+/// The same `%.7g`, written straight into an existing buffer.
+///
+/// The embeddings response formats one number per dimension, so allocating a
+/// fresh `String` for every float (and concatenating it into the body) used to
+/// create one temporary allocation per value. Writing into the response buffer
+/// keeps the bytes identical while removing those temporaries.
+fn format_g_into(out: &mut String, value: f32, precision: usize) {
     if value.is_nan() {
-        return if value.is_sign_negative() {
-            "-nan".to_string()
-        } else {
-            "nan".to_string()
-        };
+        out.push_str(if value.is_sign_negative() { "-nan" } else { "nan" });
+        return;
     }
     if value.is_infinite() {
-        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
+        out.push_str(if value < 0.0 { "-inf" } else { "inf" });
+        return;
     }
     if value == 0.0 {
-        return if value.is_sign_negative() {
-            "-0".to_string()
-        } else {
-            "0".to_string()
-        };
+        out.push_str(if value.is_sign_negative() { "-0" } else { "0" });
+        return;
     }
     let exponent = value.abs().log10().floor() as i32;
     if exponent < -4 || exponent >= precision as i32 {
@@ -175,29 +187,30 @@ pub fn format_g(value: f32, precision: usize) -> String {
         let text = format!("{:.*e}", precision - 1, value);
         if let Some((mantissa, exp)) = text.split_once('e') {
             if let Ok(exp) = exp.parse::<i32>() {
-                return format!(
+                let _ = write!(
+                    out,
                     "{}e{}{:02}",
                     trim_zeros(mantissa),
                     if exp < 0 { '-' } else { '+' },
                     exp.abs()
                 );
+                return;
             }
         }
-        text
+        out.push_str(&text);
     } else {
         let decimals = (precision as i32 - 1 - exponent).max(0) as usize;
-        trim_zeros(&format!("{value:.decimals$}"))
+        out.push_str(&trim_zeros(&format!("{value:.decimals$}")));
     }
 }
 
 /// The trailing zeros of a decimal, and the point that follows them.
-fn trim_zeros(text: &str) -> String {
+fn trim_zeros(text: &str) -> &str {
     if !text.contains('.') {
-        return text.to_string();
+        return text;
     }
     let trimmed = text.trim_end_matches('0');
-    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
-    trimmed.to_string()
+    trimmed.strip_suffix('.').unwrap_or(trimmed)
 }
 
 /// `GET /health`.
@@ -290,19 +303,46 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
             ),
         );
     }
-    match encoder.embed(&texts) {
+    // The embedding forward pass is CPU-bound (or waits on a device) for the
+    // whole batch loop. Running it on the async worker would stall every other
+    // request on that worker, so hand it to the blocking pool exactly as the
+    // classify/pose/transcription routes do. `encoder` is an `Arc`, so the
+    // clone is a refcount bump, not a copy of the model's weights.
+    let engine = encoder.clone();
+    let outcome = tokio::task::spawn_blocking(move || engine.embed(&texts))
+        .await
+        .unwrap_or_else(|e| Err(format!("the embedding task failed: {e}")));
+    match outcome {
         Ok((vectors, tokens)) => {
-            let mut body = String::from("{\"object\":\"list\",\"data\":[");
+            let mut bytes = Vec::<u8>::new();
+            // Reserve once for the whole response. Each float prints as at
+            // most ~14 bytes with `%.7g`, so this avoids re-growing the body
+            // on every vector/float. Base64 is 4/3 of the raw f32 bytes.
+            let floats = vectors.iter().map(Vec::len).sum::<usize>();
+            let estimate = if format == "base64" {
+                floats * 4 + vectors.len() * 96 + state.model_id.len() + 128
+            } else {
+                floats * 15 + vectors.len() * 96 + state.model_id.len() + 128
+            };
+            let mut body = String::with_capacity(estimate);
+            body.push_str("{\"object\":\"list\",\"data\":[");
             for (r, vector) in vectors.iter().enumerate() {
                 if r > 0 {
                     body.push(',');
                 }
-                body.push_str(&format!(
+                let _ = write!(
+                    body,
                     "{{\"object\":\"embedding\",\"index\":{r},\"embedding\":"
-                ));
+                );
                 if format == "base64" {
-                    let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
                     body.push('"');
+                    // Avoid the intermediate `Vec<u8>`: write the little-endian
+                    // bytes of every float into one reusable staging buffer.
+                    bytes.clear();
+                    bytes.reserve(vector.len() * 4);
+                    for v in vector {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
                     body.push_str(&base64(&bytes));
                     body.push('"');
                 } else {
@@ -311,16 +351,17 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
                         if c > 0 {
                             body.push(',');
                         }
-                        body.push_str(&format_g(*v, 7));
+                        format_g_into(&mut body, *v, 7);
                     }
                     body.push(']');
                 }
                 body.push('}');
             }
-            body.push_str(&format!(
+            let _ = write!(
+                body,
                 "],\"model\":\"{}\",\"usage\":{{\"prompt_tokens\":{tokens},\"total_tokens\":{tokens}}}}}",
                 state.model_id
-            ));
+            );
             json(StatusCode::OK, body)
         }
         Err(reason) => json(

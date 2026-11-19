@@ -352,7 +352,14 @@ impl<T: Transport> EltwiseDesign<T> {
         let used = values.len() * 2;
         let c = self.design.info().buffers.len() - 1;
         self.design.read(c, &mut self.out_bytes[..used])?;
-        npum_format::bf16::bf16_to_f32_bytes(&self.out_bytes[..used], values);
+        // Widening is row/chunk-local and bit-exact per value. Split it across
+        // the host pool when a chunk is large; the byte order is unchanged.
+        let row_len = values.len().div_ceil(crate::parallel::threads()).max(1);
+        let bytes = &self.out_bytes[..used];
+        crate::parallel::for_each_row(values, row_len, |i, row| {
+            let src = i * row_len * 2;
+            npum_format::bf16::bf16_to_f32_bytes(&bytes[src..src + row.len() * 2], row);
+        });
         Ok(())
     }
 

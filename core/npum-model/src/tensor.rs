@@ -191,11 +191,15 @@ impl Tensor {
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
             ),
-            DType::Bf16 => out.extend(
-                self.data
-                    .chunks_exact(2)
-                    .map(|c| npum_format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
-            ),
+            DType::Bf16 => {
+                // The block helper widens the same little-endian bits with the
+                // same zero-extend-and-shift as `bf16_to_f32`, but 8 lanes at a
+                // time when AVX2 is available. Bit-identical by construction:
+                // a bf16 value IS the top half of its f32.
+                let n = self.len();
+                out.resize(n, 0.0);
+                npum_format::bf16::bf16_to_f32_bytes(&self.data, &mut out[..n]);
+            }
             DType::I32 => out.extend(
                 self.data
                     .chunks_exact(4)
