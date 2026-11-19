@@ -2122,9 +2122,10 @@ impl Network {
                 w.index
             ));
         };
+        // The transpose writes every output element, so no zero pass here.
         let mut out = Tensor {
             shape: vec![1, w.cout, oh, ow],
-            d: vec![0.0f32; (w.cout * oh * ow) as usize],
+            d: kernels::scratch_f32((w.cout * oh * ow) as usize),
         };
         let m = oh * ow;
         let k = w.cin * w.kh * w.kw;
@@ -2259,9 +2260,10 @@ impl Network {
                 w.index, w.cout, input.shape[1]
             ));
         }
+        // Every channel's plane is written in full by the tap loop below.
         let mut out = Tensor {
             shape: vec![1, w.cout, oh, ow],
-            d: vec![0.0f32; (w.cout * oh * ow) as usize],
+            d: kernels::scratch_f32((w.cout * oh * ow) as usize),
         };
         let t0 = std::time::Instant::now();
         // One filter per channel. The weight is `[Cout, 1, kh, kw]` and the

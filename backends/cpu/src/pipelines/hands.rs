@@ -2110,11 +2110,12 @@ impl Hands {
         let t = std::time::Instant::now();
         let h = input.h;
         let wd = input.w;
+        // Every channel's plane is written in full, so no zero pass is needed.
         let mut out = Tensor {
             c: layer.out_c,
             h: oh,
             w: ow,
-            d: vec![0.0f32; (layer.out_c * oh * ow) as usize],
+            d: kernels::scratch_f32((layer.out_c * oh * ow) as usize),
         };
         // Only the TOP and LEFT terms are read here: they are the offsets of
         // the gather. The bottom and right terms are checked by check_extent()

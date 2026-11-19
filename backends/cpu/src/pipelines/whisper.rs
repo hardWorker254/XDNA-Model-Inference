@@ -959,7 +959,8 @@ impl Decoder {
 /// and not the GEMM's own reduction, which walks K in order for each
 /// output. The two are different trees and the two are different numbers.
 pub fn logits_from(h: &[f32], embed_tokens: &[f32], d: usize, vocab: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; vocab];
+    // `logits_from_into` overwrites every entry, so no zero pass is needed.
+    let mut out = kernels::scratch_f32(vocab);
     logits_from_into(h, embed_tokens, d, vocab, &mut out);
     out
 }
@@ -1165,8 +1166,9 @@ pub fn attention(
     scale: f32,
     out: &mut [f32],
 ) {
-    let mut scores = vec![0.0f32; n_kv];
-    let mut acc = vec![0.0f32; head_dim];
+    // Both are overwritten in full by `attention_rows` before any read.
+    let mut scores = kernels::scratch_f32(n_kv);
+    let mut acc = kernels::scratch_f32(head_dim);
     attention_into(
         q,
         q_stride,
@@ -1220,8 +1222,8 @@ pub fn attention_into(
         parallel::for_each_chunk_mut(out, chunk * d_model, |ci, part| {
             let first = ci * chunk;
             let rows = part.len() / d_model;
-            let mut scores = vec![0.0f32; n_kv];
-            let mut acc = vec![0.0f32; head_dim];
+            let mut scores = kernels::scratch_f32(n_kv);
+            let mut acc = kernels::scratch_f32(head_dim);
             attention_rows(
                 q, q_stride, kv, kv_stride, first, rows, n_kv, d_model, 0, heads,
                 head_dim, scale, part, &mut scores, &mut acc,
@@ -1239,8 +1241,8 @@ pub fn attention_into(
             parallel::for_each_chunk_mut(row, chunk * head_dim, |hi, part| {
                 let first = hi * chunk;
                 let count = part.len() / head_dim;
-                let mut scores = vec![0.0f32; n_kv];
-                let mut acc = vec![0.0f32; head_dim];
+                let mut scores = kernels::scratch_f32(n_kv);
+                let mut acc = kernels::scratch_f32(head_dim);
                 attention_rows(
                     q, q_stride, kv, kv_stride, 0, 1, n_kv, d_model, first,
                     first + count, head_dim, scale, part, &mut scores, &mut acc,

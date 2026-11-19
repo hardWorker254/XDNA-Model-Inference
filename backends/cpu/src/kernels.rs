@@ -1625,6 +1625,30 @@ unsafe fn weighted_accumulate_avx2(acc: &mut [f32], v: &[f32], weight: f32) {
 
 // ---------------------------------------------------------------- the trait
 
+/// Allocate `len` floats for a buffer the caller will OVERWRITE COMPLETELY.
+///
+/// `vec![0.0f32; len]` pays for a zero pass on every allocation. The layers'
+/// scratch buffers are overwritten in full by a GEMM, a score row or an
+/// activation before anything reads them, so that pass is pure overhead.
+/// `f32` has no drop glue and every bit pattern is valid, so `set_len` can
+/// publish reserved capacity without initialising it.
+///
+/// # Safety contract
+///
+/// The caller MUST write every element before reading any of them. Reading
+/// an unwritten element is undefined behaviour, not a zero. Buffers whose
+/// kernel ACCUMULATES into them (a bias add, a convtranspose's tap sum) must
+/// keep using `vec![0.0; len]`.
+#[inline]
+pub fn scratch_f32(len: usize) -> Vec<f32> {
+    let mut buf = Vec::with_capacity(len);
+    // SAFETY: `with_capacity(len)` reserved room for `len` f32s; f32 has no
+    // invalid bit patterns and no drop glue. The caller's contract above
+    // guarantees every published element is written before it is read.
+    unsafe { buf.set_len(len) };
+    buf
+}
+
 /// The GELU, on a named ISA.
 ///
 /// The polynomial is contracted with FMA on the vector path and not on the

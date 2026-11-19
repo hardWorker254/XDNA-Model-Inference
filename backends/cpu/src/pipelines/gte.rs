@@ -524,13 +524,17 @@ impl GteModel {
         let score_rows = batch * spec.heads * seq;
         let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
 
-        let mut qkv = vec![0.0f32; rows * three_hidden];
-        let mut ctx = vec![0.0f32; rows * hidden];
-        let mut proj = vec![0.0f32; rows * hidden];
-        let mut up_gate = vec![0.0f32; rows * 2 * spec.ffn];
-        let mut act = vec![0.0f32; rows * spec.ffn];
-        let mut down = vec![0.0f32; rows * hidden];
-        let mut scores = vec![0.0f32; score_rows * seq];
+        // Every one of these is written IN FULL before it is read: the GEMMs
+        // overwrite their output, `qk` writes every score row, and the GEGLU
+        // writes every activation. `zeros_bias` below is the exception -- it
+        // is READ as a bias -- so it stays a real zero-filled vector.
+        let mut qkv = kernels::scratch_f32(rows * three_hidden);
+        let mut ctx = kernels::scratch_f32(rows * hidden);
+        let mut proj = kernels::scratch_f32(rows * hidden);
+        let mut up_gate = kernels::scratch_f32(rows * 2 * spec.ffn);
+        let mut act = kernels::scratch_f32(rows * spec.ffn);
+        let mut down = kernels::scratch_f32(rows * hidden);
+        let mut scores = kernels::scratch_f32(score_rows * seq);
 
         // The bias of a GEMM without one: one buffer per CALL, not one per
         // layer. `gemm_nt` reads `bias[j]` for every column.
