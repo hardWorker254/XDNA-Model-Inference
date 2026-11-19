@@ -91,6 +91,26 @@ pub trait Ops {
     /// row's, and one row's sum never touches another's.
     fn softmax_rows(&mut self, values: &mut [f32], rows: usize, width: usize) -> Result<()>;
 
+    /// `values += other`, elementwise, in place: the residual connection.
+    ///
+    /// On the host this is the kernel the family used directly. A device
+    /// implementation can keep the residual on the device, and can fold it
+    /// into a batch of the layer's other dispatches.
+    fn add_inplace(&mut self, values: &mut [f32], other: &[f32]) -> Result<()>;
+
+    /// Begin a batch of operations, returning whether this implementation
+    /// actually batches. The default is "no": a host backend computes each
+    /// call as it comes. A backend that returns `true` must have `end_batch`
+    /// called before any host code reads a buffer the batch wrote.
+    fn begin_batch(&mut self) -> bool {
+        false
+    }
+
+    /// Submit a batch and hand its results back to the host.
+    fn end_batch(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Where these operations ran.
     ///
     /// A claim about the run rather than a name of a backend: the family

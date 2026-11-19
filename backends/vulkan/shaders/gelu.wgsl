@@ -13,7 +13,7 @@ struct Params {
 }
 
 @group(0) @binding(0) var<storage, read_write> x: array<f32>;
-@group(0) @binding(5) var<uniform> params: Params;
+var<immediate> params: Params;
 
 fn gelu(v: f32) -> f32 {
     let u = min(abs(v), 4.0);

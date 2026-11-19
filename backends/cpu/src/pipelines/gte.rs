@@ -626,7 +626,7 @@ impl GteModel {
                     }
                 }
             }
-            kernels::add_inplace(x, &proj[..x.len()]);
+            ops.add_inplace(x, &proj[..x.len()])?;
             // attn_ln (post-LN)
             let t_ln = std::time::Instant::now();
             ops.layernorm_rows(x, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
@@ -719,7 +719,7 @@ impl GteModel {
                     }
                 }
             }
-            kernels::add_inplace(x, &down[..x.len()]);
+            ops.add_inplace(x, &down[..x.len()])?;
             // mlp_ln (post-LN)
             let t_ln = std::time::Instant::now();
             ops.layernorm_rows(x, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;

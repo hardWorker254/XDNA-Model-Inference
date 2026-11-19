@@ -1,89 +1,126 @@
-// The matrix multiply, tiled 16x16 per workgroup.
-//
-// THE TILE, and why 16: the array's panels are 64 wide and the GPU's
-// workgroup is 16 wide, so a GEMM that is right on one is not right on the
-// other. The two are separate backends with separate tolerances, and this
-// comment says so rather than leaving the reader to assume the tile carries
-// across.
+// The matrix multiply, 8x32 output tile per workgroup, 32-wide K tile.
 //
 // a is [m, k] row-major, b is [k, n] row-major, c is [m, n] -- the same
 // contract as `npum_cpu::kernels::gemm`.
+//
+// # Why B is NOT stored transposed
+//
+// The audit of this shader suspected a non-coalesced `b[b_row*n+col]` load.
+// It is the opposite: the 32 lanes of a workgroup map to output COLUMNS, so
+// they read 32 consecutive B elements. Storing B as [n, k] in the weight
+// cache would make those 32 lanes stride by `k` and lose that coalescing.
+// The real hazard was in shared memory, addressed by the 33-wide strides
+// below. B therefore keeps its [k, n] layout in the cache.
+//
+// # The 33-wide shared strides
+//
+// a_tile[lid.y*33 + p] and b_tile[p*33 + lid.x]. Without the padding both
+// arrays have 32-wide rows, and 8 (respectively 32) threads addressing the
+// same p land in the same bank. 33 is coprime with 32, so each row shifts
+// the bank by one. The cost is 1/32 of shared memory; the saving is the
+// 8-way conflict on every iteration of the inner product.
 //
 // # No early return, and that is not a style choice
 //
 // `workgroupBarrier()` must be reached by every invocation of the workgroup.
 // An invocation for a row past `m` or a column past `n` that RETURNED before
-// the barrier would leave the reduction reading a tile nobody loaded -- the
-// kind of bug that gives a plausible answer for a 2x2 and a wrong one for
-// an 8x16. So out-of-range invocations do the work (loading zeros) and
-// simply do not store.
+// the barrier would leave the reduction reading a tile nobody loaded. So
+// out-of-range lanes load zeros and simply do not store.
 //
-// # Why B is staged transposed
+// # Double buffering
 //
-// The inner product below reads `b_tile[lid.x * TILE + p]`, so B's tile is
-// stored column-major: `b_tile[lid.x * TILE + lid.y]` is `b[t*TILE + lid.y,
-// col]`. Storing it like A looks symmetric and computes the right answer only
-// when the matrix happens to be symmetric.
+// Two tile pairs alternate. The barrier after the reduction of tile t
+// protects the buffers that tile t+2 will overwrite, so loads of the next
+// tile can start while the current one is still being read. There are two
+// barriers per K tile, but the tile is twice as wide as before: half as
+// many K tiles, half as many barriers per GEMM.
 
 struct Params {
     m: u32,
     k: u32,
     n: u32,
-    has_bias: u32,
+    flags: u32, // bit 0: add bias[col], bit 2: add acc[row, col]
 }
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
-// The bias is per output COLUMN and added after the whole reduction, in the
-// same order as the host's `value += bias[col]`. Binding 3 is otherwise unused
-// by this shader, so the epilogue costs no descriptor layout change.
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
-@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read> acc: array<f32>;
+var<immediate> params: Params;
 
-const TILE: u32 = 16u;
+const TM: u32 = 8u;
+const TN: u32 = 32u;
+const TK: u32 = 32u;
+const PAD_A: u32 = 33u;
+const PAD_B: u32 = 33u;
 
-var<workgroup> a_tile: array<f32, 256>;
-var<workgroup> b_tile: array<f32, 256>;
+var<workgroup> a0: array<f32, 8u * 33u>;
+var<workgroup> b0: array<f32, 32u * 33u>;
+var<workgroup> a1: array<f32, 8u * 33u>;
+var<workgroup> b1: array<f32, 32u * 33u>;
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(32, 8, 1)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
-    let row = wid.y * TILE + lid.y;
-    let col = wid.x * TILE + lid.x;
+    let row = wid.y * TM + lid.y;
+    let col = wid.x * TN + lid.x;
     let row_ok = row < params.m;
     let col_ok = col < params.n;
 
     var sum: f32 = 0.0;
-    let tiles = (params.k + TILE - 1u) / TILE;
+    let tiles = (params.k + TK - 1u) / TK;
     for (var t = 0u; t < tiles; t = t + 1u) {
-        let a_col = t * TILE + lid.x;
-        let b_row = t * TILE + lid.y;
-
+        let kbase = t * TK;
+        let ak = kbase + lid.x;
         var av: f32 = 0.0;
-        if (row_ok && a_col < params.k) {
-            av = a[row * params.k + a_col];
+        if (row_ok && ak < params.k) {
+            av = a[row * params.k + ak];
         }
-        a_tile[lid.y * TILE + lid.x] = av;
 
-        var bv: f32 = 0.0;
-        if (col_ok && b_row < params.k) {
-            bv = b[b_row * params.n + col];
+        // Four B values per thread: the K tile has 32 rows and the
+        // workgroup has only 8 lanes in y.
+        var bv: array<f32, 4>;
+        for (var q = 0u; q < 4u; q = q + 1u) {
+            let bk = kbase + lid.y + q * 8u;
+            bv[q] = 0.0;
+            if (col_ok && bk < params.k) {
+                bv[q] = b[bk * params.n + col];
+            }
         }
-        b_tile[lid.x * TILE + lid.y] = bv;
 
+        if ((t & 1u) == 0u) {
+            a0[lid.y * PAD_A + lid.x] = av;
+            for (var q = 0u; q < 4u; q = q + 1u) {
+                b0[(lid.y + q * 8u) * PAD_B + lid.x] = bv[q];
+            }
+        } else {
+            a1[lid.y * PAD_A + lid.x] = av;
+            for (var q = 0u; q < 4u; q = q + 1u) {
+                b1[(lid.y + q * 8u) * PAD_B + lid.x] = bv[q];
+            }
+        }
         workgroupBarrier();
 
-        for (var p = 0u; p < TILE; p = p + 1u) {
-            sum = sum + a_tile[lid.y * TILE + p] * b_tile[lid.x * TILE + p];
+        if ((t & 1u) == 0u) {
+            for (var p = 0u; p < TK; p = p + 1u) {
+                sum = sum + a0[lid.y * PAD_A + p] * b0[p * PAD_B + lid.x];
+            }
+        } else {
+            for (var p = 0u; p < TK; p = p + 1u) {
+                sum = sum + a1[lid.y * PAD_A + p] * b1[p * PAD_B + lid.x];
+            }
         }
         workgroupBarrier();
     }
 
     if (row_ok && col_ok) {
         var value = sum;
-        if (params.has_bias != 0u) {
+        if ((params.flags & 1u) != 0u) {
             value = value + bias[col];
+        }
+        if ((params.flags & 4u) != 0u) {
+            value = value + acc[row * params.n + col];
         }
         c[row * params.n + col] = value;
     }

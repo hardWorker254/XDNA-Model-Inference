@@ -1089,6 +1089,10 @@ impl BertModel {
             // `gemm_batch` to overlap; keep these calls sequential. The batch
             // path is for families with genuinely independent projections.
             //
+            // The GPU can record this projection into a batch. It is closed
+            // before the host's QK^T reads qkv_buf: a batch result is not in
+            // host memory until `end_batch`.
+            let qkv_batch = ops.begin_batch();
             // THE SEAM: the array, or the host, decided ONCE per projection
             // and in one place. The two paths are not the same numbers --
             // the array multiplies the weights in bf16 and the host in f32
@@ -1128,6 +1132,10 @@ impl BertModel {
                         timings.gpu += t.elapsed().as_secs_f64();
                     }
                 }
+            }
+
+            if qkv_batch {
+                ops.end_batch()?;
             }
 
             // THE ATTENTION: QK^T, the softmax, and softmax.V.
@@ -1231,6 +1239,16 @@ impl BertModel {
                 timings.attention += qk_s + av_s;
             }
 
+            // The rest of the layer is a chain of GPU operations when no
+            // array/eltwise backend owns a link in it. Record them into ONE
+            // submission: projection, residual, LayerNorm, FFN, GELU, FFN,
+            // residual, LayerNorm. The host sees x_buf only at `end_batch`.
+            let tail_batch = ops.begin_batch();
+            let tail_batched = tail_batch && array.is_none() && eltwise.is_none();
+            if tail_batch && !tail_batched {
+                ops.end_batch()?;
+            }
+
             // The attention output projection, and the residual.
             match array.as_deref_mut().filter(|_| gemm_on) {
                 Some(array) => {
@@ -1262,7 +1280,7 @@ impl BertModel {
                     }
                 }
             }
-            kernels::add_inplace(x_buf, proj_buf);
+            ops.add_inplace(x_buf, proj_buf)?;
 
             // The first LayerNorm, then the FFN.
             let t_ln = std::time::Instant::now();
@@ -1349,7 +1367,7 @@ impl BertModel {
                     }
                 }
             }
-            kernels::add_inplace(x_buf, down_buf);
+            ops.add_inplace(x_buf, down_buf)?;
 
             // The second LayerNorm.
             let t_ln = std::time::Instant::now();
@@ -1363,6 +1381,9 @@ impl BertModel {
                     Placement::Host => timings.host_layernorm += spent,
                     _ => timings.gpu += spent,
                 }
+            }
+            if tail_batch {
+                ops.end_batch()?;
             }
         }
         Ok(())

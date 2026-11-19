@@ -41,9 +41,10 @@
 //! * **A tensor that is not f32.** The GPU path is f32; bf16 and i8 operands
 //!   come back to the host for that operation. `Caps::precision` says f32, so
 //!   this is the container's doing, not the shader's.
-//! * **Attention longer than 1024 keys.** The attention shader keeps one
-//!   score row in private memory, which is 1024 f32; a longer sequence falls
-//!   back to the host rather than computing a truncated softmax.
+//! * **A head wider than 256 columns.** The attention shader streams keys
+//!   in chunks, so sequence length is unbounded, but it keeps four private
+//!   output accumulators per lane. A wider head falls back to the host
+//!   rather than silently dropping columns.
 
 pub mod device;
 pub mod ops;
@@ -54,8 +55,12 @@ use npum_model::{Backend, Caps, DType, Error, ModelSpec, OpKind, Plan, Result, T
 
 use device::Gpu;
 
-/// The longest key sequence the attention shader can take.
-pub const MAX_ATTENTION_KEYS: usize = 1024;
+/// The attention shader's key-chunk width. Sequences longer than this are
+/// streamed in several chunks with an online softmax, not rejected.
+pub const MAX_ATTENTION_KEYS: usize = 256;
+
+/// The widest head the shader's four private accumulators can cover.
+pub const MAX_HEAD_DIM: usize = 256;
 
 /// The Vulkan backend.
 pub struct VulkanBackend {
@@ -226,15 +231,13 @@ impl Backend for VulkanBackend {
         };
         let a_values = Self::decode(a, &mut self.scratch_a);
         let b_values = Self::decode(b, &mut self.scratch_b);
-        let mut values = gpu
-            .gemm(a_values, b_values, m, k, n)
+        // With an accumulator the addition is the GEMM shader's EPILOGUE:
+        // one dispatch and one round-trip, not GEMM -> read -> add -> read.
+        let acc_values = acc.map(|acc| Self::decode(acc, &mut self.scratch_c));
+        let acc_slice = acc_values.as_ref().map(|v| &v[..]);
+        let values = gpu
+            .gemm_tensor(a_values, b_values, acc_slice, m, k, n)
             .map_err(|d| Self::failed("gemm", d))?;
-        if let Some(acc) = acc {
-            let acc_values = Self::decode(acc, &mut self.scratch_c);
-            values = gpu
-                .add(&values, acc_values)
-                .map_err(|d| Self::failed("gemm", d))?;
-        }
         Self::encode(c, &values, &mut self.bytes);
         Ok(())
     }
@@ -267,7 +270,7 @@ impl Backend for VulkanBackend {
         let values = Self::decode(x, &mut self.scratch_a);
         let g = Self::decode(gamma, &mut self.scratch_b);
         let b = Self::decode(beta, &mut self.scratch_c);
-        gpu.layernorm(
+        gpu.layernorm_fresh(
             values,
             rows,
             width,
@@ -306,8 +309,10 @@ impl Backend for VulkanBackend {
         if d == 0 {
             return Ok(());
         }
-        // The shader's score row is a private array of MAX_ATTENTION_KEYS.
-        if k.len() / d > MAX_ATTENTION_KEYS {
+        // The shader streams keys in 256-wide chunks, but its four private
+        // accumulators cover at most 256 output columns. A wider head goes
+        // back to the host rather than silently dropping columns.
+        if d > MAX_HEAD_DIM {
             return npum_cpu::kernels::attention(q, k, v, out);
         }
         let Some(gpu) = self.gpu.as_mut() else {

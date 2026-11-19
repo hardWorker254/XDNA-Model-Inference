@@ -187,10 +187,10 @@ fn attention_is_within_1e_4_of_the_host() {
 }
 
 #[test]
-fn a_long_attention_goes_back_to_the_host() {
+fn a_long_attention_uses_chunked_softmax() {
     let Some(mut gpu) = open() else { return };
-    // One key over the shader's bound: the backend must not compute it on the
-    // GPU, and must not compute a truncated softmax either.
+    // One key over the shader's CHUNK width: the backend must stream a
+    // second chunk and normalise over all keys, not just the first chunk.
     let (q_len, kv_len, d) = (1usize, npum_vulkan::MAX_ATTENTION_KEYS + 8, 2usize);
     let q = vec![1.0f32; q_len * d];
     let k = vec![1.0f32; kv_len * d];
@@ -203,6 +203,6 @@ fn a_long_attention_goes_back_to_the_host() {
     // All ones: every weight is 1/kv_len, so the answer is 1.0 exactly, on
     // whichever side computed it.
     for value in out.to_f32() {
-        assert!((value - 1.0).abs() < 1e-6, "long attention gave {value}");
+        assert!((value - 1.0).abs() < 1e-6, "chunked attention gave {value}");
     }
 }

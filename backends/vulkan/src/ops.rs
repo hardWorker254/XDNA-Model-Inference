@@ -40,6 +40,8 @@ pub struct VulkanOps {
     layn: bool,
     gelu: bool,
     softm: bool,
+    /// True between `begin_batch` and `end_batch`.
+    batching: bool,
 }
 
 impl Default for VulkanOps {
@@ -67,6 +69,7 @@ impl VulkanOps {
             layn,
             gelu,
             softm,
+            batching: false,
         }
     }
 
@@ -108,6 +111,23 @@ impl Ops for VulkanOps {
         if !self.gemm {
             npum_cpu::kernels::gemm_nt(a, m, b, k, n, bias, out);
             return Ok(());
+        }
+        if self.batching {
+            if bias.len() == n {
+                let Some(gpu) = self.backend.device_mut() else {
+                    npum_cpu::kernels::gemm_nt(a, m, b, k, n, bias, out);
+                    return Ok(());
+                };
+                // The device owns the destination until `end_batch`; no
+                // `copy_from_slice` here (the Vec would be empty).
+                gpu.gemm_with_bias_into(a, b, Some(bias), m, k, n, out.as_ptr() as usize)
+                    .map_err(|d| Self::failed("gemm", d))?;
+                self.dispatches += 1;
+                return Ok(());
+            }
+            // The short-bias case needs a host epilogue, so it closes the
+            // batch rather than reading a result the device has not run.
+            self.end_batch()?;
         }
         let Some(gpu) = self.backend.device_mut() else {
             npum_cpu::kernels::gemm_nt(a, m, b, k, n, bias, out);
@@ -205,6 +225,48 @@ impl Ops for VulkanOps {
         gpu.softmax(values, rows, width)
             .map_err(|d| Self::failed("softmax", d))?;
         self.dispatches += 1;
+        Ok(())
+    }
+
+    fn add_inplace(&mut self, x: &mut [f32], y: &[f32]) -> Result<()> {
+        if !self.gemm {
+            npum_cpu::kernels::add_inplace(x, y);
+            return Ok(());
+        }
+        let Some(gpu) = self.backend.device_mut() else {
+            npum_cpu::kernels::add_inplace(x, y);
+            return Ok(());
+        };
+        // `add.wgsl` was compiled all along; this is its dispatch path. The
+        // residual no longer reads two arrays back to the host to add them.
+        gpu.add_inplace(x, y).map_err(|d| Self::failed("add", d))?;
+        self.dispatches += 1;
+        Ok(())
+    }
+
+    fn begin_batch(&mut self) -> bool {
+        match self.backend.device_mut() {
+            Some(gpu) => {
+                if gpu.begin_batch().is_err() {
+                    false
+                } else {
+                    self.batching = true;
+                    true
+                }
+            }
+            None => false,
+        }
+    }
+
+    fn end_batch(&mut self) -> Result<()> {
+        if self.batching {
+            self.batching = false;
+            let gpu = self
+                .backend
+                .device_mut()
+                .expect("a batch was begun on a device");
+            gpu.end_batch().map_err(|d| Self::failed("batch", d))?;
+        }
         Ok(())
     }
 

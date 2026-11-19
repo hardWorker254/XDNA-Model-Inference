@@ -198,6 +198,11 @@ impl Ops for CpuOps {
         Ok(())
     }
 
+    fn add_inplace(&mut self, values: &mut [f32], other: &[f32]) -> Result<()> {
+        kernels::add_inplace(values, other);
+        Ok(())
+    }
+
     fn place(&self) -> Placement {
         Placement::Host
     }

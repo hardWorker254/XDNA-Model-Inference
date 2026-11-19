@@ -51,7 +51,9 @@ fn main() {
         let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let module =
             wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{path}: WGSL does not parse: {e}"));
-        let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+        // `var<immediate>` is Naga's WGSL spelling of a Vulkan push constant.
+        // It is a Naga extension, so validation has to enable its capability.
+        let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
             .validate(&module)
             .unwrap_or_else(|e| panic!("{path}: WGSL does not validate: {e:?}"));
         let words = spv::write_vec(

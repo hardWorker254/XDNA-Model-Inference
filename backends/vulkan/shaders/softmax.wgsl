@@ -10,21 +10,26 @@
 //
 // The third one is the subtle one: a negative exponent below about -127 is a
 // negative exponent FIELD, which is a NaN bit pattern.
+//
+// BOTH reductions are trees: six steps of 64 -> 1 instead of every lane
+// reading all 64 partials (O(64) work per lane). The tree's barriers double
+// as the availability barrier before the next pass over the row.
 
 struct Params {
     width: u32,
     rows: u32,
+    stride: u32, // 0 means `width`: rows may be padded wider than the row
     _pad: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> x: array<f32>;
-@group(0) @binding(5) var<uniform> params: Params;
+var<immediate> params: Params;
 
 const FLOOR_LOAD: f32 = -1e30;
 const FLOOR_DIFF: f32 = -100.0;
 const FLOOR_ARG: f32 = -120.0;
 const LOG2E: f32 = 1.4426950408889634;
+const NEG_INF: f32 = -3.402823e38;
 
 var<workgroup> partial: array<f32, 64>;
 
@@ -35,25 +40,28 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     if (row >= params.rows) {
         return;
     }
-    let base = row * params.width;
+    let width = params.width;
+    let stride = select(width, params.stride, params.stride != 0u);
+    let base = row * stride;
 
-    var m: f32 = -3.402823e38;
-    for (var i = lid.x; i < params.width; i = i + 64u) {
+    var m: f32 = NEG_INF;
+    for (var i = lid.x; i < width; i = i + 64u) {
         let v = max(x[base + i], FLOOR_LOAD);
         x[base + i] = v;
         m = max(m, v);
     }
     partial[lid.x] = m;
     workgroupBarrier();
-
-    var mx: f32 = -3.402823e38;
-    for (var i = 0u; i < 64u; i = i + 1u) {
-        mx = max(mx, partial[i]);
+    for (var step = 32u; step > 0u; step = step >> 1u) {
+        if (lid.x < step) {
+            partial[lid.x] = max(partial[lid.x], partial[lid.x + step]);
+        }
+        workgroupBarrier();
     }
-    workgroupBarrier();
+    let mx = partial[0];
 
     var sum: f32 = 0.0;
-    for (var i = lid.x; i < params.width; i = i + 64u) {
+    for (var i = lid.x; i < width; i = i + 64u) {
         let d = max(x[base + i] - mx, FLOOR_DIFF);
         let arg = max(d * LOG2E, FLOOR_ARG);
         let e = exp2(arg);
@@ -62,15 +70,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     partial[lid.x] = sum;
     workgroupBarrier();
-
-    var total: f32 = 0.0;
-    for (var i = 0u; i < 64u; i = i + 1u) {
-        total = total + partial[i];
+    for (var step = 32u; step > 0u; step = step >> 1u) {
+        if (lid.x < step) {
+            partial[lid.x] = partial[lid.x] + partial[lid.x + step];
+        }
+        workgroupBarrier();
     }
-    let inv = select(0.0, 1.0 / total, total > 0.0);
-    workgroupBarrier();
+    let inv = select(0.0, 1.0 / partial[0], partial[0] > 0.0);
 
-    for (var i = lid.x; i < params.width; i = i + 64u) {
+    for (var i = lid.x; i < width; i = i + 64u) {
         x[base + i] = x[base + i] * inv;
     }
 }
