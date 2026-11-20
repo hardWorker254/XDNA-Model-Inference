@@ -41,7 +41,7 @@ fn main() {
     let conv = whisper_features::conv_front_end(&mel, &w1, &b1, &w2, &b2, g.d_model);
 
     let n_src = conv.len() / g.d_model;
-    let hidden = encoder.run(&conv, n_src);
+    let hidden = encoder.run(&conv, n_src, None, None).expect("the encoder");
     println!("enc {} {} {}", n_src, g.d_model, to_hex(&hidden));
 }
 

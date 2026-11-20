@@ -24,7 +24,9 @@ fn main() {
     let g = vit.geometry().clone();
     let decoded = vit_image::decode_image(image).expect("the image decodes");
     let patches = vit_image::preprocess(&decoded, &g).expect("the front end runs");
-    let hidden = vit.encode(&patches);
+    let hidden = vit
+        .encode(&patches, None, None, false, false)
+        .expect("the encoder");
     let d = g.hidden as usize;
     let logits = vit.classify(&hidden[..d]);
     let prediction = vit::predict(&logits, vit.labels()).expect("the prediction");

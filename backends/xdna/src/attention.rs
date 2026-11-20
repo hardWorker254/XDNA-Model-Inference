@@ -182,12 +182,16 @@ impl AttentionScratch {
         // zero block is never written at all: `ensure_f32` already zero-fills
         // any growth, so a full `fill` there is work nothing observes.
         let a = &mut self.a_q[..tier_rows * k_qk];
+        // `a_q` holds ONE tier's rows, not the whole sequence. A sequence
+        // longer than a tier is gathered chunk by chunk into these same rows,
+        // so there are no rows past `seq` to clear when seq > tier_rows.
+        let rows = seq.min(tier_rows);
         if head_dim < k_qk {
-            for row in a[..seq * k_qk].chunks_exact_mut(k_qk) {
+            for row in a[..rows * k_qk].chunks_exact_mut(k_qk) {
                 row[head_dim..].fill(0.0);
             }
         }
-        a[seq * k_qk..].fill(0.0);
+        a[rows * k_qk..].fill(0.0);
     }
 }
 
@@ -503,14 +507,15 @@ pub fn run<T: Transport>(
         ))
     })?;
 
-    // THE BATCH THE DESIGN HOLDS, AND WHY THE RUN PADS UP TO IT.
-    let tier_batch = tier_rows / seq;
-    if tier_batch < batch {
-        return Err(ArrayError::Design(format!(
-            "the design's tier computes {tier_rows} rows, which is {tier_batch} sequences of \
-             {seq}, and the run has {batch}."
-        )));
-    }
+    // THE BATCH SLOT COUNT.
+    //
+    // When the tier holds several whole sequences, the loop below pads up to
+    // that many slots and reads zeros for the ones the run does not have.
+    // When ONE sequence is LONGER than a tier (Whisper's 1500 positions in a
+    // 512-row tile), the row loop below splits it into chunks, and there is
+    // still one slot per real sequence. Taking only `tier_rows / seq` would
+    // give zero iterations and silently compute nothing.
+    let tier_batch = (tier_rows / seq).max(batch);
 
     // THE SCORE BUFFER, THE CONTEXT ROWS, AND THE WORKSPACE.
     attn.scratch

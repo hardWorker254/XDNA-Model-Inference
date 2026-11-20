@@ -268,6 +268,52 @@ pub fn exp2_poly(x: f32) -> f32 {
     pl * f32::from_bits(bits)
 }
 
+/// Eight copies of `exp2_poly` at once.
+///
+/// Every lane runs the SAME Horner steps with the SAME FMA and the same
+/// exponent-field scaling, so lane `i` of the vector is bit-for-bit the
+/// scalar `exp2_poly(x[i])`. That is what lets the vectorised softmax replace
+/// the scalar one without moving a single golden byte: only the instruction
+/// that computes the exponential changes, not the number it returns.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp2_poly_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    const C0: f32 = 1.548_327_546_3e-05;
+    const C1: f32 = 1.566_983_317_4e-04;
+    const C2: f32 = 1.333_182_523_6e-03;
+    const C3: f32 = 9.616_460_553_8e-03;
+    const C4: f32 = 5.550_415_685_5e-02;
+    const C5: f32 = 2.402_268_410_9e-01;
+    const C6: f32 = 6.931_471_769_4e-01;
+    const C7: f32 = 9.999_999_895_5e-01;
+
+    // SAFETY: the caller checked the host for AVX2/FMA. `cvttps` truncates
+    // toward zero and yields the integer indefinite value for NaN/overflow,
+    // exactly like `cvttps_i32` in the scalar path.
+    let k = _mm256_cvttps_epi32(x);
+    let f = _mm256_sub_ps(x, _mm256_cvtepi32_ps(k));
+    let c0 = _mm256_set1_ps(C0);
+    let c1 = _mm256_set1_ps(C1);
+    let c2 = _mm256_set1_ps(C2);
+    let c3 = _mm256_set1_ps(C3);
+    let c4 = _mm256_set1_ps(C4);
+    let c5 = _mm256_set1_ps(C5);
+    let c6 = _mm256_set1_ps(C6);
+    let c7 = _mm256_set1_ps(C7);
+    let mut pl = _mm256_fmadd_ps(f, c0, c1);
+    pl = _mm256_fmadd_ps(f, pl, c2);
+    pl = _mm256_fmadd_ps(f, pl, c3);
+    pl = _mm256_fmadd_ps(f, pl, c4);
+    pl = _mm256_fmadd_ps(f, pl, c5);
+    pl = _mm256_fmadd_ps(f, pl, c6);
+    pl = _mm256_fmadd_ps(f, pl, c7);
+    // 2^k, built from the exponent field with wrapping integer addition.
+    let bias = _mm256_slli_epi32(_mm256_add_epi32(k, _mm256_set1_epi32(127)), 23);
+    _mm256_mul_ps(pl, _mm256_castsi256_ps(bias))
+}
+
 /// The GELU activation, as the reference's `gelu_cpu` computes it.
 ///
 /// A degree-8 minimax polynomial on `min(|x|, 4)`, NOT the exact erf and NOT
@@ -304,9 +350,10 @@ pub fn gelu_f32(v: f32) -> f32 {
 
 /// Layer normalisation over one row.
 ///
-/// The width must be a multiple of eight: the reference's AVX2 path reads eight
-/// floats at a time and has no tail, and a row that is not a multiple of
-/// eight would be read past its end. The port refuses instead.
+/// Eight floats are read at a time, with a scalar tail for the last zero to
+/// seven columns. The tail feeds the SAME eight lane accumulators (the unused
+/// lanes just stay at zero), so the fixed `hsum8` tree and every FMA keep the
+/// reference's order -- a short row is the same function, not a new one.
 ///
 /// The order is the reference's: eight lane accumulators for the mean, the tree of
 /// `hsum8` to finish it, eight lane accumulators with an FMA for the
@@ -324,13 +371,6 @@ pub fn layernorm_row_on(isa: Isa, row: &mut [f32], gamma: &[f32], beta: &[f32]) 
     let n = row.len();
     if n == 0 {
         return Ok(());
-    }
-    if n % 8 != 0 {
-        return Err(TensorError::WrongLength {
-            expected: n.next_multiple_of(8),
-            found: n,
-        }
-        .into());
     }
     #[cfg(target_arch = "x86_64")]
     if isa != Isa::Portable && has_avx2_fma() {
@@ -386,42 +426,58 @@ fn layernorm_row_impl(row: &mut [f32], gamma: &[f32], beta: &[f32]) {
     // The mean: eight lane accumulators.
     let mut sum = [0.0f32; 8];
     let mut j = 0;
-    while j < n {
+    while j + 8 <= n {
         for l in 0..8 {
             sum[l] += row[j + l];
         }
         j += 8;
+    }
+    // A short tail lands in the first lanes; the other lanes stay zero, so
+    // the fixed eight-lane tree sees exactly the values it would for a full
+    // group padded with zeros.
+    for l in 0..n - j {
+        sum[l] += row[j + l];
     }
     let mean = hsum8(sum) / n as f32;
 
     // The variance: eight lane accumulators, and an FMA per element.
     let mut acc = [0.0f32; 8];
     j = 0;
-    while j < n {
+    while j + 8 <= n {
         for l in 0..8 {
             let d = row[j + l] - mean;
             acc[l] = d.mul_add(d, acc[l]);
         }
         j += 8;
     }
+    for l in 0..n - j {
+        let d = row[j + l] - mean;
+        acc[l] = d.mul_add(d, acc[l]);
+    }
     let var = hsum8(acc) / n as f32;
     let inv = 1.0f32 / (var + LAYERNORM_EPS).sqrt();
 
     // The epilogue: `fma((x - mean) * inv, gamma, beta)`.
     j = 0;
-    while j < n {
+    while j + 8 <= n {
         for l in 0..8 {
             let d = row[j + l] - mean;
             row[j + l] = (d * inv).mul_add(gamma[j + l], beta[j + l]);
         }
         j += 8;
     }
+    for l in 0..n - j {
+        let d = row[j + l] - mean;
+        row[j + l] = (d * inv).mul_add(gamma[j + l], beta[j + l]);
+    }
 }
 
 /// Softmax over one row, as the reference's `softmax_cpu` computes it.
 ///
-/// The width must be a multiple of eight, for the same reason as the
-/// LayerNorm's.
+/// The last zero to seven columns are handled by a scalar tail instead of a
+/// padded read: a short attention sequence does not have to be rounded up to
+/// a multiple of eight by its caller. The tail feeds the same eight lane
+/// accumulators and the same `hsum8` tree, so the answer is the same function.
 ///
 /// Three things are not textbook and all three are the reference's:
 ///
@@ -445,13 +501,6 @@ pub fn softmax_row_on(isa: Isa, row: &mut [f32]) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
-    if n % 8 != 0 {
-        return Err(TensorError::WrongLength {
-            expected: n.next_multiple_of(8),
-            found: n,
-        }
-        .into());
-    }
     #[cfg(target_arch = "x86_64")]
     if isa != Isa::Portable && has_avx2_fma() {
         // SAFETY: the host was checked for the features. The AVX-512 request
@@ -464,10 +513,81 @@ pub fn softmax_row_on(isa: Isa, row: &mut [f32]) -> Result<()> {
 }
 
 /// The softmax, compiled for a host with AVX2 and FMA.
+///
+/// Only the exponential is vectorised. The maximum still uses the scalar
+/// lane array and `hmax8`, and the sum still lives in the same eight scalar
+/// lanes and is folded with `hsum8`: a sixteen-lane fold would be a different
+/// number, and the reference folds eight. `exp2_poly_avx2` returns the same
+/// bits as `exp2_poly` in every lane, so the vector body and the scalar body
+/// agree byte for byte.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn softmax_row_avx2(row: &mut [f32]) {
-    softmax_row_impl(row)
+    use std::arch::x86_64::*;
+
+    let n = row.len();
+    // The max stays scalar: `_mm256_max_ps` and `f32::max` disagree on which
+    // operand to return for a NaN, and that would be a golden difference on a
+    // pathological row. It is not the expensive part of this kernel anyway.
+    let mut mx = [f32::NEG_INFINITY; 8];
+    for (slot, &v) in mx.iter_mut().zip(row.iter().take(8)) {
+        *slot = v;
+    }
+    // For a row shorter than one vector the first lanes were already filled
+    // from the row above, so there is no second group to visit: `j = n` ends
+    // the loop and leaves the tail empty.
+    let mut j = 8.min(n);
+    while j + 8 <= n {
+        for l in 0..8 {
+            mx[l] = mx[l].max(row[j + l]);
+        }
+        j += 8;
+    }
+    for l in 0..n - j {
+        mx[l] = mx[l].max(row[j + l]);
+    }
+    let m = hmax8(mx);
+
+    let mv = _mm256_set1_ps(m);
+    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+    let floor = _mm256_set1_ps(-120.0);
+    let mut sumv = _mm256_setzero_ps();
+    j = 0;
+    while j + 8 <= n {
+        // SAFETY: `j + 8 <= n`; every load and store stays in the row.
+        unsafe {
+            let v = _mm256_loadu_ps(row.as_ptr().add(j));
+            let a = _mm256_mul_ps(_mm256_sub_ps(v, mv), log2e);
+            let a = _mm256_max_ps(a, floor);
+            let e = exp2_poly_avx2(a);
+            _mm256_storeu_ps(row.as_mut_ptr().add(j), e);
+            sumv = _mm256_add_ps(sumv, e);
+        }
+        j += 8;
+    }
+    let mut sum = [0.0f32; 8];
+    // SAFETY: eight floats, exactly the width of the vector above.
+    unsafe { _mm256_storeu_ps(sum.as_mut_ptr(), sumv) };
+    // The short tail uses the scalar exponential -- the same polynomial, so
+    // the same bytes -- and lands in the same lane indices as a vector group.
+    for l in 0..n - j {
+        let a = ((row[j + l] - m) * std::f32::consts::LOG2_E).max(-120.0);
+        let e = exp2_poly(a);
+        row[j + l] = e;
+        sum[l] += e;
+    }
+
+    let inv = 1.0f32 / hsum8(sum);
+    j = 0;
+    while j + 8 <= n {
+        for l in 0..8 {
+            row[j + l] *= inv;
+        }
+        j += 8;
+    }
+    for l in 0..n - j {
+        row[j + l] *= inv;
+    }
 }
 
 /// The softmax body, written once and shared by both builds.
@@ -477,24 +597,33 @@ fn softmax_row_impl(row: &mut [f32]) {
     // The maximum: eight lanes, then a tree of maxes. Max is associative, so
     // the tree is not a numerical question -- but it is the reference's tree.
     //
-    // The lanes start at the row's FIRST eight elements and not at zero: a
-    // row of negatives would otherwise have a maximum of zero, and the
-    // softmax would then divide by a sum of e^0s instead of e^(x - max).
-    let mut mx = [0.0f32; 8];
-    mx.copy_from_slice(&row[..8]);
-    let mut j = 8;
-    while j < n {
+    // The lanes start at the row's FIRST eight elements and not at zero:
+    // a row of negatives would otherwise have a maximum of zero. For a row
+    // shorter than eight, missing lanes are -infinity, which cannot win the
+    // maximum and so cannot change the result.
+    let mut mx = [f32::NEG_INFINITY; 8];
+    for (slot, &v) in mx.iter_mut().zip(row.iter().take(8)) {
+        *slot = v;
+    }
+    // For a row shorter than one vector the first lanes were already filled
+    // from the row above, so there is no second group to visit: `j = n` ends
+    // the loop and leaves the tail empty.
+    let mut j = 8.min(n);
+    while j + 8 <= n {
         for l in 0..8 {
             mx[l] = mx[l].max(row[j + l]);
         }
         j += 8;
+    }
+    for l in 0..n - j {
+        mx[l] = mx[l].max(row[j + l]);
     }
     let m = hmax8(mx);
 
     // The exponentials, and their sum.
     let mut sum = [0.0f32; 8];
     j = 0;
-    while j < n {
+    while j + 8 <= n {
         for l in 0..8 {
             let a = ((row[j + l] - m) * std::f32::consts::LOG2_E).max(-120.0);
             let e = exp2_poly(a);
@@ -503,13 +632,22 @@ fn softmax_row_impl(row: &mut [f32]) {
         }
         j += 8;
     }
+    for l in 0..n - j {
+        let a = ((row[j + l] - m) * std::f32::consts::LOG2_E).max(-120.0);
+        let e = exp2_poly(a);
+        row[j + l] = e;
+        sum[l] += e;
+    }
     let inv = 1.0f32 / hsum8(sum);
     j = 0;
-    while j < n {
+    while j + 8 <= n {
         for l in 0..8 {
             row[j + l] *= inv;
         }
         j += 8;
+    }
+    for l in 0..n - j {
+        row[j + l] *= inv;
     }
 }
 
@@ -526,7 +664,34 @@ fn softmax_row_impl(row: &mut [f32]) {
 ///
 /// The bias is added AFTER the whole reduction, in a plain addition.
 pub fn gemm_nt(a: &[f32], m: usize, b: &[f32], k: usize, n: usize, bias: &[f32], out: &mut [f32]) {
-    with_gemm_acc(n, |acc| gemm_nt_dispatch(a, m, b, k, n, bias, out, acc))
+    with_gemm_acc(n, |acc| {
+        gemm_nt_dispatch(a, m, b, k, n, bias, out, acc, true)
+    })
+}
+
+/// `gemm_nt` without the B repack.
+///
+/// A row-parallel caller that already decided NOT to share a packed panel
+/// must not let each worker repack B into its own thread-local scratch. The
+/// whole point of that decision is that the original, strided B is faster
+/// for this width; re-packing it `threads` times undoes the choice and adds
+/// `threads * O(K*N)` copies and zero-fills to every GEMM.
+///
+/// The arithmetic is identical -- only the address `bv` is loaded from
+/// changes -- so this is bit-for-bit the same GEMM.
+#[inline]
+fn gemm_nt_no_pack(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+) {
+    with_gemm_acc(n, |acc| {
+        gemm_nt_dispatch(a, m, b, k, n, bias, out, acc, false)
+    })
 }
 
 thread_local! {
@@ -638,14 +803,165 @@ fn pack_b_avx2(b: &[f32], k: usize, n: usize, packed: &mut Vec<f32>) {
     }
 }
 
+// ------------------------------------------------------ cached packed weights
+//
+// A model's weight tensors are immutable for its whole lifetime, but the FFN
+// down projection alone is ~9 MB and used to be repacked on EVERY call. The
+// panels contain the same values as B, only at different addresses, so a
+// cached pack is bit-for-bit the same GEMM -- it just does not pay for the
+// copy twice.
+
+/// The identity of one packed matrix.
+///
+/// The pointer and shape are the cheap part of the key; the fingerprint MUST
+/// cover all of B. A handful of sampled floats cannot detect a mutation of
+/// any unprobed element, and a stale panel then feeds the GEMM the old weights
+/// without a word. A sequential read of B is still far cheaper than the
+/// scattered writes of a repack, so correctness here costs less than the copy
+/// the cache exists to avoid.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PackKey {
+    ptr: usize,
+    k: usize,
+    n: usize,
+    fingerprint: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct PackEntry {
+    data: std::sync::Arc<[f32]>,
+    bytes: usize,
+    stamp: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct PackCache {
+    entries: std::collections::HashMap<PackKey, PackEntry>,
+    bytes: usize,
+    limit: usize,
+    stamp: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+static PACK_CACHE: std::sync::OnceLock<std::sync::Mutex<PackCache>> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "x86_64")]
+fn pack_cache() -> &'static std::sync::Mutex<PackCache> {
+    PACK_CACHE.get_or_init(|| {
+        let disabled = std::env::var_os("NPU_CPU_NO_PACK_CACHE").is_some();
+        let mb = std::env::var("NPU_CPU_PACK_CACHE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(128);
+        std::sync::Mutex::new(PackCache {
+            entries: std::collections::HashMap::new(),
+            bytes: 0,
+            limit: if disabled {
+                0
+            } else {
+                mb.saturating_mul(1024 * 1024)
+            },
+            stamp: 0,
+        })
+    })
+}
+
+/// A full-content fingerprint: every element of B, hashed by its exact bits
+/// (so a sign change of zero is visible too). Used both to tell a reused
+/// allocation from the same weights and to notice an in-place mutation.
+#[cfg(target_arch = "x86_64")]
+fn content_fingerprint(b: &[f32]) -> u64 {
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325u64;
+    for &v in b {
+        fingerprint = (fingerprint ^ (v.to_bits() as u64)).wrapping_mul(0x100_0000_01b3);
+    }
+    fingerprint
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pack_key(b: &[f32], k: usize, n: usize) -> PackKey {
+    PackKey {
+        ptr: b.as_ptr() as usize,
+        k,
+        n,
+        fingerprint: content_fingerprint(b),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pack_cache_get(key: &PackKey) -> Option<std::sync::Arc<[f32]>> {
+    let mut cache = pack_cache().lock().unwrap();
+    if !cache.entries.contains_key(key) {
+        return None;
+    }
+    cache.stamp += 1;
+    let stamp = cache.stamp;
+    let entry = cache.entries.get_mut(key).unwrap();
+    entry.stamp = stamp;
+    Some(std::sync::Arc::clone(&entry.data))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pack_cache_put(key: PackKey, data: std::sync::Arc<[f32]>, bytes: usize) {
+    let mut cache = pack_cache().lock().unwrap();
+    if bytes > cache.limit {
+        return;
+    }
+    cache.stamp += 1;
+    let stamp = cache.stamp;
+    if let Some(old) = cache.entries.insert(key, PackEntry { data, bytes, stamp }) {
+        cache.bytes = cache.bytes.saturating_sub(old.bytes);
+    }
+    cache.bytes += bytes;
+    // A bounded LRU: a process that loads many models must not retain every
+    // panel it ever packed. Evicting a panel only costs one future repack.
+    while cache.bytes > cache.limit {
+        let victim = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.stamp)
+            .map(|(key, _)| *key);
+        match victim {
+            Some(key) => {
+                if let Some(entry) = cache.entries.remove(&key) {
+                    cache.bytes = cache.bytes.saturating_sub(entry.bytes);
+                }
+            }
+            None => break,
+        }
+    }
+}
+
+/// Forget every cached panel. Call this when a model's weight buffers are
+/// freed or replaced: the cache keys on addresses, and an address can be
+/// reused by a different tensor.
+#[cfg(target_arch = "x86_64")]
+pub fn clear_b_pack_cache() {
+    let mut cache = pack_cache().lock().unwrap();
+    cache.entries.clear();
+    cache.bytes = 0;
+}
+
 /// Give `f` an immutable packed copy of B for this call.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn with_packed_b<R>(b: &[f32], k: usize, n: usize, f: impl FnOnce(&[f32]) -> R) -> R {
+    let key = pack_key(b, k, n);
+    if let Some(packed) = pack_cache_get(&key) {
+        return f(&packed);
+    }
+    // Miss: pack into this thread's scratch, publish a snapshot to the cache,
+    // and compute from the scratch (no second copy on the cold path).
     B_PACK.with(|cell| {
         let mut buf = cell.borrow_mut();
         pack_b_avx2(b, k, n, &mut buf);
         let len = packed_b_len(k, n);
+        pack_cache_put(
+            key,
+            std::sync::Arc::from(&buf[..len]),
+            len * std::mem::size_of::<f32>(),
+        );
         f(&buf[..len])
     })
 }
@@ -678,7 +994,14 @@ pub fn gemm_nt_rows(
     }
     let work = (m as i64) * (k as i64) * (n as i64);
     let Some(chunk) = parallel::chunk_rows(m, work, threads) else {
-        gemm_nt(a, m, b, k, n, bias, out);
+        // `m` is too small for a row split -- the autoregressive decode case.
+        // Its output columns are still independent, so split those instead of
+        // leaving the whole projection on one core.
+        if let Some(col_chunk) = parallel::chunk_cols(n, work, threads) {
+            gemm_nt_cols(a, m, b, k, n, bias, out, col_chunk);
+        } else {
+            gemm_nt(a, m, b, k, n, bias, out);
+        }
         return;
     };
     #[cfg(target_arch = "x86_64")]
@@ -702,12 +1025,17 @@ pub fn gemm_nt_rows(
         });
         return;
     }
+    // Ordinary widths deliberately use the ORIGINAL strided B. Every worker
+    // must therefore take the no-pack dispatcher: going through `gemm_nt`
+    // would satisfy `should_pack_b(rows, k, n)` on each worker and repack the
+    // whole weight matrix into that worker's thread-local B_PACK, once per
+    // worker per GEMM. See the note above the packed branch.
     parallel::for_each_chunk_mut(out, chunk * n, |ci, part| {
         let rows = part.len() / n;
         let start_row = ci * chunk;
         let a_part = &a[start_row * k..(start_row + rows) * k];
         // Each worker's accumulator is thread-local and reused across calls.
-        gemm_nt(a_part, rows, b, k, n, bias, part);
+        gemm_nt_no_pack(a_part, rows, b, k, n, bias, part);
     });
 }
 
@@ -733,6 +1061,9 @@ pub fn gemm_nt_rows_on(
     }
     let work = (m as i64) * (k as i64) * (n as i64);
     let Some(chunk) = parallel::chunk_rows(m, work, threads) else {
+        if let Some(col_chunk) = parallel::chunk_cols(n, work, threads) {
+            return gemm_nt_cols_on(isa, a, m, b, k, n, bias, out, col_chunk);
+        }
         return gemm_nt_on(isa, a, m, b, k, n, bias, out);
     };
     #[cfg(target_arch = "x86_64")]
@@ -758,6 +1089,287 @@ pub fn gemm_nt_rows_on(
         let start_row = ci * chunk;
         let a_part = &a[start_row * k..(start_row + rows) * k];
         if !gemm_nt_on(isa, a_part, rows, b, k, n, bias, part) {
+            failed.store(true, Ordering::Relaxed);
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        gemm_nt_on(Isa::Portable, a, m, b, k, n, bias, out);
+    }
+    true
+}
+
+// ------------------------------------------------ column-parallel GEMM (decode)
+//
+// A decode projects ONE token: m = 1. `chunk_rows` cannot split that -- it
+// insists on eight rows per worker -- so every projection and FFN of an
+// autoregressive step used to run on a single core. Output COLUMNS, however,
+// are independent: column j is reduced over all of K in order, no matter
+// which worker computes it. Splitting N is therefore bit-exact by the same
+// argument that makes the row split bit-exact, and it brings the pool to a
+// shape the row policy has to leave serial.
+//
+// The kernels below are the row-at-a-time kernels with a column WINDOW: B is
+// still `[k, ldb]` and is read at `b[kk*ldb + j0 + j]`, while the output is a
+// contiguous `out_windows[r][0..nc]` slice. No copy of B is made, so a
+// single-token GEMM never pays for a pack (which would need `m >= 8` reuse to
+// amortise anyway).
+
+/// The column-window GEMM on a named ISA.
+///
+/// Returns `false` if the host cannot run `isa`; the caller then computes the
+/// whole GEMM portably. Only windows inside the same row are ever handed out,
+/// so worker results never overlap.
+#[inline]
+fn gemm_nt_window(
+    isa: Isa,
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    ldb: usize,
+    k: usize,
+    bias: &[f32],
+    out_windows: &mut [&mut [f32]],
+    j0: usize,
+) -> bool {
+    let nc = out_windows.first().map_or(0, |w| w.len());
+    if nc == 0 || m == 0 {
+        return true;
+    }
+    match isa {
+        Isa::Portable => {
+            with_gemm_acc(nc, |acc| {
+                gemm_nt_impl_window(a, m, b, ldb, k, bias, out_windows, j0, acc)
+            });
+            true
+        }
+        Isa::Avx2 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !has_avx2_fma() {
+                    return false;
+                }
+                with_gemm_acc(nc, |acc| unsafe {
+                    gemm_nt_avx2_rows_window(a, m, b, ldb, k, bias, out_windows, j0, acc)
+                });
+                true
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                false
+            }
+        }
+        Isa::Avx512 => {
+            #[cfg(all(target_arch = "x86_64", has_stable_avx512))]
+            {
+                if !has_avx512f() {
+                    return false;
+                }
+                with_gemm_acc(nc, |acc| unsafe {
+                    gemm_nt_avx512_rows_window(a, m, b, ldb, k, bias, out_windows, j0, acc)
+                });
+                true
+            }
+            #[cfg(not(all(target_arch = "x86_64", has_stable_avx512)))]
+            {
+                false
+            }
+        }
+    }
+}
+
+/// The portable body: one FMA per step, K in order, bias added last.
+#[inline]
+fn gemm_nt_impl_window(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    ldb: usize,
+    k: usize,
+    bias: &[f32],
+    out_windows: &mut [&mut [f32]],
+    j0: usize,
+    acc: &mut [f32],
+) {
+    for (r, out) in out_windows.iter_mut().enumerate().take(m) {
+        let arow = &a[r * k..r * k + k];
+        let nc = out.len();
+        acc[..nc].fill(0.0);
+        for kk in 0..k {
+            let av = arow[kk];
+            let brow = &b[kk * ldb + j0..kk * ldb + j0 + nc];
+            for j in 0..nc {
+                acc[j] = brow[j].mul_add(av, acc[j]);
+            }
+        }
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = acc[j] + bias[j0 + j];
+        }
+    }
+}
+
+/// The eight-lane body, with the same masked tail as `gemm_nt_avx2_rows`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_nt_avx2_rows_window(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    ldb: usize,
+    k: usize,
+    bias: &[f32],
+    out_windows: &mut [&mut [f32]],
+    j0: usize,
+    acc: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    for (r, out) in out_windows.iter_mut().enumerate().take(m) {
+        let arow = &a[r * k..r * k + k];
+        let nc = out.len();
+        acc[..nc].fill(0.0);
+        for kk in 0..k {
+            let av = _mm256_set1_ps(arow[kk]);
+            // SAFETY: every window lies inside `b`, whose rows are `ldb`
+            // floats apart; `j0 + nc <= ldb`.
+            unsafe {
+                let brow = b.as_ptr().add(kk * ldb + j0);
+                let mut j = 0usize;
+                while j + 8 <= nc {
+                    let bv = _mm256_loadu_ps(brow.add(j));
+                    let cv = _mm256_loadu_ps(acc.as_ptr().add(j));
+                    let sum = _mm256_fmadd_ps(bv, av, cv);
+                    _mm256_storeu_ps(acc.as_mut_ptr().add(j), sum);
+                    j += 8;
+                }
+                if j < nc {
+                    let mask = avx2_tail_mask(nc - j);
+                    let bv = _mm256_maskload_ps(brow.add(j), mask);
+                    let cv = _mm256_maskload_ps(acc.as_ptr().add(j), mask);
+                    let sum = _mm256_fmadd_ps(bv, av, cv);
+                    _mm256_maskstore_ps(acc.as_mut_ptr().add(j), mask, sum);
+                }
+            }
+        }
+        // Vector bias add, with the window's column offset folded into the
+        // bias pointer. One rounding per lane, as in the scalar loop.
+        unsafe {
+            let dst = out.as_mut_ptr();
+            let bp = bias.as_ptr().add(j0);
+            let mut j = 0usize;
+            while j + 8 <= nc {
+                let c = _mm256_loadu_ps(acc.as_ptr().add(j));
+                let b = _mm256_loadu_ps(bp.add(j));
+                _mm256_storeu_ps(dst.add(j), _mm256_add_ps(c, b));
+                j += 8;
+            }
+            if j < nc {
+                let mask = avx2_tail_mask(nc - j);
+                let c = _mm256_maskload_ps(acc.as_ptr().add(j), mask);
+                let b = _mm256_maskload_ps(bp.add(j), mask);
+                _mm256_maskstore_ps(dst.add(j), mask, _mm256_add_ps(c, b));
+            }
+        }
+    }
+}
+
+/// The sixteen-lane body, with the same masked tail as `gemm_nt_avx512_rows`.
+#[cfg(all(target_arch = "x86_64", has_stable_avx512))]
+#[target_feature(enable = "avx512f")]
+unsafe fn gemm_nt_avx512_rows_window(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    ldb: usize,
+    k: usize,
+    bias: &[f32],
+    out_windows: &mut [&mut [f32]],
+    j0: usize,
+    acc: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    for (r, out) in out_windows.iter_mut().enumerate().take(m) {
+        let arow = &a[r * k..r * k + k];
+        let nc = out.len();
+        acc[..nc].fill(0.0);
+        for kk in 0..k {
+            let av = _mm512_set1_ps(arow[kk]);
+            // SAFETY: as in the eight-lane window kernel.
+            unsafe {
+                let brow = b.as_ptr().add(kk * ldb + j0);
+                let mut j = 0usize;
+                while j + 16 <= nc {
+                    let bv = _mm512_loadu_ps(brow.add(j));
+                    let cv = _mm512_loadu_ps(acc.as_ptr().add(j));
+                    let sum = _mm512_fmadd_ps(bv, av, cv);
+                    _mm512_storeu_ps(acc.as_mut_ptr().add(j), sum);
+                    j += 16;
+                }
+                if j < nc {
+                    let mask = avx512_tail_mask(nc - j);
+                    let bv = _mm512_maskz_loadu_ps(mask, brow.add(j));
+                    let cv = _mm512_maskz_loadu_ps(mask, acc.as_ptr().add(j));
+                    let sum = _mm512_fmadd_ps(bv, av, cv);
+                    _mm512_mask_storeu_ps(acc.as_mut_ptr().add(j), mask, sum);
+                }
+            }
+        }
+        unsafe {
+            let dst = out.as_mut_ptr();
+            let bp = bias.as_ptr().add(j0);
+            let mut j = 0usize;
+            while j + 16 <= nc {
+                let c = _mm512_loadu_ps(acc.as_ptr().add(j));
+                let b = _mm512_loadu_ps(bp.add(j));
+                _mm512_storeu_ps(dst.add(j), _mm512_add_ps(c, b));
+                j += 16;
+            }
+            if j < nc {
+                let mask = avx512_tail_mask(nc - j);
+                let c = _mm512_maskz_loadu_ps(mask, acc.as_ptr().add(j));
+                let b = _mm512_maskz_loadu_ps(mask, bp.add(j));
+                _mm512_mask_storeu_ps(dst.add(j), mask, _mm512_add_ps(c, b));
+            }
+        }
+    }
+}
+
+/// Split a GEMM's output COLUMNS over the shared pool, `chunk_cols` columns
+/// per worker, on the host's best ISA.
+pub fn gemm_nt_cols(
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    chunk_cols: usize,
+) {
+    let _ = gemm_nt_cols_on(gemm_isa(), a, m, b, k, n, bias, out, chunk_cols);
+}
+
+/// The column split on a named ISA, for the byte gate.
+pub fn gemm_nt_cols_on(
+    isa: Isa,
+    a: &[f32],
+    m: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    chunk_cols: usize,
+) -> bool {
+    if m == 0 || n == 0 || chunk_cols == 0 {
+        return true;
+    }
+    if out.len() < m * n {
+        return false;
+    }
+    let failed = AtomicBool::new(false);
+    parallel::for_each_col_chunk(&mut out[..m * n], n, chunk_cols, |_, j0, mut wins| {
+        if !gemm_nt_window(isa, a, m, b, n, k, bias, &mut wins, j0) {
             failed.store(true, Ordering::Relaxed);
         }
     });
@@ -839,6 +1451,7 @@ fn gemm_nt_dispatch(
     bias: &[f32],
     out: &mut [f32],
     acc: &mut [f32],
+    pack: bool,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -865,10 +1478,13 @@ fn gemm_nt_dispatch(
             // eight are vectorised too; there is no scalar cut-off left.
             // SAFETY: as above.
             unsafe {
-                if should_pack_b(m, k, n) {
+                if pack && should_pack_b(m, k, n) {
                     // Packing makes the column-panel reads contiguous, so
                     // even the page-multiple widths that used to force the
                     // row-wise kernel can use the register-blocked one.
+                    // A row-parallel caller passes `pack = false`: it has
+                    // already decided against sharing a packed panel and
+                    // cannot afford to redo this pass on every worker.
                     with_packed_b(b, k, n, |packed| {
                         gemm_nt_avx2_packed(a, m, b, packed, k, n, bias, out, acc)
                     });
@@ -991,9 +1607,24 @@ unsafe fn gemm_nt_avx512_rows(
                 }
             }
         }
-        let orow = &mut out[r * n..r * n + n];
-        for j in 0..n {
-            orow[j] = acc[j] + bias[j];
+        // The bias is a plain add -- one rounding, no FMA -- so adding eight
+        // columns at a time is the same number in each lane as the old scalar
+        // loop. A masked tail keeps the byte result for short rows too.
+        unsafe {
+            let dst = out.as_mut_ptr().add(r * n);
+            let mut j = 0usize;
+            while j + 16 <= n {
+                let c = _mm512_loadu_ps(acc.as_ptr().add(j));
+                let b = _mm512_loadu_ps(bias.as_ptr().add(j));
+                _mm512_storeu_ps(dst.add(j), _mm512_add_ps(c, b));
+                j += 16;
+            }
+            if j < n {
+                let mask = avx512_tail_mask(n - j);
+                let c = _mm512_maskz_loadu_ps(mask, acc.as_ptr().add(j));
+                let b = _mm512_maskz_loadu_ps(mask, bias.as_ptr().add(j));
+                _mm512_mask_storeu_ps(dst.add(j), mask, _mm512_add_ps(c, b));
+            }
         }
     }
 }
@@ -1044,9 +1675,23 @@ unsafe fn gemm_nt_avx2_rows(
                 }
             }
         }
-        let orow = &mut out[r * n..r * n + n];
-        for j in 0..n {
-            orow[j] = acc[j] + bias[j];
+        // Same vector bias add as the sixteen-lane kernel above; `_mm256_add_ps`
+        // rounds once per lane, exactly as `acc[j] + bias[j]` did.
+        unsafe {
+            let dst = out.as_mut_ptr().add(r * n);
+            let mut j = 0usize;
+            while j + 8 <= n {
+                let c = _mm256_loadu_ps(acc.as_ptr().add(j));
+                let b = _mm256_loadu_ps(bias.as_ptr().add(j));
+                _mm256_storeu_ps(dst.add(j), _mm256_add_ps(c, b));
+                j += 8;
+            }
+            if j < n {
+                let mask = avx2_tail_mask(n - j);
+                let c = _mm256_maskload_ps(acc.as_ptr().add(j), mask);
+                let b = _mm256_maskload_ps(bias.as_ptr().add(j), mask);
+                _mm256_maskstore_ps(dst.add(j), mask, _mm256_add_ps(c, b));
+            }
         }
     }
 }
@@ -1667,13 +2312,9 @@ pub fn fused_attention(
     head_dim: usize,
     hidden: usize,
 ) -> Result<()> {
-    if seq % 8 != 0 {
-        return Err(TensorError::WrongLength {
-            expected: seq.next_multiple_of(8),
-            found: seq,
-        }
-        .into());
-    }
+    // `seq` need not be a multiple of eight: `softmax_row_impl` now has a
+    // masked scalar tail. `dot8` still needs at least one eight-lane group,
+    // so a head narrower than that uses the scalar dot below.
     let rows = batch * seq;
     let span = rows * hidden;
     if ctx.len() < span {
@@ -1714,7 +2355,13 @@ pub fn fused_attention(
                 // QK^T, with the mask added where the separate QK pass adds it.
                 for (j, slot) in scores.iter_mut().enumerate() {
                     let k_base = (b * seq + j) * 3 * hidden + hidden + h * head_dim;
-                    *slot = dot8(q, &qkv[k_base..k_base + head_dim]) + add_mask[b * seq + j];
+                    let krow = &qkv[k_base..k_base + head_dim];
+                    let score = if head_dim >= 8 {
+                        dot8(q, krow)
+                    } else {
+                        q.iter().zip(krow).map(|(&a, &b)| a * b).sum()
+                    };
+                    *slot = score + add_mask[b * seq + j];
                 }
                 softmax_row_impl(scores);
                 let o = &mut out[h * head_dim..][..head_dim];
@@ -1949,6 +2596,14 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &mut Tensor, acc: Option<&mut Tensor>) ->
 }
 
 /// Scaled dot-product attention: `softmax(q k^T / sqrt(d)) v`.
+///
+/// One score row is kept in the shared `ATTN_ROW` scratch instead of
+/// allocating an `n_q x n_kv` matrix. The ARITHMETIC, though, stays the
+/// reference's: scalar QK products and a plain `result += w * v` accumulation.
+/// `dot8` and `weighted_accumulate` are the FUSED-attention kernels -- they
+/// contract differently (FMA) and produce different bits here, so using them
+/// would silently move every embedding golden. Rows are independent, so
+/// overwriting the row for the next query changes no answer.
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor) -> Result<()> {
     let qv = q.to_f32();
     let kv = k.to_f32();
@@ -1960,30 +2615,114 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor) -> Result
     let scale = 1.0 / (d as f32).sqrt();
     let n_kv = kv.len() / d;
     let n_q = qv.len() / d;
-    let mut scores = vec![0.0f32; n_q * n_kv];
-    for i in 0..n_q {
-        for j in 0..n_kv {
-            let mut sum = 0.0f32;
-            for p in 0..d {
-                sum += qv[i * d + p] * kv[j * d + p];
-            }
-            scores[i * n_kv + j] = sum * scale;
+    if n_kv == 0 || n_q == 0 {
+        return Ok(());
+    }
+    // Every element is overwritten below, so skip the zero pass.
+    let mut result = scratch_f32(n_q * d);
+    ATTN_ROW.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < n_kv {
+            scratch.resize(n_kv, 0.0);
         }
-    }
-    for i in 0..n_q {
-        softmax_row(&mut scores[i * n_kv..(i + 1) * n_kv])?;
-    }
-    let mut result = vec![0.0f32; n_q * d];
-    for i in 0..n_q {
-        for j in 0..n_kv {
-            let w = scores[i * n_kv + j];
-            for p in 0..d {
-                result[i * d + p] += w * vv[j * d + p];
+        let scores = &mut scratch[..n_kv];
+        for i in 0..n_q {
+            let qrow = &qv[i * d..(i + 1) * d];
+            for (j, slot) in scores.iter_mut().enumerate() {
+                let krow = &kv[j * d..(j + 1) * d];
+                let mut sum = 0.0f32;
+                for p in 0..d {
+                    sum += qrow[p] * krow[p];
+                }
+                *slot = sum * scale;
+            }
+            softmax_row(scores)?;
+            let orow = &mut result[i * d..(i + 1) * d];
+            orow.fill(0.0);
+            for (j, &weight) in scores.iter().enumerate() {
+                let vrow = &vv[j * d..(j + 1) * d];
+                for p in 0..d {
+                    orow[p] += weight * vrow[p];
+                }
             }
         }
-    }
+        Ok(())
+    })?;
     copy_into(out, &result);
     Ok(())
+}
+
+// The im2col gather writes every column, but the weight transpose was being
+// redone on EVERY convolution call even though a model's filters never change.
+// A few entries per thread are enough: a forward pass alternates between the
+// layers of one network, not between hundreds of different filter sets.
+thread_local! {
+    static CONV_W: RefCell<Vec<(ConvKey, std::sync::Arc<[f32]>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// A full 128-bit fingerprint of the tensor's raw bytes.
+///
+/// Unlike a GEMM weight, a conv filter is decoded into a FRESH `Vec` on every
+/// call (`to_f32`), so its address cannot key a cache. The bytes are stable,
+/// and hashing them is a single linear read -- cheaper than the scattered
+/// writes of the transpose it saves. Two independent FNV-style accumulators
+/// make a collision across different filters vanishingly unlikely.
+fn conv_fingerprint(bytes: &[u8]) -> u128 {
+    let mut h1 = 0xcbf2_9ce4_8422_2325u64;
+    let mut h2 = 0x9e37_79b9_7f4a_7c15u64;
+    for &byte in bytes {
+        h1 = (h1 ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        h2 = (h2.rotate_left(5) ^ (byte as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    }
+    ((h1 as u128) << 64) | h2 as u128
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConvKey {
+    hash: u128,
+    len: usize,
+    kdim: usize,
+    cout: usize,
+    tag: u64,
+}
+
+/// Transpose a conv filter into the GEMM's `[kdim, cout]` layout, reusing the
+/// last few results. The fill closure runs only on a miss; a hit returns the
+/// same floats without even decoding the tensor.
+fn conv_weights(
+    w: &Tensor,
+    kdim: usize,
+    cout: usize,
+    tag: u64,
+    fill: impl FnOnce(&[f32], &mut [f32]),
+) -> std::sync::Arc<[f32]> {
+    let raw = w.bytes();
+    let key = ConvKey {
+        hash: conv_fingerprint(raw),
+        len: raw.len(),
+        kdim,
+        cout,
+        tag,
+    };
+    CONV_W.with(|cell| {
+        let mut entries = cell.borrow_mut();
+        if let Some((_, cached)) = entries.iter_mut().find(|(k, _)| *k == key) {
+            return std::sync::Arc::clone(cached);
+        }
+        let wv = w.to_f32();
+        // The GEMM overwrites every element, so the zero pass of `vec!` is
+        // pure overhead here.
+        let mut buf = scratch_f32(kdim * cout);
+        fill(&wv, &mut buf);
+        let packed: std::sync::Arc<[f32]> = std::sync::Arc::from(buf);
+        if entries.len() >= 4 {
+            entries.remove(0);
+        }
+        entries.push((key, std::sync::Arc::clone(&packed)));
+        packed
+    })
 }
 
 /// Pad an optional bias tensor to exactly `cout` entries.
@@ -2040,7 +2779,6 @@ fn conv_gemm(
 /// arithmetic runs through the reference SIMD kernels.
 pub fn conv1d(x: &mut Tensor, w: &Tensor, b: Option<&Tensor>, stride: i64, pad: i64) -> Result<()> {
     let xv = x.to_f32();
-    let wv = w.to_f32();
     let xs = x.shape();
     let ws = w.shape();
     if xs.len() != 3 || ws.len() != 3 {
@@ -2076,18 +2814,20 @@ pub fn conv1d(x: &mut Tensor, w: &Tensor, b: Option<&Tensor>, stride: i64, pad: 
     }
     // The weight is stored `[cout, cin, k]`; the GEMM wants `[cin*k, cout]`.
     // Flattening the filter's `(channel, tap)` index keeps the reduction in
-    // exactly the order the direct loops used.
-    let mut weights = vec![0.0f32; kdim * cout];
-    for co in 0..cout {
-        for ci in 0..cin {
-            for ki in 0..k {
-                weights[(ci * k + ki) * cout + co] = wv[(co * cin + ci) * k + ki];
+    // exactly the order the direct loops used. Filters are immutable, so the
+    // transpose is cached between calls instead of being paid every time.
+    let weights = conv_weights(w, kdim, cout, 1, |wv, weights| {
+        for co in 0..cout {
+            for ci in 0..cin {
+                for ki in 0..k {
+                    weights[(ci * k + ki) * cout + co] = wv[(co * cin + ci) * k + ki];
+                }
             }
         }
-    }
+    });
 
     let bias_owned = conv_bias(b, cout);
-    let mut gemm_out = vec![0.0f32; rows * cout];
+    let mut gemm_out = scratch_f32(rows * cout);
     with_zero_bias(cout, |zeros| {
         conv_gemm(
             &columns,
@@ -2100,7 +2840,7 @@ pub fn conv1d(x: &mut Tensor, w: &Tensor, b: Option<&Tensor>, stride: i64, pad: 
         );
     });
 
-    let mut out = vec![0.0f32; n * cout * l_out];
+    let mut out = scratch_f32(n * cout * l_out);
     for bi in 0..n {
         for oi in 0..l_out {
             let src = &gemm_out[(bi * l_out + oi) * cout..][..cout];
@@ -2126,7 +2866,6 @@ pub fn conv2d(
     pad: (i64, i64),
 ) -> Result<()> {
     let xv = x.to_f32();
-    let wv = w.to_f32();
     let xs = x.shape();
     let ws = w.shape();
     if xs.len() != 4 || ws.len() != 4 {
@@ -2174,20 +2913,21 @@ pub fn conv2d(
             }
         }
     }
-    let mut weights = vec![0.0f32; kdim * cout];
-    for co in 0..cout {
-        for ci in 0..cin {
-            for ki in 0..kh {
-                for kwi in 0..kw {
-                    weights[((ci * kh + ki) * kw + kwi) * cout + co] =
-                        wv[((co * cin + ci) * kh + ki) * kw + kwi];
+    let weights = conv_weights(w, kdim, cout, 2, |wv, weights| {
+        for co in 0..cout {
+            for ci in 0..cin {
+                for ki in 0..kh {
+                    for kwi in 0..kw {
+                        weights[((ci * kh + ki) * kw + kwi) * cout + co] =
+                            wv[((co * cin + ci) * kh + ki) * kw + kwi];
+                    }
                 }
             }
         }
-    }
+    });
 
     let bias_owned = conv_bias(b, cout);
-    let mut gemm_out = vec![0.0f32; rows * cout];
+    let mut gemm_out = scratch_f32(rows * cout);
     with_zero_bias(cout, |zeros| {
         conv_gemm(
             &columns,
@@ -2200,7 +2940,7 @@ pub fn conv2d(
         );
     });
 
-    let mut out = vec![0.0f32; n * cout * plane_out];
+    let mut out = scratch_f32(n * cout * plane_out);
     for bi in 0..n {
         for oi in 0..h_out {
             for oj in 0..w_out {
@@ -2245,11 +2985,16 @@ pub fn fft(x: &Tensor, out: &mut Tensor) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
-    let mut result = vec![0.0f32; n];
+    // The angle is computed from (k, t) DIRECTLY, in this order, in f32:
+    // `-2π*k*t/n`. A twiddle table indexed by `(k*t) mod n` is mathematically
+    // the same angle, but a much smaller f32 argument, so cos/sin round
+    // differently and the mel bank receives different numbers. The reference
+    // arithmetic is the contract here; keep it.
+    let mut result = scratch_f32(n);
     for k in 0..n {
         let mut re = 0.0f32;
         let mut im = 0.0f32;
-        for (t, v) in xv.iter().enumerate() {
+        for (t, &v) in xv.iter().enumerate() {
             let angle = -2.0 * std::f32::consts::PI * (k as f32) * (t as f32) / (n as f32);
             re += v * angle.cos();
             im += v * angle.sin();

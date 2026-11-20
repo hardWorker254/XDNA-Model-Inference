@@ -88,7 +88,17 @@ impl Unigram {
     /// Cc+Cf+Zl+Zp. A control character is dropped and a space becomes the
     /// word-boundary marker.
     fn normalise(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
+        let mut out = String::with_capacity(text.len() + 1);
+        // SentencePiece marks the beginning of a word with `▁` AND prepends
+        // that marker to the input. Without it, no piece beginning with the
+        // marker can ever match text that starts with a word.
+        if let Some(first) = text.chars().next() {
+            // A leading space already becomes the marker below; adding one
+            // here as well would double it.
+            if first != WORD_BOUNDARY && !first.is_whitespace() {
+                out.push(WORD_BOUNDARY);
+            }
+        }
         for ch in text.chars() {
             let cp = ch as u32;
             if self.tables.is_control(cp) {

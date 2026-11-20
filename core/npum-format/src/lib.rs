@@ -296,14 +296,27 @@ impl ContainerMeta {
                 path: self.path.clone(),
                 name: name.to_string(),
             })?;
-        let start = (self.header.data_offset + entry.offset) as usize;
-        let end = start + entry.nbytes as usize;
-        self.bytes
-            .get(start..end)
-            .ok_or_else(|| Error::TensorOutOfBounds {
-                path: self.path.clone(),
-                name: name.to_string(),
-            })
+        let bad = || Error::TensorOutOfBounds {
+            path: self.path.clone(),
+            name: name.to_string(),
+        };
+        // A directory is data, and data can be corrupt. Neither the header's
+        // offsets nor the entry's may wrap, on 32- or 64-bit hosts; and a
+        // tensor must stay inside the header's declared payload, not just
+        // inside the mapping (which would let it borrow the directory).
+        let offset = usize::try_from(entry.offset).map_err(|_| bad())?;
+        let nbytes = usize::try_from(entry.nbytes).map_err(|_| bad())?;
+        let base = usize::try_from(self.header.data_offset).map_err(|_| bad())?;
+        let start = base.checked_add(offset).ok_or_else(bad)?;
+        let end = start.checked_add(nbytes).ok_or_else(bad)?;
+        let payload_end = usize::try_from(self.header.data_length)
+            .ok()
+            .and_then(|len| base.checked_add(len))
+            .unwrap_or(usize::MAX);
+        if end > payload_end {
+            return Err(bad());
+        }
+        self.bytes.get(start..end).ok_or_else(bad)
     }
 
     /// Every tensor's name, in directory order.

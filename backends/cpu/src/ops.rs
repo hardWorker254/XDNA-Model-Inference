@@ -122,15 +122,9 @@ impl Ops for CpuOps {
             }
             .into());
         }
-        // The row kernel's only error is a row that is not a multiple of
-        // eight. Check it once here so the parallel path cannot swallow it.
-        if rows > 0 && width > 0 && width % 8 != 0 {
-            return Err(TensorError::WrongLength {
-                expected: width.next_multiple_of(8),
-                found: width,
-            }
-            .into());
-        }
+        // The row kernels now handle a short tail, so an attention sequence
+        // whose length is not a multiple of eight no longer has to be padded
+        // (quadratic work in a short batch) or rejected at this seam.
         let work = (rows as i64) * (width as i64);
         match parallel::chunk_rows(rows, work, self.threads) {
             Some(chunk) => {
@@ -173,13 +167,6 @@ impl Ops for CpuOps {
             }
             .into());
         }
-        if rows > 0 && width > 0 && width % 8 != 0 {
-            return Err(TensorError::WrongLength {
-                expected: width.next_multiple_of(8),
-                found: width,
-            }
-            .into());
-        }
         let work = (rows as i64) * (width as i64);
         match parallel::chunk_rows(rows, work, self.threads) {
             Some(chunk) => {
@@ -199,7 +186,24 @@ impl Ops for CpuOps {
     }
 
     fn add_inplace(&mut self, values: &mut [f32], other: &[f32]) -> Result<()> {
-        kernels::add_inplace(values, other);
+        // Each element depends only on the two values at the same index, so a
+        // chunk boundary crosses no reduction: every worker computes exactly
+        // the sum the serial loop would. GELU already uses this split; the
+        // residual add and the additive attention mask are just as safe to
+        // split, and they run on every layer of every inference.
+        let work = values.len().min(other.len()) as i64;
+        let Some(chunk) = parallel::chunk_rows(values.len(), work, self.threads) else {
+            kernels::add_inplace(values, other);
+            return Ok(());
+        };
+        parallel::for_each_chunk_mut(values, chunk, |ci, part| {
+            let start = ci * chunk;
+            let end = start + part.len();
+            // `add_inplace` clamps to the shorter slice; a short `other` must
+            // leave the tail alone, chunked or not.
+            let src = &other[start.min(other.len())..end.min(other.len())];
+            kernels::add_inplace(part, src);
+        });
         Ok(())
     }
 

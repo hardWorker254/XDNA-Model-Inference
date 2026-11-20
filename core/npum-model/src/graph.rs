@@ -59,7 +59,8 @@ impl ModelSpec {
             .unwrap_or(0) as usize;
         let max_seq = container
             .config()
-            .get_i64("max_seq")
+            .get_i64("max_seq_len")
+            .or_else(|| container.config().get_i64("max_seq"))
             .or_else(|| container.config().get_i64("max_position_embeddings"))
             .unwrap_or(0) as usize;
         let pooling = container.config_str("pooling").map(|s| s.to_string());

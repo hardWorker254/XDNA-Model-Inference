@@ -224,8 +224,25 @@ impl Backend for VulkanBackend {
         if !Self::all_f32(&[a, b, c]) {
             return npum_cpu::kernels::gemm(a, b, c, acc);
         }
-        let (m, k) = (a.shape()[0] as usize, a.shape()[1] as usize);
-        let n = c.shape().last().copied().unwrap_or(0) as usize;
+        let ash = a.shape();
+        let csh = c.shape();
+        if ash.len() != 2 || b.shape().len() != 2 || csh.len() != 2 {
+            return npum_cpu::kernels::gemm(a, b, c, acc);
+        }
+        let (m, k) = (ash[0] as usize, ash[1] as usize);
+        let n = csh[1] as usize;
+        // The CPU path refuses a malformed operand; the GPU path must not
+        // read stale bytes out of a recycled buffer and answer 200 with
+        // garbage. Let the reference produce the canonical error.
+        if b.shape()[0] as usize != k
+            || csh[0] as usize != m
+            || a.len() != m * k
+            || b.len() != k * n
+            || c.len() != m * n
+            || acc.as_ref().is_some_and(|a| a.len() > m * n)
+        {
+            return npum_cpu::kernels::gemm(a, b, c, acc);
+        }
         let Some(gpu) = self.gpu.as_mut() else {
             return npum_cpu::kernels::gemm(a, b, c, acc);
         };

@@ -49,6 +49,9 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
+# packers.vit imports `tools.lib.*` by its full package name, so the ROOT has
+# to be importable too -- not just its subdirectories.
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools" / "lib"))
 sys.path.insert(0, str(REPO / "tools" / "pack"))
 sys.path.insert(0, str(REPO / "reference"))

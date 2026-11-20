@@ -8,6 +8,46 @@ use std::sync::Arc;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use npum_model::array::{ArrayConvs, ArrayEltwise, ArrayText};
+
+/// The array handles one `serve` process opened at startup.
+///
+/// A transport is `Send` but not `Sync`, so the ONE handle per family is kept
+/// behind a `Mutex`: concurrent requests serialise on the hardware context
+/// instead of handing the same `&mut` to two calls. The CLI's `npu` module
+/// opens these; the server only holds and hands them to the CPU pipeline.
+pub struct XdnaForStt {
+    pub enc: Option<Box<dyn ArrayText + Send>>,
+    pub dec: Option<Box<dyn ArrayText + Send>>,
+    pub eltwise: Option<Box<dyn ArrayEltwise + Send>>,
+}
+
+/// The ViT's array handles, with the flags that decide which of the staged
+/// projections are dispatched. Staging a panel is not a dispatch, so the
+/// engine carries the flags the CLI read and the pipeline is told explicitly.
+pub struct XdnaForCls {
+    pub array: Option<Box<dyn ArrayText + Send>>,
+    pub eltwise: Option<Box<dyn ArrayEltwise + Send>>,
+    pub gemm: bool,
+    pub conv: bool,
+}
+
+/// The embedding endpoint's array handles, opened once at startup.
+///
+/// Both of this family's forward passes -- BERT and GTE -- take the same two
+/// seams: `ArrayText` for the four projections and the attention block, and
+/// `ArrayEltwise` for LayerNorm/GELU/softmax. A handle the flag did not name
+/// stays `None`, and the pipeline then does that pass on the host.
+pub struct XdnaForEmbed {
+    pub array: Option<Box<dyn ArrayText + Send>>,
+    pub eltwise: Option<Box<dyn ArrayEltwise + Send>>,
+}
+
+/// The pose endpoint's convolution handle, opened once at startup.
+pub struct XdnaForPose {
+    pub array: Box<dyn ArrayConvs + Send>,
+}
+
 /// The speech endpoint's engine.
 ///
 /// The encoder, the tokenizer and the front end's weights are shared, while
@@ -20,9 +60,13 @@ use std::time::{Duration, Instant};
 /// Tokenisation pads every text to the model's design window. The trailing
 /// all-padding columns carry no information, and with the host/Vulkan softmax
 /// the score width follows the sequence: dropping them is the same answer
-/// with a much smaller attention matrix. The server passes no array attention
-/// or array softmax, so there is no design-fixed width to respect here.
-fn batch_seq(design_seq: usize, lengths: &[usize]) -> usize {
+/// with a much smaller attention matrix. An array attention or an array
+/// softmax fixes the score row at the DESIGN's width, so those runs keep the
+/// full window (`fix_width`) and rely on batching alone -- as the CLI does.
+fn batch_seq(design_seq: usize, lengths: &[usize], fix_width: bool) -> usize {
+    if fix_width {
+        return design_seq;
+    }
     lengths
         .iter()
         .copied()
@@ -57,9 +101,15 @@ mod seq_tests {
 
     #[test]
     fn a_short_batch_drops_only_padding() {
-        assert_eq!(batch_seq(512, &[3, 5, 2]), 5);
-        assert_eq!(batch_seq(512, &[]), 1);
-        assert_eq!(batch_seq(4, &[9, 1]), 4);
+        assert_eq!(batch_seq(512, &[3, 5, 2], false), 5);
+        assert_eq!(batch_seq(512, &[], false), 1);
+        assert_eq!(batch_seq(4, &[9, 1], false), 4);
+    }
+
+    #[test]
+    fn the_array_keeps_the_design_width() {
+        assert_eq!(batch_seq(512, &[3, 5, 2], true), 512);
+        assert_eq!(batch_seq(512, &[], true), 512);
     }
 
     #[test]
@@ -93,6 +143,12 @@ pub struct Transcriber {
     /// in the window between that sweep and the wait cannot be missed.
     avail_gen: Mutex<u64>,
     avail_cv: Condvar,
+    /// The array handles, opened once by `serve`. They are kept behind
+    /// SEPARATE mutexes: one hardware context per handle, and one `&mut` per
+    /// request. `None` is a host run: no device, no design set, no array work.
+    xdna_enc: Option<Arc<Mutex<Box<dyn ArrayText + Send>>>>,
+    xdna_dec: Option<Arc<Mutex<Box<dyn ArrayText + Send>>>>,
+    xdna_elt: Option<Arc<Mutex<Box<dyn ArrayEltwise + Send>>>>,
 }
 
 impl Transcriber {
@@ -144,7 +200,33 @@ impl Transcriber {
             options,
             avail_gen: Mutex::new(0),
             avail_cv: Condvar::new(),
+            xdna_enc: None,
+            xdna_dec: None,
+            xdna_elt: None,
         })
+    }
+
+    /// Give the transcriber the array handles `serve` opened at startup.
+    ///
+    /// The engine does not open a design or a transport itself: the one place
+    /// that knows the search rules, the panel checks and `--artifacts` is the
+    /// CLI's `npu` module. Sharing its result here keeps a host run and an
+    /// array run identical apart from the seams the run actually dispatches.
+    pub fn with_xdna(self, xdna: Option<XdnaForStt>) -> Self {
+        match xdna {
+            Some(h) => Self {
+                xdna_enc: h.enc.map(|e| Arc::new(Mutex::new(e))),
+                xdna_dec: h.dec.map(|e| Arc::new(Mutex::new(e))),
+                xdna_elt: h.eltwise.map(|e| Arc::new(Mutex::new(e))),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Whether this transcriber will dispatch array work.
+    pub fn has_xdna(&self) -> bool {
+        self.xdna_enc.is_some() || self.xdna_dec.is_some() || self.xdna_elt.is_some()
     }
 
     /// The vocabulary's size.
@@ -220,6 +302,24 @@ impl Transcriber {
         let read = npum_cpu::whisper_features::read_wav_bytes(audio, name).map_err(|r| r.0)?;
         let result = {
             let mut decoder = self.acquire_decoder()?;
+            // ONE hardware context per set, so each handle is locked for the
+            // length of the pass. A second request waits here rather than
+            // handing the same `&mut` to two dispatches.
+            let mut enc_guard = self.xdna_enc.as_ref().map(|m| m.lock().unwrap());
+            let mut dec_guard = self.xdna_dec.as_ref().map(|m| m.lock().unwrap());
+            let mut elt_guard = self.xdna_elt.as_ref().map(|m| m.lock().unwrap());
+            let enc: Option<&mut dyn ArrayText> = match enc_guard.as_deref_mut() {
+                Some(b) => Some(b.as_mut()),
+                None => None,
+            };
+            let dec: Option<&mut dyn ArrayText> = match dec_guard.as_deref_mut() {
+                Some(b) => Some(b.as_mut()),
+                None => None,
+            };
+            let elt: Option<&mut dyn ArrayEltwise> = match elt_guard.as_deref_mut() {
+                Some(b) => Some(b.as_mut()),
+                None => None,
+            };
             npum_cpu::whisper_session::transcribe_samples(
                 &self.encoder,
                 &mut decoder,
@@ -227,6 +327,9 @@ impl Transcriber {
                 &read.samples,
                 options,
                 &self.weights,
+                enc,
+                dec,
+                elt,
             )
         };
         self.notify_decoder_free();
@@ -268,6 +371,13 @@ impl ClassifierScratch {
 pub struct Classifier {
     vit: npum_cpu::vit::Vit,
     scratch: Vec<std::sync::Mutex<ClassifierScratch>>,
+    /// The one array handle for this engine, opened by `serve` at startup.
+    xdna_array: Option<Arc<Mutex<Box<dyn ArrayText + Send>>>>,
+    xdna_elt: Option<Arc<Mutex<Box<dyn ArrayEltwise + Send>>>>,
+    /// Staging is not dispatching: the CLI's flags decide which of the
+    /// staged projections the encoder actually submits to the array.
+    xdna_gemm: bool,
+    xdna_conv: bool,
 }
 
 impl Classifier {
@@ -279,7 +389,30 @@ impl Classifier {
             scratch: (0..2)
                 .map(|_| std::sync::Mutex::new(ClassifierScratch::new()))
                 .collect(),
+            xdna_array: None,
+            xdna_elt: None,
+            xdna_gemm: false,
+            xdna_conv: false,
         })
+    }
+
+    /// Give the classifier the array handles `serve` opened at startup.
+    pub fn with_xdna(self, xdna: Option<XdnaForCls>) -> Self {
+        match xdna {
+            Some(h) => Self {
+                xdna_array: h.array.map(|a| Arc::new(Mutex::new(a))),
+                xdna_elt: h.eltwise.map(|e| Arc::new(Mutex::new(e))),
+                xdna_gemm: h.gemm,
+                xdna_conv: h.conv,
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Whether this classifier will dispatch array work.
+    pub fn has_xdna(&self) -> bool {
+        self.xdna_array.is_some() || self.xdna_elt.is_some()
     }
 
     /// How many labels.
@@ -327,8 +460,25 @@ impl Classifier {
             }
         };
         let enc = std::time::Instant::now();
-        self.vit
-            .encode_into(&patches, &mut scratch.workspace, &mut scratch.hidden);
+        let mut array_guard = self.xdna_array.as_ref().map(|m| m.lock().unwrap());
+        let mut elt_guard = self.xdna_elt.as_ref().map(|m| m.lock().unwrap());
+        let backend: Option<&mut dyn ArrayText> = match array_guard.as_deref_mut() {
+            Some(b) => Some(b.as_mut()),
+            None => None,
+        };
+        let eltwise: Option<&mut dyn ArrayEltwise> = match elt_guard.as_deref_mut() {
+            Some(b) => Some(b.as_mut()),
+            None => None,
+        };
+        self.vit.encode_into(
+            &patches,
+            &mut scratch.workspace,
+            &mut scratch.hidden,
+            backend,
+            eltwise,
+            self.xdna_gemm,
+            self.xdna_conv,
+        )?;
         let encoder_s = enc.elapsed().as_secs_f64();
         let head = std::time::Instant::now();
         let d = geometry.hidden as usize;
@@ -366,6 +516,9 @@ pub struct Classification {
 /// function of the image and the thresholds -- so it needs no lock.
 pub struct PoseDetector {
     net: npum_cpu::pose::Network,
+    /// The array's convolutions, behind a lock: one hardware context must not
+    /// be handed to two concurrent requests. `None` runs the host's kernels.
+    xdna: Option<Arc<Mutex<Box<dyn ArrayConvs + Send>>>>,
 }
 
 impl PoseDetector {
@@ -373,7 +526,23 @@ impl PoseDetector {
     pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         let net =
             npum_cpu::pose::Network::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self { net })
+        Ok(Self { net, xdna: None })
+    }
+
+    /// Give the engine the convolution handle `serve` opened at startup.
+    pub fn with_xdna(self, xdna: Option<XdnaForPose>) -> Self {
+        match xdna {
+            Some(h) => Self {
+                xdna: Some(Arc::new(Mutex::new(h.array))),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Whether this engine will actually dispatch convolutions to the array.
+    pub fn has_xdna(&self) -> bool {
+        self.xdna.is_some()
     }
 
     /// The model's geometry.
@@ -403,7 +572,15 @@ impl PoseDetector {
         let (input, letterbox) = npum_cpu::pose_decode::letterbox_normalise(&decoded, geometry)?;
         let front_end_s = front.elapsed().as_secs_f64();
         let net = std::time::Instant::now();
-        let (head, _) = self.net.run_timed(&input)?;
+        let (head, _) = match self.xdna.as_ref() {
+            Some(shared) => {
+                let mut guard = shared
+                    .lock()
+                    .expect("the array convolution mutex was poisoned");
+                self.net.run_timed_on_array(&input, Some(&mut **guard))?
+            }
+            None => self.net.run_timed(&input)?,
+        };
         let network_s = net.elapsed().as_secs_f64();
         let dec = std::time::Instant::now();
         let people = npum_cpu::pose_decode::decode(&head, geometry, &letterbox, params)?;
@@ -525,6 +702,13 @@ pub struct Embedder {
     /// forwards of batch one.
     pending: Arc<Mutex<Vec<PendingEmbed>>>,
     pending_cv: Arc<Condvar>,
+    /// The startup-opened array handles, behind separate locks: a transport is
+    /// `Send` but not `Sync`, so concurrent requests must serialise on the
+    /// hardware context instead of sharing one `&mut`. The two handles are
+    /// separate because a run can stage projections without staging an
+    /// eltwise pass (and the other way round).
+    xdna_array: Option<Arc<Mutex<Box<dyn ArrayText + Send>>>>,
+    xdna_elt: Option<Arc<Mutex<Box<dyn ArrayEltwise + Send>>>>,
 }
 
 type BertSlot = (npum_cpu::bert::BertWorkspace, Vec<f32>);
@@ -614,7 +798,26 @@ impl Embedder {
             gte_workspace: Arc::new(std::sync::Mutex::new(npum_cpu::GteWorkspace::default())),
             pending: Arc::new(Mutex::new(Vec::new())),
             pending_cv: Arc::new(Condvar::new()),
+            xdna_array: None,
+            xdna_elt: None,
         })
+    }
+
+    /// Give the engine the array handles `serve` opened at startup.
+    pub fn with_xdna(self, xdna: Option<XdnaForEmbed>) -> Self {
+        match xdna {
+            Some(h) => Self {
+                xdna_array: h.array.map(|a| Arc::new(Mutex::new(a))),
+                xdna_elt: h.eltwise.map(|e| Arc::new(Mutex::new(e))),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Whether this engine will actually dispatch to the array.
+    pub fn has_xdna(&self) -> bool {
+        self.xdna_array.is_some() || self.xdna_elt.is_some()
     }
 
     /// Give the engine a Vulkan device that is already open.
@@ -694,6 +897,13 @@ impl Embedder {
         // amortising tokenisation, dispatch and device setup.
         const BATCH: usize = 16;
 
+        // The array's score row is the DESIGN's, so an array attention/softmax
+        // keeps the full window. The handles are held for the whole request:
+        // one hardware context must not be handed to two callers at once.
+        let fix_width = self.xdna_array.is_some() || self.xdna_elt.is_some();
+        let mut array_guard = self.xdna_array.as_ref().map(|m| m.lock().unwrap());
+        let mut elt_guard = self.xdna_elt.as_ref().map(|m| m.lock().unwrap());
+
         let mut vectors = Vec::with_capacity(texts.len());
         let mut offset = 0usize;
         if let (Some((gemm, layn, gelu, softm)), Some(shared)) =
@@ -719,18 +929,25 @@ impl Embedder {
             }
             while offset < texts.len() {
                 let batch = (texts.len() - offset).min(BATCH);
-                let eff_seq = batch_seq(self.seq, &lengths[offset..offset + batch]);
+                let eff_seq = batch_seq(self.seq, &lengths[offset..offset + batch], fix_width);
                 let (ids, mask) = pack_batch(&all_ids, &all_mask, self.seq, offset, batch, eff_seq);
                 let mut guard = shared.lock().expect("the Vulkan device mutex was poisoned");
                 let ops = guard
                     .as_mut()
                     .expect("the Vulkan device was opened above and is never removed");
+                let array = array_guard
+                    .as_deref_mut()
+                    .map(|a| a.as_mut() as &mut (dyn ArrayText + '_));
+                let eltwise = elt_guard
+                    .as_deref_mut()
+                    .map(|e| e.as_mut() as &mut (dyn ArrayEltwise + '_));
                 self.with_bert_slot(|(workspace, flat)| {
                     let gte = match &self.model {
                         EmbedModel::Bert(model) => {
                             model
                                 .embed_into(
-                                    &ids, &mask, batch, eff_seq, ops, None, None, workspace, flat,
+                                    &ids, &mask, batch, eff_seq, ops, array, eltwise, workspace,
+                                    flat,
                                 )
                                 .map_err(|e| e.to_string())?;
                             None
@@ -752,8 +969,8 @@ impl Embedder {
                                         &mask,
                                         batch,
                                         eff_seq,
-                                        None,
-                                        None,
+                                        array,
+                                        eltwise,
                                         &mut scratch,
                                     )
                                     .map_err(|e| e.to_string())?,
@@ -782,15 +999,21 @@ impl Embedder {
             let mut ops = npum_cpu::ops::CpuOps::best();
             while offset < texts.len() {
                 let batch = (texts.len() - offset).min(BATCH);
-                let eff_seq = batch_seq(self.seq, &lengths[offset..offset + batch]);
+                let eff_seq = batch_seq(self.seq, &lengths[offset..offset + batch], fix_width);
                 let (ids, mask) = pack_batch(&all_ids, &all_mask, self.seq, offset, batch, eff_seq);
+                let array = array_guard
+                    .as_deref_mut()
+                    .map(|a| a.as_mut() as &mut (dyn ArrayText + '_));
+                let eltwise = elt_guard
+                    .as_deref_mut()
+                    .map(|e| e.as_mut() as &mut (dyn ArrayEltwise + '_));
                 self.with_bert_slot(|(workspace, flat)| {
                     let gte = match &self.model {
                         EmbedModel::Bert(model) => {
                             model
                                 .embed_into(
-                                    &ids, &mask, batch, eff_seq, &mut ops, None, None, workspace,
-                                    flat,
+                                    &ids, &mask, batch, eff_seq, &mut ops, array, eltwise,
+                                    workspace, flat,
                                 )
                                 .map_err(|e| e.to_string())?;
                             None
@@ -810,8 +1033,8 @@ impl Embedder {
                                         &mask,
                                         batch,
                                         eff_seq,
-                                        None,
-                                        None,
+                                        array,
+                                        eltwise,
                                         &mut scratch,
                                     )
                                     .map_err(|e| e.to_string())?,

@@ -87,6 +87,9 @@ pub enum TensorError {
     #[error("shape {shape:?} does not match the data length {len}")]
     ShapeMismatch { shape: Vec<i64>, len: usize },
 
+    #[error("shape {shape:?} has a negative or overflowing dimension")]
+    InvalidShape { shape: Vec<i64> },
+
     #[error("cannot widen {from} into {to}")]
     BadDType { from: DType, to: DType },
 }
@@ -99,10 +102,25 @@ pub struct Tensor {
     data: Vec<u8>,
 }
 
+/// The number of elements a shape describes.
+///
+/// Shape dimensions come from a container directory, so a negative dimension
+/// or a product too large for `usize` is data to refuse, not a panic or a
+/// wrap into a plausible small tensor.
+fn element_count(shape: &[i64]) -> Result<usize, TensorError> {
+    shape.iter().try_fold(1usize, |count, dim| {
+        let dim = usize::try_from(*dim)
+            .map_err(|_| TensorError::InvalidShape { shape: shape.to_vec() })?;
+        count
+            .checked_mul(dim)
+            .ok_or_else(|| TensorError::InvalidShape { shape: shape.to_vec() })
+    })
+}
+
 impl Tensor {
     /// A tensor of f32, from a shape and the values.
     pub fn f32(shape: Vec<i64>, values: Vec<f32>) -> Result<Self, TensorError> {
-        let expected: usize = shape.iter().map(|d| *d as usize).product();
+        let expected = element_count(&shape)?;
         if expected != values.len() {
             return Err(TensorError::WrongLength {
                 expected,
@@ -122,7 +140,9 @@ impl Tensor {
 
     /// A tensor of raw bytes.
     pub fn raw(dtype: DType, shape: Vec<i64>, data: Vec<u8>) -> Result<Self, TensorError> {
-        let expected: usize = shape.iter().map(|d| *d as usize).product::<usize>() * dtype.size();
+        let expected = element_count(&shape)?
+            .checked_mul(dtype.size())
+            .ok_or_else(|| TensorError::InvalidShape { shape: shape.clone() })?;
         if expected != data.len() {
             return Err(TensorError::ShapeMismatch {
                 shape,
@@ -154,7 +174,10 @@ impl Tensor {
 
     /// How many elements the tensor holds.
     pub fn len(&self) -> usize {
-        self.shape.iter().map(|d| *d as usize).product()
+        // Both constructors validate the shape, so this cannot fail for a
+        // tensor that exists. Still refuse to panic if one is ever built by a
+        // path that bypasses them.
+        element_count(&self.shape).unwrap_or(0)
     }
 
     /// Whether the tensor holds no elements.
@@ -209,7 +232,12 @@ impl Tensor {
             DType::I64 => out.extend(self.data.chunks_exact(8).map(|c| {
                 i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
             })),
-            DType::U16 | DType::U8 => out.extend(self.data.iter().map(|b| *b as f32)),
+            DType::U8 => out.extend(self.data.iter().map(|b| *b as f32)),
+            DType::U16 => out.extend(
+                self.data
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32),
+            ),
         }
     }
 }

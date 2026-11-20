@@ -43,6 +43,100 @@ import npu_ops  # noqa: E402  -- needs the path above
 
 DOCS = {"en": REPO / "NPU_OPS.md", "ru": REPO / "NPU_OPS.ru.md"}
 
+# The re-measurement block printed in BOTH generated files. It is a table,
+# not a mood: every figure was taken at the same commit, on the same host,
+# with the same corpus and the same number of runs per arm. See BUILD.md §3
+# for the reproduction commands and the full protocol.
+MEASURE_COMMIT = "412f80ee0c3d69d1b85c48fd95ef745327b814a7"
+MEASURE_HOST = "AMD Ryzen 7 PRO 8845HS, XDNA1 (npu1), Rust 1.89.0"
+MEASURE_CORPUS = "tools/data/bench_corpus_4.txt"
+MEASURE_ARMS = [
+    # label, wall seconds (median of 3), dispatches, comparison
+    ("~(all host)", "0.38", "0", "reference arm"),
+    ("`gemm`", "0.15", "48", "2.5x FASTER than all-host"),
+    ("`softm`", "0.98", "12", "2.6x slower than all-host"),
+    ("`gemm,softm`", "0.72", "60", "4.8x slower than `gemm`"),
+    ("`attn`", "1.06", "1152", "2.8x slower than all-host"),
+    ("`gemm,attn`", "0.74", "1200", "4.9x slower than `gemm`"),
+    ("`gemm,attn,softm`", "26.36", "1200", "35.6x slower than `gemm,attn`"),
+    ("`attn,softm`", "26.61", "1152", "70x slower than all-host"),
+]
+MEASURE_SCOPE_EN = (
+    "Scope: these are the text-embedder (`gemm_rtp`) cells. The other "
+    "architectures were NOT re-measured at this commit: the Rust runtime "
+    "refuses `--npu-ops` for `cls`, the gemma3 family's tokenizer is not wired "
+    "into `embed`, and the speech/vision families have no array seam here. "
+    "Their per-cell figures remain the earlier ones and are not claims about "
+    "this commit."
+)
+MEASURE_SCOPE_RU = (
+    "Область: это ячейки текстового эмбеддера (`gemm_rtp`). Остальные "
+    "архитектуры НЕ перезамерялись на этом коммите: Rust-рантайм отвергает "
+    "`--npu-ops` для `cls`, токенайзер семейства gemma3 не подключён к `embed`, "
+    "а у речевых и зрительных семейств здесь нет массивного стыка. Их числа "
+    "в ячейках остались с более ранних замеров и не являются утверждениями "
+    "об этом коммите."
+)
+
+
+def measurement_table(ru: bool) -> list[str]:
+    """The prose and the table of figures re-measured at MEASURE_COMMIT."""
+    L = []
+    if ru:
+        L += [
+            "### Актуальные замеры",
+            "",
+            f"Перезамерено на коммите `{MEASURE_COMMIT}` (2026-11-19, "
+            f"«perf: P0/P1 optimization pass across XDNA, CPU and server»): "
+            f"{MEASURE_HOST}. Корпус `{MEASURE_CORPUS}` — 4 текста, самый "
+            "длинный дополнен до 64 токенов ширины дизайна (массивное внимание "
+            "требует пакета из 4); медиана 3 прогонов на руку, окружение XRT "
+            "взято из `/opt/xilinx/xrt/setup.sh`. Полный протокол и команды "
+            "воспроизведения — в `BUILD.md`, раздел 3.",
+            "",
+            "| `--npu-ops` | стена, с | диспетчей | сравнение |",
+            "| --- | ---: | ---: | --- |",
+        ]
+    else:
+        L += [
+            "### Current measurements",
+            "",
+            f"Re-measured at commit `{MEASURE_COMMIT}` (2026-11-19, "
+            f"\"perf: P0/P1 optimization pass across XDNA, CPU and server\"): "
+            f"{MEASURE_HOST}. Corpus `{MEASURE_CORPUS}` -- 4 texts, the longest "
+            "padded to the design's 64 tokens (array attention requires a "
+            "batch of 4); median wall time of 3 runs per arm, XRT environment "
+            "from `/opt/xilinx/xrt/setup.sh`. Full protocol and reproduction "
+            "commands are in `BUILD.md` §3.",
+            "",
+            "| `--npu-ops` | wall, s | dispatches | comparison |",
+            "| --- | ---: | ---: | --- |",
+        ]
+    note_ru = {
+        "reference arm": "опорная рука",
+        "2.5x FASTER than all-host": "в 2.5 раза БЫСТРЕЕ all-host",
+        "2.6x slower than all-host": "в 2.6 раза медленнее all-host",
+        "4.8x slower than `gemm`": "в 4.8 раза медленнее `gemm`",
+        "2.8x slower than all-host": "в 2.8 раза медленнее all-host",
+        "4.9x slower than `gemm`": "в 4.9 раза медленнее `gemm`",
+        "35.6x slower than `gemm,attn`": "в 35.6 раза медленнее `gemm,attn`",
+        "70x slower than all-host": "в 70 раз медленнее all-host",
+    }
+    for label, wall, disp, note in MEASURE_ARMS:
+        L.append(f"| {label} | {wall} | {disp} | {note_ru[note] if ru else note} |")
+    L += [
+        "",
+        ("Где эти числа расходятся с более старым текстом ячеек ниже, "
+         "авторитетной для этого коммита считается эта таблица."
+         if ru else
+         "Where these figures differ from the older per-cell prose below, "
+         "this table is the authoritative one for this commit."),
+        "",
+        MEASURE_SCOPE_RU if ru else MEASURE_SCOPE_EN,
+        "",
+    ]
+    return L
+
 # The order the architectures are printed in. Deliberately NOT the registry's
 # dict order: this is the order a reader meets them in -- the default first, then
 # the two that have audio, then the two that are not transformers at all.
@@ -181,13 +275,14 @@ REASONS_RU = {
     "числами.",
 ("gemm_rtp", "softm"):
     "softmax над матрицей оценок — отдельный проход между двумя GEMM внимания,"
-    "поэтому дизайн `softmax/` забирает его как есть. ЗАМЕРЕНО на"
-    "bge-base-en-v1.5, 15 текстов, arch 1: `--npu-ops gemm,softm` — 1.70 с"
-    "против 0.17 с у `--npu-ops gemm` (в 10.0 раза МЕДЛЕННЕЕ), relfro 1.391e-02"
-    "/ cos 0.999903381, минимальный cos 0.999844372, max|d| 2.259e-03 против"
-    "той же самой опорной руки. Обычный `--npu-ops softm`, то есть четыре GEMM"
-    "в этом процессе, как теперь по умолчанию, — 1.58 с против 1.06 с у"
-    "all-host-дефолта, 36 диспатчей против 0. Опорная рука названа, а не"
+    "поэтому дизайн `softmax/` забирает его как есть. ПЕРЕЗАМЕРЕНО на коммите"
+    "412f80e (таблица в начале файла): bge-base-en-v1.5, 4 текста, arch 1,"
+    "медиана 3 прогонов: `--npu-ops gemm,softm` — 0.72 с против 0.15 с у"
+    "`--npu-ops gemm` (в 4.8 раза МЕДЛЕННЕЕ), 60 диспатчей против 48, relfro"
+    "1.239e-02 / минимальный cos 0.999888957 / max|d| 2.306e-03 против"
+    "all-host-дефолта. Обычный `--npu-ops softm`, то есть четыре GEMM"
+    "в этом процессе, как теперь по умолчанию, — 0.98 с против 0.38 с у"
+    "all-host-дефолта, 12 диспатчей против 0. Опорная рука названа, а не"
     "названа «хостом», потому что хостом она не является: `gemm` делал каждый"
     "прогон до того, как этот код выделили, и на этой паре снимали исходные"
     "числа. Вся трудность тут — в ШИРИНЕ строки, и она была неверной, пока это"
@@ -204,8 +299,9 @@ REASONS_RU = {
     "ЦЕНА — и это не дефект этой ячейки, а то, как комбинируются два флага: при"
     "attn,softm softmax оказывается внутри NpuAttention и диспатчится раз на"
     "голову и на чанк, а не раз на слой, и каждый диспатч заполняет всю"
-    "row-capacity дизайна в 12288 строк — 100.59 с на 15 текстов против 1.36 с"
-    "для `gemm,attn`, и обе величины перезамерены с этим изменением. Это"
+    "row-capacity дизайна в 12288 строк — 26.36 с на 4 текста против 0.74 с"
+    "для `gemm,attn`, обе величины перезамерены на коммите 412f80e. Обычный"
+    "`attn,softm` — 26.61 с. Это"
     "измерение ПОСТАВЛЯЕМЫХ артефактов: при экспорте по target дизайн теперь"
     "рассчитан на один чанк внимания (здесь 256 строк), так что после"
     "повторного экспорта эту цену нужно измерить заново.",
@@ -227,13 +323,14 @@ REASONS_RU = {
     "это делает возможным голову шириной 32 (три из восьми моделей); рантайм"
     "зануляет соответствующие строки собранного блока Q, так что лишние MAC"
     "дают 0*0. Та же ОГОВОРКА, что в строках `cls` и `stt`: внимание на массиве"
-    "МЕДЛЕННЕЕ хостового прохода. ЗАМЕРЕНО на bge-base-en-v1.5, 15 текстов,"
-    "arch 1: `--npu-ops gemm,attn` — 1.36 с против 0.17 с у `--npu-ops gemm` (в"
-    "8.0 раза МЕДЛЕННЕЕ), при 4752 диспатчах против 144 у той руки — из них"
-    "4608 принадлежат этому коду, по одному на голову и на чанк запроса."
-    "Обычный `--npu-ops attn` — 2.00 с против 1.06 с у all-host-дефолта, 4608"
-    "диспатчей против 0. Точность против руки `gemm`: relfro 1.398e-02, средний"
-    "cos 0.999902308, минимальный cos 0.999853313, max|d| 2.093e-03. Этот код"
+    "МЕДЛЕННЕЕ хостового прохода. ПЕРЕЗАМЕРЕНО на коммите 412f80e (таблица в"
+    "начале файла): bge-base-en-v1.5, 4 текста, arch 1, медиана 3 прогонов:"
+    "`--npu-ops gemm,attn` — 0.74 с против 0.15 с у `--npu-ops gemm` (в"
+    "4.9 раза МЕДЛЕННЕЕ), при 1200 диспатчах против 48 у той руки — из них"
+    "1152 принадлежат этому коду, по одному на голову и на чанк запроса."
+    "Обычный `--npu-ops attn` — 1.06 с против 0.38 с у all-host-дефолта, 1152"
+    "диспатчей против 0. Точность против all-host: relfro 1.193e-02, минимальный"
+    "cos 0.999908328, max|d| 1.458e-03. Этот код"
     "делает модель запускаемой на массиве, а не быстрее.",
 ("gemm_rtp", "mproj"):
     "называет банк mel-фильтров Slaney — аудио-фронтенд, а этой архитектуры нет.",
@@ -934,12 +1031,14 @@ def doc(ru=False):
         a("умолчанию — пустое множество: **всякая операция считается на CPU.** Это")
         a("то, с чего стартует прогон, а не приговор о том, где ему следует остановиться, и")
         a("замеры теперь спорят с ним для девятого кода: `gemm` на массиве обгоняет")
-        a("хост на каждом трансформере здесь (bge, 15 текстов: 1.06 с -> 0.17 с;")
-        a("ViT 0.435 с -> 0.241 с; Gemma 0.69 с -> 0.10 с; энкодер Whisper 0.70 с ->")
-        a("0.51 с), а `attn` и `softm` на массиве остаются медленнее того хоста, который")
+        a("хост на каждом трансформере здесь (bge, 4 текста: 0.38 с -> 0.15 с на")
+        a("перезамере ниже; ViT 0.435 с -> 0.241 с; Gemma 0.69 с -> 0.10 с; энкодер")
+        a("Whisper 0.70 с -> 0.51 с — последние три числа сняты в более ранних сессиях),")
+        a("а `attn` и `softm` на массиве остаются медленнее того хоста, который")
         a("они заменяют. Коды в списке — это способ попросить массив вместо этого, по")
         a("одной операции.")
         a("")
+        L.extend(measurement_table(True))
         a("У экспортёра такого флага НЕТ вовсе. Одна команда собирает каждый")
         a("дизайн, который цель способна использовать:")
         a("")
@@ -1068,11 +1167,13 @@ def doc(ru=False):
     a("the empty set: **every op runs on the CPU.** That is where a run starts,")
     a("not a verdict on where it should end, and the measurements now disagree")
     a("with it for the ninth code: `gemm` on the array beats the host on every")
-    a("transformer here (bge, 15 texts 1.06 s -> 0.17 s; ViT 0.435 s -> 0.241 s;")
-    a("Gemma 0.69 s -> 0.10 s; Whisper's encoder 0.70 s -> 0.51 s), while `attn`")
-    a("and `softm` on the array stay slower than the host they replace. Passing")
-    a("codes is how you ask for the array instead, one op at a time.")
+    a("transformer here (bge, 4 texts 0.38 s -> 0.15 s at the re-measurement")
+    a("below; ViT 0.435 s -> 0.241 s; Gemma 0.69 s -> 0.10 s; Whisper's encoder")
+    a("0.70 s -> 0.51 s -- the last three were taken in earlier sessions), while")
+    a("`attn` and `softm` on the array stay slower than the host they replace.")
+    a("Passing codes is how you ask for the array instead, one op at a time.")
     a("")
+    L.extend(measurement_table(False))
     a("The exporter has **no such flag**. One command builds every design the")
     a("target can use:")
     a("")

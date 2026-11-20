@@ -190,34 +190,37 @@ pub fn run(
             message: format!("{}: {e}", path.display()),
         })?;
 
-        // The GTE forward pass does not yet dispatch projections, attention
-        // or eltwise work to the array. Accepting these flags and opening
-        // contexts would make the command line claim array work that the run
-        // does not perform, so refuse them here as well as at the family
-        // gate.
-        let wants_any_npu = wants_gemm(args)
+        // THE ARRAY, OR THE HOST. GTE's own forward pass now has the same
+        // seams as BERT's: four projections per layer, the attention block
+        // and the LayerNorm/GELU/softmax passes. As in BERT, the flag is the
+        // only thing that opens a design; a design on disk is not a dispatch.
+        let mut array: Option<Box<dyn npum_model::array::ArrayText>> = if wants_gemm(args)
             || wants_attn(args)
-            || wants_op(args, "layn")
-            || wants_op(args, "gelu")
-            || wants_op(args, "softm");
-        if wants_any_npu {
-            return Err(Refusal {
-                code: crate::EXIT_REFUSED,
-                message: format!(
-                    "{}: --npu-ops is not yet implemented for GTE models ({}). \
-                     The array/eltwise dispatch seam is missing from the GTE \
-                     forward pass, so accepting the flag would run on the host \
-                     while reporting array work. Remove --npu-ops to run on the host.",
-                    path.display(),
-                    arch
-                ),
-            });
-        }
+        {
+            Some(
+                open_array_gte(container, path, &model, root, args).map_err(|reason| Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: reason,
+                })?,
+            )
+        } else {
+            None
+        };
+        // ONE DESIGN, ONE CONTEXT per elementwise pass. Only the passes the
+        // flag named are opened; a pass with no design stays on the host.
+        let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> =
+            match open_eltwise(container, path, root, args) {
+                Ok(backend) => backend,
+                Err(reason) => {
+                    return Err(Refusal {
+                        code: crate::EXIT_REFUSED,
+                        message: reason,
+                    });
+                }
+            };
 
-        let mut array: Option<Box<dyn npum_model::array::ArrayText>> = None;
-        let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> = None;
-
-        let artifacts = find_artifacts(root, &container_name(path));
+        let artifacts =
+            crate::npu::find_artifacts(root, &container_name(path), args.value("--artifacts"));
         let seq = sequence_length(path, container, root, artifacts.as_deref());
         let hidden = model.spec.hidden;
 
@@ -228,12 +231,15 @@ pub fn run(
         let started = std::time::Instant::now();
         let mut timings = npum_cpu::gte::Timings::default();
         let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
-        // GTE's forward pass has no array dispatch, so its score width follows
-        // the sequence and trailing padding can be dropped per batch.
+        // An array design fixes the score row's width (array attention's
+        // padded key count or an array softmax's columns), so those runs keep
+        // the full design sequence and rely on batching alone. Host and GPU
+        // runs shrink `seq` per batch.
+        let fix_width = array.is_some() || eltwise.is_some();
         let mut offset = 0usize;
         while offset < texts.len() {
             let batch = (texts.len() - offset).min(BATCH);
-            let eff_seq = batch_seq(seq, &lengths[offset..offset + batch], false);
+            let eff_seq = batch_seq(seq, &lengths[offset..offset + batch], fix_width);
             let (ids, mask) = pack_batch(&all_ids, &all_mask, seq, offset, batch, eff_seq);
             let chunk = model
                 .embed_timed_with(
@@ -349,7 +355,8 @@ pub fn run(
     // The status block was printed by the caller, before any refusal this
     // run might give: the banner says WHICH container, and a refusal on
     // its own does not.
-    let artifacts = find_artifacts(root, &container_name(path));
+    let artifacts =
+        crate::npu::find_artifacts(root, &container_name(path), args.value("--artifacts"));
     let seq = sequence_length(path, container, root, artifacts.as_deref());
     let hidden = model.spec.hidden;
 
@@ -560,27 +567,10 @@ pub fn wants_out_file(args: &Args) -> Option<String> {
 /// first, because that is where the exporter puts it and where the status
 /// block says it is.
 pub fn find_artifacts(root: &Path, model_name: &str) -> Option<PathBuf> {
-    if model_name.is_empty() {
-        return None;
-    }
-    for base in [
-        root.join("runtime").join("artifacts"),
-        root.join("artifacts"),
-        root.join("runtime"),
-        root.to_path_buf(),
-    ] {
-        for sub in ["artifacts_npu1", "artifacts_npu2", "", "npu1", "npu2"] {
-            let dir = if sub.is_empty() {
-                base.join(model_name)
-            } else {
-                base.join(model_name).join(sub)
-            };
-            if dir.join("gemm_rtp").join("design.json").is_file() {
-                return Some(dir);
-            }
-        }
-    }
-    None
+    // The search itself lives with the other array-opening rules in `npu`.
+    // Callers that have `--artifacts` pass it to `npu::find_artifacts`
+    // directly; the design-opening paths in this file do.
+    crate::npu::find_artifacts(root, model_name, None)
 }
 
 /// Whether the run asked for the LayerNorm to go on the array.
@@ -654,20 +644,28 @@ pub fn places(
     // set's existence: a design set on the disk is not a dispatch, and a
     // status block that said "on the ARRAY" for a pass the host computed
     // would be a block that lies. The reference's block reads it the same way.
-    places.layn = array_place(container, path, root, "layernorm", wants_layernorm(args))
+    let named = args.value("--artifacts");
+    places.layn = array_place(
+        container,
+        path,
+        root,
+        named,
+        "layernorm",
+        wants_layernorm(args),
+    )
+    .map(crate::status::OpWhere::Array)
+    .or_else(|| gpu.clone());
+    places.gelu = array_place(container, path, root, named, "gelu", wants_gelu(args))
         .map(crate::status::OpWhere::Array)
         .or_else(|| gpu.clone());
-    places.gelu = array_place(container, path, root, "gelu", wants_gelu(args))
-        .map(crate::status::OpWhere::Array)
-        .or_else(|| gpu.clone());
-    places.softm = array_place(container, path, root, "softmax", wants_softmax(args))
+    places.softm = array_place(container, path, root, named, "softmax", wants_softmax(args))
         .map(crate::status::OpWhere::Array)
         .or_else(|| gpu.clone());
     if wants_attn(args) {
         // The attention's streams are inside the projections' set, so the
         // place it names is that set's.
         places.attn =
-            op_place(container, path, root, "gemm_rtp").map(crate::status::OpWhere::Array);
+            op_place(container, path, root, named, "gemm_rtp").map(crate::status::OpWhere::Array);
     }
     // THE GPU'S OWN PASSES, for the backend's line.
     //
@@ -730,7 +728,13 @@ pub fn staged_bytes(
     }
     if wants_layernorm(args) {
         if let (Some(cols), Some(layers)) = (
-            design_cols(container, path, root, "layernorm"),
+            design_cols(
+                container,
+                path,
+                root,
+                args.value("--artifacts"),
+                "layernorm",
+            ),
             layers(container),
         ) {
             // gamma and beta, f32, two of them per row.
@@ -756,9 +760,10 @@ fn design_cols(
     container: &npum_format::Container,
     path: &Path,
     root: &Path,
+    named: Option<&str>,
     set: &str,
 ) -> Option<usize> {
-    let value = design_manifest(container, path, root, set)?;
+    let value = design_manifest(container, path, root, named, set)?;
     value.get("cols")?.as_u64().map(|v| v as usize)
 }
 
@@ -777,13 +782,14 @@ fn array_place(
     container: &npum_format::Container,
     path: &Path,
     root: &Path,
+    named: Option<&str>,
     set: &str,
     asked: bool,
 ) -> Option<crate::status::OpPlace> {
     if !asked {
         return None;
     }
-    op_place(container, path, root, set)
+    op_place(container, path, root, named, set)
 }
 
 /// One design set's place, from its own manifest.
@@ -791,9 +797,10 @@ fn op_place(
     container: &npum_format::Container,
     path: &Path,
     root: &Path,
+    named: Option<&str>,
     set: &str,
 ) -> Option<crate::status::OpPlace> {
-    let value = design_manifest(container, path, root, set)?;
+    let value = design_manifest(container, path, root, named, set)?;
     Some(crate::status::OpPlace {
         name: value
             .get("name")
@@ -818,6 +825,7 @@ fn design_manifest(
     container: &npum_format::Container,
     path: &Path,
     root: &Path,
+    named: Option<&str>,
     set: &str,
 ) -> Option<serde_json::Value> {
     if let Some(bytes) = container
@@ -828,7 +836,7 @@ fn design_manifest(
             return Some(value);
         }
     }
-    let dir = find_artifacts(root, &container_name(path))?;
+    let dir = crate::npu::find_artifacts(root, &crate::npu::model_name(path), named)?;
     let bytes = std::fs::read(dir.join(set).join("design.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -837,118 +845,23 @@ fn design_manifest(
 ///
 /// The flag is a SET of codes, and a code is asked for by NAME.
 fn wants_op(args: &crate::flags::Args, code: &str) -> bool {
-    args.value("--npu-ops")
-        .map(|v| v.split(',').any(|c| c.trim() == code))
-        .unwrap_or(false)
-}
-
-/// Whether an eltwise design set is present for this model.
-///
-/// Presence is checked before opening so a real open/load failure (corrupt or
-/// incompatible design) is reported directly instead of being masked by trying
-/// an unrelated fallback design.
-fn eltwise_design_present(
-    container: &npum_format::Container,
-    path: &Path,
-    root: &Path,
-    set: &str,
-) -> bool {
-    if container
-        .directory()
-        .tensor(&format!("design/{set}/design.json"))
-        .is_some()
-    {
-        return true;
-    }
-    let Some(dir) = find_artifacts(root, &container_name(path)) else {
-        return false;
-    };
-    let set_dir = dir.join(set);
-    set_dir.join("design.json").is_file() || set_dir.is_dir()
+    crate::npu::wants_op(args, code)
 }
 
 /// The array's elementwise passes, when the run asked for them.
 ///
 /// The passes are separate designs and separate contexts, and only the ones
 /// the flag named are opened: a design that was not opened is a pass that
-/// stays on the host.
+/// stays on the host. The opening rules live in [`crate::npu`], shared with
+/// every other family that asks for elementwise work.
 pub fn open_eltwise(
     container: &npum_format::Container,
     path: &Path,
     root: &Path,
     args: &crate::flags::Args,
 ) -> Result<Option<Box<dyn npum_model::array::ArrayEltwise>>, String> {
-    use npum_xdna::eltwise::{Eltwise, EltwiseDesign};
-
-    let mut layernorm = None;
-    let mut rmsnorm = None;
-    if wants_layernorm(args) {
-        // Prefer LayerNorm design; for models that use RMSNorm (e.g. Gemma),
-        // the exported eltwise artifact is `rmsnorm/` and should be opened as
-        // RMSNorm while still being requested via the `layn` op code. Only
-        // fall back when the LayerNorm design is not present, so a broken
-        // LayerNorm design is reported instead of being hidden behind an
-        // unrelated rmsnorm lookup.
-        if eltwise_design_present(container, path, root, "layernorm") {
-            let design = open_design(container, path, root, "layernorm", "layn")?;
-            layernorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
-        } else if eltwise_design_present(container, path, root, "rmsnorm") {
-            let design = open_design(container, path, root, "rmsnorm", "layn")?;
-            rmsnorm = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
-        } else {
-            let _ = open_design(container, path, root, "layernorm", "layn")?;
-        }
-    }
-    let mut gelu = None;
-    if wants_gelu(args) {
-        let design = open_design(container, path, root, "gelu", "gelu")?;
-        gelu = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
-    }
-    let mut softmax = None;
-    if wants_softmax(args) {
-        let design = open_design(container, path, root, "softmax", "softm")?;
-        softmax = Some(EltwiseDesign::open(design).map_err(|e| e.to_string())?);
-    }
-    if layernorm.is_none() && rmsnorm.is_none() && gelu.is_none() && softmax.is_none() {
-        return Ok(None);
-    }
-    let backend =
-        Eltwise::with_rmsnorm(layernorm, gelu, softmax, rmsnorm).map_err(|e| e.to_string())?;
-    Ok(Some(Box::new(backend)))
-}
-
-/// The array's design set, from the container's own copy or from the tree.
-///
-/// The container is the PREFERRED source and the directory is the
-/// fallback: a container that carries its own design set needs nothing
-/// beside it -- no directory, no MLIR-AIE on the reader's machine, no
-/// artifacts to install.
-fn open_design(
-    container: &npum_format::Container,
-    path: &Path,
-    root: &Path,
-    set: &str,
-    code: &str,
-) -> Result<npum_xdna::array::ArrayDesign<crate::transport::Transport>, String> {
-    use npum_xdna::array::ArrayDesign;
-
-    let own = container
-        .directory()
-        .tensor(&format!("design/{set}/design.json"))
-        .is_some();
-    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
-    if own {
-        ArrayDesign::open_from_container(path, set, transport).map_err(|e| e.to_string())
-    } else {
-        let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
-            format!(
-                "{}: --npu-ops {code} needs the {set} design set: this container does not carry \
-                 one, and no design set was found for it. Pass --artifacts <dir> naming one.",
-                path.display()
-            )
-        })?;
-        ArrayDesign::open(&dir.join(set), transport).map_err(|e| e.to_string())
-    }
+    let backend = crate::npu::open_eltwise(container, path, root, args)?;
+    Ok(backend.map(|b| b as Box<dyn npum_model::array::ArrayEltwise>))
 }
 
 /// Whether the run asked for the projections to go on the array.
@@ -987,82 +900,18 @@ pub fn open_array(
     root: &Path,
     args: &crate::flags::Args,
 ) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
-    use npum_xdna::array::ArrayDesign;
-    use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
-
-    let gemm = wants_gemm(args);
-    let attn = wants_attn(args);
-
-    if gemm {
-        let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
-            format!(
-                "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
-                 any: it has no layer.0.qkv. Repack it with the packer's --dtype bf16, which \
-                 stores every projection's weights as the pre-tiled bf16 panel the array \
-                 multiplies by.",
-                path.display()
-            )
-        })?;
-        if panel.dtype != "BF16" {
-            return Err(format!(
-                "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
-                 any: layer.0.qkv is {}, not BF16. Repack it with the packer's --dtype bf16, \
-                 which stores every projection's weights as the pre-tiled bf16 panel the array \
-                 multiplies by.",
-                path.display(),
-                panel.dtype
-            ));
-        }
-    }
-
-    let own = container
-        .directory()
-        .tensor("design/gemm_rtp/design.json")
-        .is_some();
-    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
-    let design = if own {
-        ArrayDesign::open_from_container(path, "gemm_rtp", transport).map_err(|e| e.to_string())?
-    } else {
-        let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
-            format!(
-                "{}: --npu-ops {} needs a design set: this container does not carry one, \
-                 and no design set was found for it. Pass --artifacts <dir> naming one, or \
-                 build it with the exporter. The flag has no default to fall back on, \
-                 because this model's design is its own.",
-                path.display(),
-                if gemm { "gemm" } else { "attn" }
-            )
-        })?;
-        ArrayDesign::open(&dir.join("gemm_rtp"), transport).map_err(|e| e.to_string())?
-    };
-
     let spec = &model.spec;
-    let hidden = spec.hidden;
-    let ffn = spec.ffn;
-    let mut specs = Vec::with_capacity(spec.layers * 4);
-    if gemm {
-        for layer in 0..spec.layers {
-            for (op, k, n) in [
-                ("qkv", hidden, 3 * hidden),
-                ("attn_out", hidden, hidden),
-                ("ffn_up", hidden, ffn),
-                ("ffn_down", ffn, hidden),
-            ] {
-                specs.push(GemmSpec {
-                    weight: format!("layer.{layer}.{op}"),
-                    op: op.to_string(),
-                    k,
-                    n,
-                });
-            }
-        }
-    }
-    let backend = ArrayGemms::open(path, design, &specs, attn).map_err(|e| e.to_string())?;
-    Ok(Box::new(backend))
+    let backend = crate::npu::open_array_text(
+        container,
+        path,
+        root,
+        args,
+        crate::npu::TextGeometry::bert(spec.layers, spec.hidden, spec.ffn),
+    )?;
+    Ok(backend as Box<dyn npum_model::array::ArrayText>)
 }
 
 /// Array backend for GTE (fused up_gate makes ffn_up [hidden, 2*ffn]).
-#[allow(dead_code)]
 fn open_array_gte(
     container: &npum_format::Container,
     path: &Path,
@@ -1070,71 +919,15 @@ fn open_array_gte(
     root: &Path,
     args: &crate::flags::Args,
 ) -> Result<Box<dyn npum_model::array::ArrayText>, String> {
-    use npum_xdna::array::ArrayDesign;
-    use npum_xdna::array_gemms::{ArrayGemms, GemmSpec};
-
-    let gemm = wants_gemm(args);
-    let attn = wants_attn(args);
-
-    if gemm {
-        let panel = container.directory().tensor("layer.0.qkv").ok_or_else(|| {
-            format!(
-                "{}: --npu-ops gemm needs the array's panels, and this container does not carry \
-                 any: it has no layer.0.qkv. Repack it with the packer's --dtype bf16.",
-                path.display()
-            )
-        })?;
-        if panel.dtype != "BF16" {
-            return Err(format!(
-                "{}: --npu-ops gemm needs the array's panels (BF16), but layer.0.qkv is {}.",
-                path.display(),
-                panel.dtype
-            ));
-        }
-    }
-
-    let own = container
-        .directory()
-        .tensor("design/gemm_rtp/design.json")
-        .is_some();
-    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
-    let design = if own {
-        ArrayDesign::open_from_container(path, "gemm_rtp", transport).map_err(|e| e.to_string())?
-    } else {
-        let dir = find_artifacts(root, &container_name(path)).ok_or_else(|| {
-            format!(
-                "{}: --npu-ops {} needs a design set: this container does not carry one, \
-                 and no design set was found for it. Pass --artifacts <dir> naming one.",
-                path.display(),
-                if gemm { "gemm" } else { "attn" }
-            )
-        })?;
-        ArrayDesign::open(&dir.join("gemm_rtp"), transport).map_err(|e| e.to_string())?
-    };
-
     let spec = &model.spec;
-    let hidden = spec.hidden;
-    let ffn = spec.ffn;
-    let mut specs = Vec::with_capacity(spec.layers * 4);
-    if gemm {
-        for layer in 0..spec.layers {
-            for (op, k, n) in [
-                ("qkv", hidden, 3 * hidden),
-                ("attn_out", hidden, hidden),
-                ("ffn_up", hidden, 2 * ffn),
-                ("ffn_down", ffn, hidden),
-            ] {
-                specs.push(GemmSpec {
-                    weight: format!("layer.{layer}.{op}"),
-                    op: op.to_string(),
-                    k,
-                    n,
-                });
-            }
-        }
-    }
-    let backend = ArrayGemms::open(path, design, &specs, attn).map_err(|e| e.to_string())?;
-    Ok(Box::new(backend))
+    let backend = crate::npu::open_array_text(
+        container,
+        path,
+        root,
+        args,
+        crate::npu::TextGeometry::gte(spec.layers, spec.hidden, spec.ffn),
+    )?;
+    Ok(backend as Box<dyn npum_model::array::ArrayText>)
 }
 
 /// A container's name, without the directory and without the extension.
@@ -1174,8 +967,15 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             container,
             path,
             root,
+            args.value("--artifacts"),
             &crate::embed::places(container, path, root, args, choice.ops.as_ref()),
         );
+        // ONE GEMM design plus one context per elementwise pass. Both of this
+        // family's forward passes (BERT and GTE) open the same set, so the
+        // budget is checked here for both before any context is created.
+        if !crate::npu::check_array_budget(args, 1) {
+            return crate::EXIT_REFUSED;
+        }
         // `--npu-ops` is a valid request and a valid question, and this
         // runtime answers it for five of the codes: the projections, the
         // LayerNorm, the GELU, the softmax and the attention go to the
@@ -1189,25 +989,20 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // attention are ported and checked on the board. What is missing is
         // the SEAM for the other families.
         //
-        // GTE (rope+GEGLU) carries its own forward pass, and it does not
-        // yet dispatch projections, attention or eltwise work to the array.
-        // Until that seam is ported, every code that would open a design or
-        // claim an array dispatch here must be refused rather than accepted
-        // and run on the host. The refusal must name that seam here, at the
-        // family gate: the generic "no array-able operation" wording hides
-        // why GTE in particular cannot honour the flag.
-        let is_gte =
-            arch.contains("gte_new_rope") || (arch.contains("gte") && arch.contains("rope"));
-        let refusal = if is_gte {
-            crate::families::refuse_gte_array_ops(args, arch)
+        // BERT honours all five codes. GTE's FFN is GATED: GELU is computed
+        // between ffn_up and ffn_down, and the exporter builds no standalone
+        // `gelu/` design for a gated FFN -- so `gelu` must be refused BY NAME
+        // here rather than accepted and silently left on the host.
+        let honoured: &[&str] = if arch == "gte_new_rope_geglu"
+            || (arch.contains("gte") && arch.contains("rope"))
+        {
+            &["gemm", "layn", "softm", "attn"]
         } else {
-            crate::families::refuse_array_not_ported(
-                npum_families::Family::Embed,
-                args,
-                &["gemm", "layn", "gelu", "softm", "attn"],
-            )
+            &["gemm", "layn", "gelu", "softm", "attn"]
         };
-        if let Some(reason) = refusal {
+        if let Some(reason) =
+            crate::families::refuse_array_not_ported(npum_families::Family::Embed, args, honoured)
+        {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }

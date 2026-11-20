@@ -22,8 +22,133 @@
 //! so: "the model id is what a client sees, and naming a host-only server
 //! after the array is exactly the silent mislabel".
 
-use npuembeddings_server::Result;
 use npuembeddings_server::routes::ServerState;
+use npuembeddings_server::Result;
+
+/// Open the speech family's array handles, if the flag asked for any.
+///
+/// `serve` opens them once, before the listener, and hands them to the engine.
+/// The opening rules live in `crate::npu` -- the same rules the `transcribe`
+/// verb uses -- so a server and a command line with the same flags open the
+/// same designs against the same container.
+fn open_stt_xdna(
+    container: &npum_format::Container,
+    path: &std::path::Path,
+    root: &std::path::Path,
+    args: &crate::flags::Args,
+    geometry: &crate::stt::Geometry,
+) -> std::result::Result<Option<npuembeddings_server::XdnaForStt>, String> {
+    let dense = crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let elt = ["layn", "gelu", "softm"]
+        .iter()
+        .any(|code| crate::npu::wants_op(args, code));
+    if !dense && !elt {
+        return Ok(None);
+    }
+    let enc = if dense {
+        Some(crate::npu::open_array_text_specs(
+            container,
+            path,
+            root,
+            args,
+            crate::stt::encoder_specs(geometry),
+            "gemm_rtp",
+        )?)
+    } else {
+        None
+    };
+    let dec = if dense {
+        Some(crate::npu::open_array_text_specs(
+            container,
+            path,
+            root,
+            args,
+            crate::stt::decoder_specs(geometry),
+            "gemm_rtp_dec",
+        )?)
+    } else {
+        None
+    };
+    let eltwise = crate::npu::open_eltwise(container, path, root, args)?;
+    Ok(Some(npuembeddings_server::XdnaForStt { enc, dec, eltwise }))
+}
+
+/// Open the classifier's array handles, if the flag asked for any.
+fn open_cls_xdna(
+    container: &npum_format::Container,
+    path: &std::path::Path,
+    root: &std::path::Path,
+    args: &crate::flags::Args,
+    geometry: &crate::vit::Geometry,
+) -> std::result::Result<Option<npuembeddings_server::XdnaForCls>, String> {
+    let array_wanted = crate::npu::wants_op(args, "gemm")
+        || crate::npu::wants_op(args, "attn")
+        || crate::npu::wants_op(args, "conv");
+    let elt = ["layn", "gelu", "softm"]
+        .iter()
+        .any(|code| crate::npu::wants_op(args, code));
+    if !array_wanted && !elt {
+        return Ok(None);
+    }
+    let array = if array_wanted {
+        let specs = crate::vit::gemm_specs(container, geometry)?;
+        let mut chosen = specs.layers;
+        chosen.push(specs.patch);
+        Some(crate::npu::open_array_text_specs(
+            container, path, root, args, chosen, "gemm_rtp",
+        )?)
+    } else {
+        None
+    };
+    let eltwise = crate::npu::open_eltwise(container, path, root, args)?;
+    Ok(Some(npuembeddings_server::XdnaForCls {
+        array,
+        eltwise,
+        gemm: crate::npu::wants_op(args, "gemm"),
+        conv: crate::npu::wants_op(args, "conv"),
+    }))
+}
+
+/// Open the embedding endpoint's array handles, if the flag asked for any.
+///
+/// Both of this family's forward passes -- BERT and GTE -- take the same two
+/// seams, so the geometry is the only thing that differs. Opening happens here,
+/// once, before the listener, with the same rules the `embed` verb uses.
+fn open_embed_xdna(
+    container: &npum_format::Container,
+    path: &std::path::Path,
+    root: &std::path::Path,
+    args: &crate::flags::Args,
+) -> std::result::Result<Option<npuembeddings_server::XdnaForEmbed>, String> {
+    let dense = crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let elt = ["layn", "gelu", "softm"]
+        .iter()
+        .any(|code| crate::npu::wants_op(args, code));
+    if !dense && !elt {
+        return Ok(None);
+    }
+    let is_gte = container
+        .config_str("arch")
+        .is_some_and(|a| a == "gte_new_rope_geglu" || (a.contains("gte") && a.contains("rope")));
+    let array = if dense {
+        let geometry = if is_gte {
+            let model = npum_cpu::gte::GteModel::from_container(container)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            crate::npu::TextGeometry::gte(model.spec.layers, model.spec.hidden, model.spec.ffn)
+        } else {
+            let model = npum_cpu::bert::BertModel::from_container(container)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            crate::npu::TextGeometry::bert(model.spec.layers, model.spec.hidden, model.spec.ffn)
+        };
+        Some(crate::npu::open_array_text(
+            container, path, root, args, geometry,
+        )?)
+    } else {
+        None
+    };
+    let eltwise = crate::npu::open_eltwise(container, path, root, args)?;
+    Ok(Some(npuembeddings_server::XdnaForEmbed { array, eltwise }))
+}
 
 /// Serve one model.
 ///
@@ -99,16 +224,65 @@ pub fn serve(
     // The speech family's engine is built HERE, inside the block's own
     // branch, because the block reports the setup time and the setup is
     // the engine's construction.
+    // A request for array work that this family's verb would refuse is
+    // refused here too -- opening a listener that reports "host" after the
+    // user asked for the array is a silently ignored flag. The lists are the
+    // SAME ones the verbs now honour; a code not in its family's list is
+    // named in the refusal, never quietly computed on the host.
+    if let Some(reason) = crate::families::refuse_op_not_in_arch(args, family) {
+        eprintln!("error: {reason}");
+        return crate::EXIT_REFUSED;
+    }
+    let honoured: &[&str] = match family {
+        // Both text forward passes (BERT and GTE) now have the seam, and the
+        // server injects the designs into Embedder at startup like the other
+        // engines -- so this list must match the one the `embed` verb honours.
+        // GTE's gated FFN has no standalone `gelu/` design; BERT does.
+        npum_families::Family::Embed => {
+            if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
+                &["gemm", "attn", "layn", "softm"]
+            } else {
+                &["gemm", "attn", "layn", "gelu", "softm"]
+            }
+        }
+        npum_families::Family::Stt => &["gemm", "attn", "layn", "gelu", "softm"],
+        npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv"],
+        // PoseDetector now takes the same ArrayConvs seam the CLI uses.
+        // Hands/MpPose/Ocr have no HTTP engine in this tree, so they keep
+        // the empty list and refuse by name rather than run on the host.
+        npum_families::Family::Pose => &["conv"],
+        _ => &[],
+    };
+    if let Some(reason) = crate::families::refuse_array_not_ported(family, args, honoured) {
+        eprintln!("error: {reason}");
+        return crate::EXIT_REFUSED;
+    }
+
     let mut speech: Option<npuembeddings_server::Transcriber> = None;
     let mut image: Option<npuembeddings_server::Classifier> = None;
     let mut pose: Option<npuembeddings_server::PoseDetector> = None;
     match family {
         npum_families::Family::Embed => {
+            if !crate::npu::check_array_budget(args, 1) {
+                return crate::EXIT_REFUSED;
+            }
             let status = crate::status::read_container(&container, &path);
-            let artifacts = crate::embed::find_artifacts(root, &status.model_name);
+            let artifacts =
+                crate::npu::find_artifacts(root, &status.model_name, args.value("--artifacts"));
             let design = artifacts
                 .as_ref()
                 .and_then(|a| crate::status::read_design(a));
+            // The same places the `embed` verb prints: a pass the flag named
+            // and a design that is actually present is the array's; everything
+            // else stays on the host (or the Vulkan device when asked).
+            let backend = match crate::backend::choose(args) {
+                Ok(c) => c,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            let places = crate::embed::places(&container, &path, root, args, backend.ops.as_ref());
             crate::status::print_block(
                 &status,
                 design.as_ref(),
@@ -116,12 +290,7 @@ pub fn serve(
                     "{} (picked from the container's geometry; no --artifacts given)",
                     artifacts.as_deref().unwrap_or(root).display()
                 ),
-                // THE SERVER RUNS THE HOST'S OPERATIONS.
-                //
-                // The server does not take `--npu-ops`, and it does not
-                // dispatch to the array -- so every operation in the block
-                // is on the host, and the block says so.
-                &crate::status::Places::default(),
+                &places,
             );
         }
         npum_families::Family::Cls => {
@@ -133,21 +302,35 @@ pub fn serve(
                 return crate::EXIT_REFUSED;
             };
             let designs =
-                crate::vit::find_designs(root, &geometry.model_name).unwrap_or_else(|| {
-                    root.join("runtime")
-                        .join("artifacts")
-                        .join(&geometry.model_name)
-                });
+                crate::vit::find_designs(root, &geometry.model_name, args.value("--artifacts"))
+                    .unwrap_or_else(|| {
+                        root.join("runtime")
+                            .join("artifacts")
+                            .join(&geometry.model_name)
+                    });
+            if !crate::npu::check_array_budget(args, 1) {
+                return crate::EXIT_REFUSED;
+            }
+            let present = crate::npu::has_own_design(&container, "gemm_rtp")
+                || designs.join("gemm_rtp").join("design.json").is_file();
+            let places = crate::vit::places(&container, &path, root, args, present);
             let started = std::time::Instant::now();
+            let xdna = match open_cls_xdna(&container, &path, root, args, &geometry) {
+                Ok(x) => x,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
             let classifier = match npuembeddings_server::Classifier::open(&path) {
-                Ok(c) => c,
+                Ok(c) => c.with_xdna(xdna),
                 Err(reason) => {
                     eprintln!("error: {reason}");
                     return crate::EXIT_REFUSED;
                 }
             };
             let setup_s = started.elapsed().as_secs_f64();
-            crate::vit::print_block(&geometry, &designs, setup_s);
+            crate::vit::print_block(&geometry, &designs, setup_s, &places);
             image = Some(classifier);
         }
         npum_families::Family::Stt => {
@@ -166,14 +349,30 @@ pub fn serve(
                 return crate::EXIT_REFUSED;
             };
             let designs =
-                crate::stt::find_designs(root, &geometry.model_name).unwrap_or_else(|| {
-                    root.join("runtime")
-                        .join("artifacts")
-                        .join(&geometry.model_name)
-                });
+                crate::stt::find_designs(root, &geometry.model_name, args.value("--artifacts"))
+                    .unwrap_or_else(|| {
+                        root.join("runtime")
+                            .join("artifacts")
+                            .join(&geometry.model_name)
+                    });
             let encoder_design = crate::stt::read_design(&designs, false);
             let decoder_design = crate::stt::read_design(&designs, true);
+            let places = crate::stt::places(
+                &container,
+                &path,
+                root,
+                args,
+                encoder_design.as_ref(),
+                decoder_design.as_ref(),
+            );
             let started = std::time::Instant::now();
+            let xdna = match open_stt_xdna(&container, &path, root, args, &geometry) {
+                Ok(x) => x,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
             // Each decoder owns its KV cache, so the pool is a memory choice
             // as well as a concurrency one. `--threads` is the host's budget;
             // cap it so a machine with 24 threads does not load 24 decoders.
@@ -186,7 +385,7 @@ pub fn serve(
                 crate::stt::options_from(args),
                 pool,
             ) {
-                Ok(t) => t,
+                Ok(t) => t.with_xdna(xdna),
                 Err(reason) => {
                     eprintln!("error: {reason}");
                     return crate::EXIT_REFUSED;
@@ -198,6 +397,7 @@ pub fn serve(
                 &designs,
                 encoder_design.as_ref(),
                 decoder_design.as_ref(),
+                &places,
             );
             let options = crate::stt::options_from(args);
             crate::stt::print_schedule(setup_s, &options, args.value("--language").is_some());
@@ -205,6 +405,10 @@ pub fn serve(
         }
         npum_families::Family::Pose => {
             let started = std::time::Instant::now();
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             let detector = match npuembeddings_server::PoseDetector::open(&path) {
                 Ok(d) => d,
                 Err(reason) => {
@@ -212,17 +416,41 @@ pub fn serve(
                     return crate::EXIT_REFUSED;
                 }
             };
+            let xdna = if crate::ocr::wants_conv(args) {
+                let specs = npum_cpu::pose::array_specs(detector.geometry());
+                match crate::npu::open_convs(&path, &specs, args, root, "gemm_rtp") {
+                    Ok(backend) => Some(backend),
+                    Err(reason) => {
+                        eprintln!("error: {reason}");
+                        return crate::EXIT_REFUSED;
+                    }
+                }
+            } else {
+                None
+            };
+            let array_info = xdna.as_ref().map(|backend| crate::pose::ArrayInfo {
+                streams: backend.stream_count(),
+                designs: args
+                    .value("--artifacts")
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                rows: backend.rows_per_dispatch(),
+            });
+            let detector = match xdna {
+                Some(backend) => {
+                    detector.with_xdna(Some(npuembeddings_server::XdnaForPose { array: backend }))
+                }
+                None => detector,
+            };
             let setup_s = started.elapsed().as_secs_f64();
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
             let geometry = detector.geometry().clone();
-            // THE SERVER RUNS THE HOST, and the block says so: the array's
-            // convolutions are a CLI path in this runtime, and a server that
-            // printed "on the AMD NPU" while dispatching nothing would be
-            // lying twice -- in the block and in the answer.
-            crate::pose::print_block(&name, &geometry, detector.threads(), setup_s, None);
+            crate::pose::print_block(
+                &name,
+                &geometry,
+                detector.threads(),
+                setup_s,
+                array_info.as_ref(),
+            );
             pose = Some(detector);
         }
         npum_families::Family::MpPose => {
@@ -526,8 +754,13 @@ fn build_state(
         return Ok(state);
     }
     if arch.contains("pose") || arch.contains("mediapipe") {
+        let pose_engine = if crate::ocr::wants_conv(args) {
+            "array"
+        } else {
+            "host"
+        };
         state.health = format!(
-            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"pose\",\"engine\":\"host\",\"input_size\":640,\"conf\":0.25,\"iou\":0.7,\"keypoint\":0.5,\"max_det\":300,\"skeleton\":\"\"}}",
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"pose\",\"engine\":\"{pose_engine}\",\"input_size\":640,\"conf\":0.25,\"iou\":0.7,\"keypoint\":0.5,\"max_det\":300,\"skeleton\":\"\"}}",
             state.model_id
         );
         state.not_found = "this model serves /v1/pose, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
@@ -561,9 +794,16 @@ fn build_state(
         }
         probe = Some(candidate);
     }
+    let xdna = match open_embed_xdna(container, path, root, args) {
+        Ok(x) => x,
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            return Err(crate::EXIT_REFUSED);
+        }
+    };
     match npuembeddings_server::Embedder::open_with_vulkan(path, seq, vulkan_ops) {
         Ok(encoder) => {
-            let encoder = encoder.with_vulkan_device(probe);
+            let encoder = encoder.with_vulkan_device(probe).with_xdna(xdna);
             state.health = format!(
                 "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"embeddings\"}}",
                 state.model_id

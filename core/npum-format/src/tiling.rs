@@ -69,6 +69,50 @@ fn refuse(message: impl Into<String>) -> TilingError {
     }
 }
 
+/// Validate tile geometry before any modulo, division or allocation.
+///
+/// Tile sizes come from a design set, which is data: a zero divisor must be
+/// refused as a `TilingError`, not panic the caller, and a product too large
+/// for `usize` must be refused rather than wrap into a small allocation.
+fn checked_bytes(k: usize, n: usize, elem: usize) -> Result<usize, TilingError> {
+    if elem == 0 {
+        return Err(refuse("the element size is zero"));
+    }
+    k.checked_mul(n)
+        .and_then(|elems| elems.checked_mul(elem))
+        .ok_or_else(|| refuse(format!("a [{k},{n}] panel of {elem}-byte elements is too large")))
+}
+
+fn sub_tile(
+    tile_k: usize,
+    tile_n: usize,
+    mac_s: Option<usize>,
+    mac_t: Option<usize>,
+) -> Result<(usize, usize), TilingError> {
+    if tile_k == 0 || tile_n == 0 {
+        return Err(refuse("a tile dimension is zero"));
+    }
+    if (mac_s.is_some()) != (mac_t.is_some()) {
+        return Err(refuse("the sub-tile is half given: s and t come together"));
+    }
+    let (s, t) = match (mac_s, mac_t) {
+        (Some(s), Some(t)) => {
+            if s == 0 || t == 0 {
+                return Err(refuse("a sub-tile dimension is zero"));
+            }
+            if tile_k % s != 0 || tile_n % t != 0 {
+                return Err(refuse(format!(
+                    "the tile ({tile_k},{tile_n}) is not divisible by the sub-tile ({s},{t})"
+                )));
+            }
+            (s, t)
+        }
+        (None, None) => (1, 1),
+        _ => unreachable!("the half-given case was refused above"),
+    };
+    Ok((s, t))
+}
+
 /// Pre-tile a [K, N] operand of `elem` -byte elements into the array's order.
 ///
 /// `b` is row-major: `k * n + j` is the element at row `k`, column `j`.
@@ -109,10 +153,7 @@ pub fn tile_b_into(
     mac_t: Option<usize>,
     order: TileOrder,
 ) -> Result<(), TilingError> {
-    if elem == 0 {
-        return Err(refuse("the element size is zero"));
-    }
-    let bytes = k * n * elem;
+    let bytes = checked_bytes(k, n, elem)?;
     if b.len() != bytes {
         return Err(refuse(format!(
             "a [{k},{n}] operand of {elem}-byte elements is {} bytes, and the buffer is {}",
@@ -126,26 +167,12 @@ pub fn tile_b_into(
             out.len()
         )));
     }
-    if k % tile_k != 0 || n % tile_n != 0 {
+    if tile_k == 0 || tile_n == 0 || k % tile_k != 0 || n % tile_n != 0 {
         return Err(refuse(format!(
             "[{k},{n}] does not tile into ({tile_k},{tile_n})"
         )));
     }
-    if (mac_s.is_some()) != (mac_t.is_some()) {
-        return Err(refuse("the sub-tile is half given: s and t come together"));
-    }
-    let (s, t) = match (mac_s, mac_t) {
-        (Some(s), Some(t)) => {
-            if tile_k % s != 0 || tile_n % t != 0 {
-                return Err(refuse(format!(
-                    "the tile ({tile_k},{tile_n}) is not divisible by the sub-tile ({s},{t})"
-                )));
-            }
-            (s, t)
-        }
-        (None, None) => (1, 1),
-        _ => unreachable!("the half-given case was refused above"),
-    };
+    let (s, t) = sub_tile(tile_k, tile_n, mac_s, mac_t)?;
 
     let kb = k / tile_k;
     let nb = n / tile_n;
@@ -247,23 +274,20 @@ pub fn untile_b(
     mac_t: Option<usize>,
     order: TileOrder,
 ) -> Result<Vec<u8>, TilingError> {
-    if flat.len() != k * n * elem {
+    let bytes = checked_bytes(k, n, elem)?;
+    if flat.len() != bytes {
         return Err(refuse(format!(
             "a [{k},{n}] panel of {elem}-byte elements is {} bytes, and the buffer is {}",
-            k * n * elem,
+            bytes,
             flat.len()
         )));
     }
-    if k % tile_k != 0 || n % tile_n != 0 {
+    if tile_k == 0 || tile_n == 0 || k % tile_k != 0 || n % tile_n != 0 {
         return Err(refuse(format!(
             "[{k},{n}] does not tile into ({tile_k},{tile_n})"
         )));
     }
-    let (s, t) = match (mac_s, mac_t) {
-        (Some(s), Some(t)) => (s, t),
-        (None, None) => (1, 1),
-        _ => return Err(refuse("the sub-tile is half given: s and t come together")),
-    };
+    let (s, t) = sub_tile(tile_k, tile_n, mac_s, mac_t)?;
 
     let kb = k / tile_k;
     let nb = n / tile_n;

@@ -77,8 +77,9 @@ def bytes_to_unicode():
 
 def unicode_to_bytes():
     inv = {v: k for k, v in bytes_to_unicode().items()}
-    # chr(256+n) is not a single byte; invert through ord().
-    return {ord(v): k for k, v in inv.items()}
+    # inv maps the printable CHARACTER to its byte; the key must be the
+    # character's codepoint, not the byte value.
+    return {ord(k): v for k, v in inv.items()}
 
 
 class VocabMerges:

@@ -42,6 +42,15 @@ pub const PAR_MIN_ITEMS: i64 = 65_536;
 /// keeps such a GEMM on the serial path.
 pub const PAR_MIN_ROWS_PER_WORKER: usize = 8;
 
+/// The fewest OUTPUT COLUMNS a worker should get in a column split.
+///
+/// Row splitting is impossible when `m < 8` -- decode runs its projections
+/// at `m = 1` -- but those GEMMs are often very wide (`1 x 768 x 2304`).
+/// Their output columns are independent, so they can be split across the
+/// pool instead. One eight-lane vector is the smallest useful column chunk:
+/// narrower than that and masked tails start to dominate.
+pub const PAR_MIN_COLS_PER_WORKER: usize = 8;
+
 /// The defaults above are deliberate, but they are machine-dependent.
 ///
 /// A many-core host with large batches can profit from a lower threshold or
@@ -134,6 +143,69 @@ pub fn chunk_rows(rows: usize, work: i64, requested: usize) -> Option<usize> {
     Some(rows.div_ceil(workers))
 }
 
+/// Decide whether `cols` independent output columns doing `work` items
+/// should be split across workers, and return the chunk width.
+///
+/// This is the decode counterpart of [`chunk_rows`]. Every output column is
+/// reduced over K in the SAME order whichever worker computes it, so a
+/// column split crosses no reduction and stays bit-identical to the serial
+/// path. The minimum chunk keeps each worker at least one vector wide.
+#[inline]
+pub fn chunk_cols(cols: usize, work: i64, requested: usize) -> Option<usize> {
+    let policy = policy();
+    if cols == 0 || work < policy.min_items {
+        return None;
+    }
+    let cap = (cols / PAR_MIN_COLS_PER_WORKER).max(1);
+    let workers = requested.min(threads()).min(cap).max(1);
+    if workers <= 1 {
+        return None;
+    }
+    Some(cols.div_ceil(workers))
+}
+
+/// Hand each worker a disjoint set of output columns.
+///
+/// `data` is a row-major `rows x cols` matrix. For every column chunk the
+/// closure receives the chunk's index, its starting column, and one mutable
+/// window per row -- the slice `data[row][j0..j0+nc]`. The windows are
+/// disjoint by construction (a row is split at `j0`, a chunk never overlaps
+/// another), so rayon can run the closures in parallel without an atomic.
+///
+/// `f` is `Fn`, not `FnMut`, because each worker only mutates the slices it
+/// was handed. No scratch is allocated in the kernel: the windows borrow
+/// the caller's matrix directly.
+#[inline]
+pub fn for_each_col_chunk<T, F>(data: &mut [T], cols: usize, chunk_cols: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, usize, Vec<&mut [T]>) + Sync + Send,
+{
+    debug_assert!(cols > 0 && data.len() % cols == 0 && chunk_cols > 0);
+    let rows = data.len() / cols;
+    let nchunks = cols.div_ceil(chunk_cols);
+    let mut row_slices: Vec<&mut [T]> = data.chunks_mut(cols).collect();
+    let mut windows: Vec<Vec<&mut [T]>> = (0..nchunks).map(|_| Vec::with_capacity(rows)).collect();
+    // Split each row ONCE into all of its column windows. Re-splitting the
+    // same row for every chunk would hand out the same bytes twice (and set
+    // off an aliasing bug) -- a row is consumed left to right here.
+    for row in row_slices.iter_mut() {
+        let mut rest = std::mem::replace(row, &mut []);
+        for ci in 0..nchunks {
+            let nc = (cols - ci * chunk_cols).min(chunk_cols);
+            let (window, tail) = rest.split_at_mut(nc);
+            windows[ci].push(window);
+            rest = tail;
+        }
+    }
+    pool().install(|| {
+        windows
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(ci, wins)| f(ci, ci * chunk_cols, wins));
+    });
+}
+
 /// Run `f` once per contiguous chunk of `data`, in parallel, on the pool.
 ///
 /// `f` receives the chunk's index and the chunk itself. The chunks are
@@ -182,6 +254,40 @@ mod tests {
         if let Some(chunk) = chunk_rows(rows, work, threads()) {
             assert!(chunk >= PAR_MIN_ROWS_PER_WORKER);
             assert!(chunk * threads() >= rows);
+        }
+    }
+
+    #[test]
+    fn chunk_cols_handles_the_decode_shape_and_skips_small_work() {
+        // m = 1 cannot be row-split, but 768*2304 items clears the threshold.
+        let work = 768i64 * 2304;
+        let chunk = chunk_cols(2304, work, 16).expect("decode qkv should split by columns");
+        assert!(chunk >= PAR_MIN_COLS_PER_WORKER);
+        assert!(chunk * 16 >= 2304);
+        // Too few columns to give every worker a vector, or too little work.
+        assert_eq!(chunk_cols(4, work, 16), None);
+        assert_eq!(chunk_cols(2304, PAR_MIN_ITEMS - 1, 16), None);
+    }
+
+    #[test]
+    fn for_each_col_chunk_hands_out_disjoint_windows() {
+        let rows = 3;
+        let cols = 37;
+        let mut data: Vec<usize> = (0..rows * cols).collect();
+        let chunk = 8;
+        for_each_col_chunk(&mut data, cols, chunk, |ci, j0, mut wins| {
+            assert_eq!(wins.len(), rows);
+            let nc = (cols - j0).min(chunk);
+            for (r, window) in wins.iter_mut().enumerate() {
+                assert_eq!(window.len(), nc);
+                for (j, slot) in window.iter_mut().enumerate() {
+                    assert_eq!(*slot, r * cols + j0 + j, "chunk {ci}");
+                    *slot += 1000;
+                }
+            }
+        });
+        for (r, slot) in data.iter().enumerate() {
+            assert_eq!(*slot, r + 1000);
         }
     }
 }

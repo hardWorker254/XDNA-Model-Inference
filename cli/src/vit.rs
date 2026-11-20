@@ -26,6 +26,7 @@
 //! row and the head.
 
 use npum_format::Container;
+use npum_xdna::array_gemms::GemmSpec;
 use std::path::{Path, PathBuf};
 
 use crate::flags::Args;
@@ -43,6 +44,117 @@ pub use npum_cpu::vit::Geometry;
 /// classifier that answers about a model nobody chose.
 pub fn read_geometry(container: &Container, path: &Path) -> Option<Geometry> {
     Geometry::read(container, path)
+}
+
+/// The ViT's projections, as the array's loader needs them.
+///
+/// The four per-layer names and shapes are the ones the CPU pipeline dispatches
+/// in [`npum_cpu::vit::Vit::encode_into`]. The patch embedding is a convolution
+/// rewritten as an exact GEMM -- stride equals kernel, so im2col is a
+/// permutation -- and is named separately because `--npu-ops conv`, not
+/// `gemm`, is the flag that moves it.
+pub struct Specs {
+    pub layers: Vec<GemmSpec>,
+    pub patch: GemmSpec,
+}
+
+pub fn gemm_specs(container: &Container, g: &Geometry) -> Result<Specs, String> {
+    let d = g.hidden as usize;
+    let ffn = container
+        .directory()
+        .tensor("layer.0.ffn_up")
+        .and_then(|e| e.logical_shape.get(1).copied())
+        .ok_or_else(|| "the container does not state layer.0.ffn_up's shape".to_string())?
+        as usize;
+    let patch = container
+        .directory()
+        .tensor("frontend.patch_embed")
+        .ok_or_else(|| "the container holds no frontend.patch_embed panel".to_string())?;
+    let patch_k = patch
+        .logical_shape
+        .first()
+        .copied()
+        .ok_or_else(|| "frontend.patch_embed has no reduction width".to_string())?
+        as usize;
+    let patch_n = patch
+        .logical_shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| "frontend.patch_embed has no output width".to_string())?
+        as usize;
+
+    let mut layers = Vec::with_capacity(g.layers as usize * 4);
+    for layer in 0..g.layers as usize {
+        for (op, k, n) in [
+            ("qkv", d, 3 * d),
+            ("attn_out", d, d),
+            ("ffn_up", d, ffn),
+            ("ffn_down", ffn, d),
+        ] {
+            layers.push(GemmSpec {
+                weight: format!("layer.{layer}.{op}"),
+                op: op.to_string(),
+                k,
+                n,
+            });
+        }
+    }
+    Ok(Specs {
+        layers,
+        // The shipped ViT design has a square `attn_out` stream at the
+        // model's hidden width, which is the patch embedding's shape too. A
+        // model whose patch width differs has no stream here and is refused
+        // by the loader instead of being run on the host under a false flag.
+        patch: GemmSpec {
+            weight: "frontend.patch_embed".to_string(),
+            op: "attn_out".to_string(),
+            k: patch_k,
+            n: patch_n,
+        },
+    })
+}
+
+/// Where each requested operation runs, for the status block.
+#[derive(Debug, Clone, Copy)]
+pub struct Places {
+    pub gemm: bool,
+    pub conv: bool,
+    pub attn: bool,
+    pub layn: bool,
+    pub gelu: bool,
+    pub softm: bool,
+}
+
+impl Places {
+    pub fn none() -> Self {
+        Self {
+            gemm: false,
+            conv: false,
+            attn: false,
+            layn: false,
+            gelu: false,
+            softm: false,
+        }
+    }
+}
+
+pub fn places(
+    container: &Container,
+    path: &Path,
+    root: &Path,
+    args: &Args,
+    design_present: bool,
+) -> Places {
+    let named = args.value("--artifacts");
+    let elt = |set: &str| crate::npu::eltwise_design_present(container, path, root, named, set);
+    Places {
+        gemm: crate::npu::wants_op(args, "gemm") && design_present,
+        conv: crate::npu::wants_op(args, "conv") && design_present,
+        attn: crate::npu::wants_op(args, "attn") && design_present,
+        layn: crate::npu::wants_op(args, "layn") && (elt("layernorm") || elt("rmsnorm")),
+        gelu: crate::npu::wants_op(args, "gelu") && elt("gelu"),
+        softm: crate::npu::wants_op(args, "softm") && elt("softmax"),
+    }
 }
 
 /// The bytes a host-layout container stages, and what the block calls them.
@@ -67,7 +179,7 @@ pub fn staged_bytes(g: &Geometry) -> u64 {
 /// The rows are the reference's, in the reference's order, with the reference's widths:
 /// a row is a name, a place and a reason, and the reason is what makes
 /// the row worth reading.
-pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64) {
+pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64, places: &Places) {
     eprintln!("NpuEmbeddings -- ViT image classification on the AMD NPU");
     eprintln!(
         "  model      {}: hidden {}, {} pre-LN layers, {} heads x {}, {}px at patch {} -> {} positions, {} labels",
@@ -89,13 +201,13 @@ pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64) {
     eprintln!("  ops        (npu = dispatched, host = this process)");
     row(
         "patch_embed, 5th GEMM",
-        "host",
+        if places.conv { "npu" } else { "host" },
         "the same attn_out shape, computed here; --npu-ops conv dispatches it, \
          and it is the only convolution this architecture has",
     );
     row(
         &format!("{} x qkv/attn_out/ffn", g.layers),
-        "host",
+        if places.gemm { "npu" } else { "host" },
         "qkv, attn_out, ffn_up, ffn_down, M=1024 rows per dispatch; --npu-ops \
          gemm moves them to the array",
     );
@@ -109,13 +221,26 @@ pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64) {
     );
     row(
         "layernorm",
-        "host",
+        if places.layn { "npu" } else { "host" },
         &format!(
             "fp32 with this container's layer_norm_eps {}; --npu-ops layn moves it",
             format_g(g.ln_eps, 6)
         ),
     );
-    row("gelu", "host", "exact erf, fp32; --npu-ops gelu moves it");
+    row(
+        "gelu",
+        if places.gelu { "npu" } else { "host" },
+        "exact erf, fp32; --npu-ops gelu moves it",
+    );
+    row(
+        "attention",
+        if places.attn { "npu" } else { "host" },
+        &format!(
+            "{} heads x {} keys, no mask; --npu-ops attn uses attn_qk/attn_av \
+             inside the same design set as the projections",
+            g.heads, g.n_pos
+        ),
+    );
     let mut softmax = format!(
         "O(seq^2) on the host: {}x{} scores x {} heads in fp32; --npu-ops softm \
          moves it to softmax/, its own hw_context",
@@ -124,7 +249,11 @@ pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64) {
     if g.n_pos == 197 {
         softmax.push_str(", at a MEASURED 0.806 s against 0.241 s on the --npu-ops gemm arm");
     }
-    row("softmax", "host", &softmax);
+    row(
+        "softmax",
+        if places.softm { "npu" } else { "host" },
+        &softmax,
+    );
     row(
         "classifier head",
         "host",
@@ -217,25 +346,10 @@ pub fn prediction_json(
 }
 
 /// The design set's directory for a model, if there is one.
-pub fn find_designs(root: &Path, model_name: &str) -> Option<PathBuf> {
-    for base in [
-        root.join("runtime").join("artifacts"),
-        root.join("artifacts"),
-        root.join("runtime"),
-        root.to_path_buf(),
-    ] {
-        for sub in ["artifacts_npu1", "artifacts_npu2", "", "npu1", "npu2"] {
-            let dir = if sub.is_empty() {
-                base.join(model_name)
-            } else {
-                base.join(model_name).join(sub)
-            };
-            if dir.join("gemm_rtp").join("design.json").is_file() {
-                return Some(dir);
-            }
-        }
-    }
-    None
+pub fn find_designs(root: &Path, model_name: &str, named: Option<&str>) -> Option<PathBuf> {
+    // The search is shared with every family, including `--artifacts`.
+    crate::npu::find_artifacts(root, model_name, named)
+        .filter(|dir| dir.join("gemm_rtp").join("design.json").is_file())
 }
 
 pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
@@ -261,20 +375,15 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        if let Some(reason) =
-            crate::families::refuse_op_not_in_arch(args, npum_families::Family::Cls)
-        {
-            eprintln!("error: {reason}");
-            return crate::EXIT_REFUSED;
-        }
-        if let Some(reason) =
-            crate::families::refuse_array_not_ported(npum_families::Family::Cls, args, &[])
-        {
-            eprintln!("error: {reason}");
+        // ONE GEMM design, plus one context per elementwise pass: check the
+        // board BEFORE the listener or the work opens anything.
+        if !crate::npu::check_array_budget(args, 1) {
             return crate::EXIT_REFUSED;
         }
         // The ViT's own block, on the stderr: the geometry, the design set,
-        // and where every operation runs.
+        // and where every operation runs. It is printed BEFORE the
+        // `--npu-ops` refusals so a refused command still says which container
+        // and which design it was refused for.
         let started = std::time::Instant::now();
         let Some(geometry) = crate::vit::read_geometry(container, path) else {
             eprintln!(
@@ -283,11 +392,16 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             );
             return crate::EXIT_REFUSED;
         };
-        let designs = crate::vit::find_designs(root, &geometry.model_name).unwrap_or_else(|| {
-            root.join("runtime")
-                .join("artifacts")
-                .join(&geometry.model_name)
-        });
+        let designs =
+            crate::vit::find_designs(root, &geometry.model_name, args.value("--artifacts"))
+                .unwrap_or_else(|| {
+                    root.join("runtime")
+                        .join("artifacts")
+                        .join(&geometry.model_name)
+                });
+        let present = crate::npu::has_own_design(container, "gemm_rtp")
+            || designs.join("gemm_rtp").join("design.json").is_file();
+        let places = crate::vit::places(container, path, root, args, present);
         // The setup is the weights arriving: the container is open, and the
         // head and the stack are read before the block is printed, because
         // the block reports how long that took.
@@ -298,11 +412,81 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                 return crate::EXIT_REFUSED;
             }
         };
-        crate::vit::print_block(&geometry, &designs, started.elapsed().as_secs_f64());
+        crate::vit::print_block(&geometry, &designs, started.elapsed().as_secs_f64(), &places);
+
+        if let Some(reason) =
+            crate::families::refuse_op_not_in_arch(args, npum_families::Family::Cls)
+        {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        // Six codes are real seams: the four layer GEMMs, the patch-embed
+        // convolution (a GEMM on the array), the attention, and the three
+        // elementwise passes. `mproj`, `fft` and `logit` are still refused by
+        // name: the head cannot be tiled to a legal B width.
+        if let Some(reason) = crate::families::refuse_array_not_ported(
+            npum_families::Family::Cls,
+            args,
+            &["gemm", "attn", "layn", "gelu", "softm", "conv"],
+        ) {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+
+        // THE ARRAY, OR THE HOST. The flag is the only thing that opens a
+        // design; a design that happens to be on disk is not a dispatch.
+        let want_array = crate::npu::wants_op(args, "gemm")
+            || crate::npu::wants_op(args, "attn")
+            || crate::npu::wants_op(args, "conv");
+        let mut array: Option<Box<dyn npum_model::array::ArrayText>> = None;
+        if want_array {
+            let specs = match crate::vit::gemm_specs(container, &geometry) {
+                Ok(s) => s,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+            // ALL of this model's projections go into the ONE backend, so a
+            // later flag cannot ask for a GEMM whose panel was never staged.
+            // The FLAGS, not the backend's `gemm_on_array()`, decide which of
+            // them are dispatched: staging the patch embedding for a
+            // `conv`-only run must not silently take over the layer GEMMs.
+            let mut chosen = specs.layers;
+            chosen.push(specs.patch);
+            array = match crate::npu::open_array_text_specs(
+                container,
+                path,
+                root,
+                args,
+                chosen,
+                "gemm_rtp",
+            ) {
+                Ok(a) => Some(a as Box<dyn npum_model::array::ArrayText>),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+        }
+        let mut eltwise = match crate::npu::open_eltwise(container, path, root, args) {
+            Ok(e) => e.map(|e| e as Box<dyn npum_model::array::ArrayEltwise>),
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        // The patch embedding is the convolution, and it is gated by `conv`
+        // and not by `gemm`: asking only for `gemm` leaves the four layer
+        // projections on the array but the patch embedding on the host.
+        let conv_on = places.conv && array.is_some();
+        let gemm_on = places.gemm && array.is_some();
         let _ = arch;
 
         let json = args.switch("--json");
-        let top_k = args.value_i64("--top-k").unwrap_or(0) > 0;
+        // `--top-k` is a switch in the flag table, so it has no value to
+        // read; reading one made the documented runners-up never print.
+        let top_k = args.switch("--top-k");
         let mut out = String::from("[\n");
         for (i, image) in images.iter().enumerate() {
             let decoded = match npum_cpu::vit_image::decode_image(std::path::Path::new(image)) {
@@ -323,8 +507,28 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             let front_end_s = front.elapsed().as_secs_f64();
 
             let enc = std::time::Instant::now();
-            let hidden = vit.encode(&patches);
+            let hidden = match vit.encode(
+                &patches,
+                array.as_deref_mut(),
+                eltwise.as_deref_mut(),
+                gemm_on,
+                conv_on,
+            ) {
+                Ok(h) => h,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
             let encoder_s = enc.elapsed().as_secs_f64();
+            // The count is the array's own, not an estimate. A run whose flag
+            // asked for array work but dispatched zero calls would be the lie
+            // the `--npu-ops` flag exists to prevent.
+            let dispatches = array
+                .as_ref()
+                .map(|a| a.dispatches() + a.attn_dispatches())
+                .unwrap_or(0)
+                + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
 
             let head = std::time::Instant::now();
             let d = geometry.hidden as usize;
@@ -350,9 +554,10 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                 out.push_str(if i + 1 < images.len() { ",\n" } else { "\n" });
             } else {
                 eprintln!(
-                    "  {:<40} {:.2} s  0 dispatches",
+                    "  {:<40} {:.2} s  {} dispatches",
                     image,
-                    front_end_s + encoder_s + head_s
+                    front_end_s + encoder_s + head_s,
+                    dispatches
                 );
                 if top_k {
                     // A ranking of the whole row, not the top two: the

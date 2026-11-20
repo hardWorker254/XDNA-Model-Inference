@@ -143,19 +143,21 @@ pub fn transcribe_samples(
     samples: &[f32],
     options: &Options,
     weights: &FrontEndWeights,
+    array_enc: npum_model::array::ArrayTextRef<'_, '_>,
+    array_dec: npum_model::array::ArrayTextRef<'_, '_>,
+    mut eltwise: Option<&mut (dyn npum_model::array::ArrayEltwise + '_)>,
 ) -> Result<Transcript, String> {
     if samples.is_empty() {
         return Err("transcribe: no audio samples".into());
     }
     let geometry = encoder.geometry();
     let pos_per_second = (SAMPLE_RATE / 2 / geometry.hop_length) as i64;
-    if options.chunk_seconds <= 0
-        || options.chunk_seconds * pos_per_second > geometry.max_seq as i64
-    {
+    let positions = options.chunk_seconds.checked_mul(pos_per_second);
+    if options.chunk_seconds <= 0 || positions.map_or(true, |p| p > geometry.max_seq as i64) {
         return Err(format!(
             "transcribe: a {} s window is {} encoder positions, and this container's position table holds {}.\n  Re-pack it with the full table -- that is the fix:\n    python tools/pack/pack_npue.py --model-dir <ckpt> --out <this file> --device <npu1|npu2> --max-seq {}\n  Shrinking --chunk-seconds to {} would NOT be a fix: the window would cover {} s of every {} s of audio, and the rest would be silence the model would transcribe as something.",
             options.chunk_seconds,
-            options.chunk_seconds * pos_per_second,
+            positions.unwrap_or(i64::MAX),
             geometry.max_seq,
             geometry.max_seq,
             geometry.max_seq as i64 / pos_per_second,
@@ -163,9 +165,13 @@ pub fn transcribe_samples(
             options.chunk_seconds
         ));
     }
-    if options.stride_seconds < 0 || options.stride_seconds * 2 > options.chunk_seconds {
+    // Two strides span the overlap, so the window ADVANCE is
+    // `chunk - 2 * stride`. At exactly half, that advance is zero and the
+    // long-form loop would transcribe the same window forever.
+    let doubled = options.stride_seconds.checked_mul(2);
+    if options.stride_seconds < 0 || doubled.map_or(true, |d| d >= options.chunk_seconds) {
         return Err(
-            "transcribe: the stride must be at most half the chunk length (transformers' own rule; two strides span the overlap)".into(),
+            "transcribe: the stride must be less than half the chunk length (the window advance, chunk - 2*stride, must be positive)".into(),
         );
     }
 
@@ -182,16 +188,34 @@ pub fn transcribe_samples(
         decoder_seconds: 0.0,
         n_dispatches: 0,
     };
-    let chunk = options.chunk_seconds as usize * SAMPLE_RATE;
-    let stride = options.stride_seconds as usize * SAMPLE_RATE;
+    let chunk = i64::try_from(options.chunk_seconds)
+        .ok()
+        .and_then(|s| s.checked_mul(SAMPLE_RATE as i64))
+        .and_then(|s| usize::try_from(s).ok())
+        .ok_or_else(|| "transcribe: the window length is too large".to_string())?;
+    let stride = i64::try_from(options.stride_seconds)
+        .ok()
+        .and_then(|s| s.checked_mul(SAMPLE_RATE as i64))
+        .and_then(|s| usize::try_from(s).ok())
+        .ok_or_else(|| "transcribe: the stride is too large".to_string())?;
     // transformers strides BOTH sides, so consecutive windows start one
     // (chunk - 2*stride) apart, not (chunk - stride).
-    let step = chunk - 2 * stride;
+    let Some(step) = stride
+        .checked_mul(2)
+        .and_then(|twice| chunk.checked_sub(twice))
+    else {
+        return Err("transcribe: the stride must be less than half the chunk length".into());
+    };
+    if step == 0 {
+        return Err("transcribe: the stride must be less than half the chunk length".into());
+    }
     let n = samples.len();
     let mut window_ids: Vec<Vec<i32>> = Vec::new();
     // One workspace for the whole transcription: the encoder's scratch is
     // reused across every window, not just across its layers.
     let mut encoder_ws = EncoderWorkspace::new();
+    let mut array_enc = array_enc;
+    let mut array_dec = array_dec;
 
     let mut position = 0usize;
     loop {
@@ -207,6 +231,9 @@ pub fn transcribe_samples(
             options,
             weights,
             &mut transcript,
+            array_enc.as_deref_mut(),
+            array_dec.as_deref_mut(),
+            eltwise.as_deref_mut(),
         )?;
         window_ids.push(segment.ids.clone());
         transcript.segments.push(segment);
@@ -220,6 +247,20 @@ pub fn transcribe_samples(
     let merged = merge_windows(&window_ids);
     let bytes = tokenizer.decode(&merged)?;
     transcript.text = String::from_utf8_lossy(&bytes).into_owned();
+    // THE DISPATCH COUNT IS READ FROM THE BACKENDS, not from the flags: a run
+    // that asked for the array and dispatched nothing must report zero.
+    transcript.n_dispatches = array_enc
+        .as_deref()
+        .map(|a| a.dispatches() as i64 + a.attn_dispatches() as i64)
+        .unwrap_or(0)
+        + array_dec
+            .as_deref()
+            .map(|a| a.dispatches() as i64 + a.attn_dispatches() as i64)
+            .unwrap_or(0)
+        + eltwise
+            .as_deref()
+            .map(|e| e.dispatches() as i64)
+            .unwrap_or(0);
     Ok(transcript)
 }
 
@@ -248,6 +289,9 @@ fn run_window(
     options: &Options,
     weights: &FrontEndWeights,
     transcript: &mut Transcript,
+    array_enc: npum_model::array::ArrayTextRef<'_, '_>,
+    array_dec: npum_model::array::ArrayTextRef<'_, '_>,
+    mut eltwise: Option<&mut (dyn npum_model::array::ArrayEltwise + '_)>,
 ) -> Result<Segment, String> {
     let geometry = encoder.geometry();
     let mel_start = std::time::Instant::now();
@@ -266,7 +310,13 @@ fn run_window(
     transcript.conv_seconds += conv_start.elapsed().as_secs_f64();
 
     let encoder_start = std::time::Instant::now();
-    let hidden = encoder.run_into(&conv, ENCODER_POSITIONS, encoder_ws);
+    let hidden = encoder.run_into(
+        &conv,
+        ENCODER_POSITIONS,
+        encoder_ws,
+        array_enc,
+        eltwise.as_deref_mut(),
+    )?;
     transcript.encoder_seconds += encoder_start.elapsed().as_secs_f64();
 
     // The cross-attention cache is built once per WINDOW, not once per
@@ -279,6 +329,8 @@ fn run_window(
         &prompt(tokenizer, options)?,
         tokenizer.token_id("<|endoftext|>")?,
         options.max_new,
+        array_dec,
+        eltwise,
     )?;
     transcript.decoder_seconds += decoder_start.elapsed().as_secs_f64();
     let bytes = tokenizer.decode(&ids)?;

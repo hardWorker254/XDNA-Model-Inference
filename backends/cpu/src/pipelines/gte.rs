@@ -6,8 +6,8 @@
 
 use crate::kernels;
 use crate::parallel;
+use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape, EltOp};
 use npum_model::Ops;
-use npum_model::array::{ArrayEltwise, ArrayTextRef};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +41,9 @@ pub enum Error {
         "the head size {head_dim} is not a multiple of eight, and the host kernels read eight floats at a time"
     )]
     UnalignedHead { head_dim: usize },
-    #[error("the input is {found} ids for {batch} sequences of {seq}, and it should be {expected}")]
+    #[error(
+        "the input is {found} ids for {batch} sequences of {seq}, and it should be {expected}"
+    )]
     WrongInput {
         batch: usize,
         seq: usize,
@@ -52,6 +54,16 @@ pub enum Error {
     BadOperand { name: String, reason: String },
     #[error("the array refused the projection: {0}")]
     Array(#[from] npum_model::array::ArrayError),
+    #[error(
+        "the softmax design's score row is {cols} wide, but this GTE has {seq} keys; \
+         a design narrower than the sequence cannot score it"
+    )]
+    SoftmaxTooNarrow { cols: usize, seq: usize },
+    #[error(
+        "the softmax design's score row is {softmax} wide and the attention's is {attn}; \
+         the two designs must agree on the score row's width"
+    )]
+    SoftmaxWidthMismatch { softmax: usize, attn: usize },
     #[error(transparent)]
     Kernel(#[from] npum_model::Error),
 }
@@ -325,6 +337,15 @@ fn grown(buf: &mut Vec<f32>, len: usize) -> &mut [f32] {
     buf
 }
 
+/// Gamma and beta as the design's single parameter buffer: gain first, then
+/// offset. The container keeps them apart; the array reads them as one run.
+fn layernorm_params(gamma: &[f32], beta: &[f32]) -> Vec<f32> {
+    let mut params = Vec::with_capacity(gamma.len() + beta.len());
+    params.extend_from_slice(gamma);
+    params.extend_from_slice(beta);
+    params
+}
+
 /// The RoPE tables up to `seq`, cached across forward passes.
 ///
 /// `cos`/`sin` are a pure function of the token position, the model's baked
@@ -554,7 +575,7 @@ impl GteModel {
         batch: usize,
         seq: usize,
         array: ArrayTextRef<'_, '_>,
-        _eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
         workspace: &mut GteWorkspace,
     ) -> Result<Vec<f32>> {
         let rows = batch * seq;
@@ -574,7 +595,9 @@ impl GteModel {
                 found: seq,
             });
         }
-        let h = self.forward(ops, ids, mask, batch, seq, timings, array, workspace)?;
+        let h = self.forward(
+            ops, ids, mask, batch, seq, timings, array, eltwise, workspace,
+        )?;
         Ok(self.pool(&h, batch, seq, workspace))
     }
 
@@ -587,6 +610,7 @@ impl GteModel {
         seq: usize,
         timings: &mut Timings,
         mut array: ArrayTextRef<'_, '_>,
+        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
         ws: &mut GteWorkspace,
     ) -> Result<Vec<f32>> {
         let spec = &self.spec;
@@ -595,6 +619,49 @@ impl GteModel {
         let three_hidden = 3 * hidden;
         let score_rows = batch * spec.heads * seq;
         let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
+
+        // WHICH PASS IS ON THE ARRAY, ASKED ONCE PER PASS.
+        //
+        // The flag names the passes one by one, so a run can put the
+        // LayerNorm on the array and leave the GELU and the softmax on the
+        // host. The handle's presence is not the answer: a handle opened for
+        // the attention alone has no projection panels, and a backend with
+        // one eltwise design has only that pass.
+        let ln_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::LayerNorm));
+        let gelu_on = eltwise.as_deref().is_some_and(|e| e.on_array(EltOp::Gelu));
+        let sm_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::Softmax));
+        let attn_on = array.as_deref().is_some_and(|a| a.on_array());
+
+        // THE SCORE ROW'S WIDTH IS THE DESIGN'S, NOT THE SEQUENCE'S.
+        //
+        // The array's softmax normalises a row of the DESIGN's width (the
+        // padded key count) and the array's attention lays its scores out at
+        // that width too. A design narrower than the sequence is refused
+        // rather than handed a longer row, and the two designs must agree on
+        // the row they share.
+        let sc_cols = match eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+            Some(cols) => {
+                if cols < seq {
+                    return Err(Error::SoftmaxTooNarrow { cols, seq });
+                }
+                cols
+            }
+            None => seq,
+        };
+        if attn_on {
+            if let Some(cols) = array.as_deref().and_then(|a| a.score_cols()) {
+                if cols != sc_cols {
+                    return Err(Error::SoftmaxWidthMismatch {
+                        softmax: sc_cols,
+                        attn: cols,
+                    });
+                }
+            }
+        }
 
         // Embeddings: word + token_type[0], then embeddings.LayerNorm.
         // No absolute position addition (RoPE). position_embedding tensor in container is zeroed.
@@ -618,14 +685,22 @@ impl GteModel {
             }
         }
         let t0 = std::time::Instant::now();
-        ops.layernorm_rows(
-            x,
-            rows,
-            hidden,
-            &self.weights.ln_gamma,
-            &self.weights.ln_beta,
-        )?;
-        timings.host_layernorm += t0.elapsed().as_secs_f64();
+        if ln_on {
+            let params = layernorm_params(&self.weights.ln_gamma, &self.weights.ln_beta);
+            if let Some(eltwise) = eltwise.as_deref_mut() {
+                eltwise.layernorm(&params, x, rows)?;
+            }
+            timings.array_gemm += t0.elapsed().as_secs_f64();
+        } else {
+            ops.layernorm_rows(
+                x,
+                rows,
+                hidden,
+                &self.weights.ln_gamma,
+                &self.weights.ln_beta,
+            )?;
+            timings.host_layernorm += t0.elapsed().as_secs_f64();
+        }
 
         // The RoPE tables are their own cache: growing them mutably borrows
         // only these three fields, leaving every scratch buffer below free.
@@ -648,7 +723,7 @@ impl GteModel {
         let up_gate = grown(&mut ws.up_gate, rows * 2 * spec.ffn);
         let act = grown(&mut ws.act, rows * spec.ffn);
         let down = grown(&mut ws.down, rows * hidden);
-        let scores = grown(&mut ws.scores, score_rows * seq);
+        let scores = grown(&mut ws.scores, score_rows * sc_cols);
         let zeros_bias = grown(&mut ws.zeros_bias, 2 * spec.ffn);
 
         for (index, layer) in self.weights.layers.iter().enumerate() {
@@ -687,14 +762,50 @@ impl GteModel {
             // Apply RoPE to Q and K
             apply_rope_qkv(qkv, batch, seq, spec.heads, spec.head_dim, hidden, cos, sin);
 
-            // ATTENTION: one fused host kernel, or the three separate passes
-            // when a device owns the softmax.
+            // ATTENTION: the array's whole block, or the host's own passes.
+            //
+            // The array's path takes QK^T, the softmax and softmax.V as ONE
+            // block, because its score rows are at the PADDED key count and
+            // the host's are at the sequence: a softmax that normalises a
+            // different number of keys than the row holds is a softmax over
+            // the wrong row. The host's fused kernel is the alternative only
+            // when no device owns the score row's width.
             let t_attn = std::time::Instant::now();
-            if ops.place() == npum_model::Placement::Host {
+            if attn_on {
+                let before = array
+                    .as_deref()
+                    .map(|a| a.attn_seconds())
+                    .unwrap_or((0.0, 0.0));
+                let shape = AttentionShape {
+                    batch,
+                    seq,
+                    heads: spec.heads,
+                    head_dim: spec.head_dim,
+                    hidden,
+                };
+                if let Some(array) = array.as_deref_mut() {
+                    // The softmax handle is passed ONLY when the softmax is
+                    // on the array: the attention asks the eltwise backend
+                    // for it, and a backend with no softmax design would
+                    // refuse.
+                    let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
+                    array.attention(qkv, shape, add_mask, softmax, ctx)?;
+                }
+                let after = array
+                    .as_deref()
+                    .map(|a| a.attn_seconds())
+                    .unwrap_or((0.0, 0.0));
+                timings.qk += after.0 - before.0;
+                timings.av += after.1 - before.1;
+                timings.attention += t_attn.elapsed().as_secs_f64();
+            } else if !sm_on
+                && sc_cols == seq
+                && seq % 8 == 0
+                && ops.place() == npum_model::Placement::Host
+            {
                 // QK^T + softmax + softmax.V in one pass over a single score
-                // row. Bit-identical to the three passes below (the same
-                // dot8, the same softmax body, the same V accumulation), but
-                // it never materialises the seq-by-seq score matrix.
+                // row. Bit-identical to the three passes below, but it never
+                // materialises the seq-by-seq score matrix.
                 kernels::fused_attention(
                     qkv,
                     ctx,
@@ -708,14 +819,20 @@ impl GteModel {
                 timings.attention += t_attn.elapsed().as_secs_f64();
             } else {
                 let t_qk = std::time::Instant::now();
-                self.qk(qkv, scores, batch, seq, add_mask);
+                self.qk(qkv, scores, batch, seq, add_mask, sc_cols);
                 let qk_s = t_qk.elapsed().as_secs_f64();
                 timings.qk += qk_s;
                 let t_sm = std::time::Instant::now();
-                ops.softmax_rows(scores, score_rows, seq)?;
+                if sm_on {
+                    if let Some(eltwise) = eltwise.as_deref_mut() {
+                        eltwise.softmax(scores, score_rows)?;
+                    }
+                } else {
+                    ops.softmax_rows(&mut scores[..score_rows * sc_cols], score_rows, sc_cols)?;
+                }
                 timings.host_softmax += t_sm.elapsed().as_secs_f64();
                 let t_av = std::time::Instant::now();
-                self.av(scores, qkv, ctx, batch, seq);
+                self.av(scores, qkv, ctx, batch, seq, sc_cols);
                 let av_s = t_av.elapsed().as_secs_f64();
                 timings.av += av_s;
                 timings.attention += qk_s + av_s;
@@ -755,8 +872,16 @@ impl GteModel {
             ops.add_inplace(x, &proj[..x.len()])?;
             // attn_ln (post-LN)
             let t_ln = std::time::Instant::now();
-            ops.layernorm_rows(x, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
-            timings.host_layernorm += t_ln.elapsed().as_secs_f64();
+            if ln_on {
+                let params = layernorm_params(&layer.ln1_gamma, &layer.ln1_beta);
+                if let Some(eltwise) = eltwise.as_deref_mut() {
+                    eltwise.layernorm(&params, x, rows)?;
+                }
+                timings.array_gemm += t_ln.elapsed().as_secs_f64();
+            } else {
+                ops.layernorm_rows(x, rows, hidden, &layer.ln1_gamma, &layer.ln1_beta)?;
+                timings.host_layernorm += t_ln.elapsed().as_secs_f64();
+            }
 
             // Gated GEGLU MLP: up_gate = x @ W (no bias), split [up|gate], gelu(gate)*up, down
             match array.as_deref_mut().filter(|_| gemm_on) {
@@ -782,33 +907,68 @@ impl GteModel {
                 }
             }
             let inter = spec.ffn;
-            let geglu = |r: usize, out: &mut [f32]| {
-                let base = r * 2 * inter;
-                for (j, slot) in out.iter_mut().enumerate() {
-                    let upv = up_gate[base + j];
-                    let gate = up_gate[base + inter + j];
-                    *slot = upv * gelu_erf_f32(gate);
+            let t_gelu = std::time::Instant::now();
+            if gelu_on {
+                // GEGLU is `up * gelu(gate)`. The array's GELU is a flat
+                // elementwise pass, so stage the GATE half into `act` (the
+                // block's own output buffer), let the array transform it,
+                // then fold in the up half. The two halves are adjacent in
+                // `up_gate` and never overlap the scratch.
+                for r in 0..rows {
+                    let base = r * 2 * inter;
+                    act[r * inter..(r + 1) * inter]
+                        .copy_from_slice(&up_gate[base + inter..base + 2 * inter]);
                 }
-            };
-            // Every output element is one `erff` on its own gate, so a row
-            // split crosses no reduction and keeps the exact libm result.
-            match parallel::chunk_rows(rows, (rows as i64) * (inter as i64), parallel::threads()) {
-                Some(chunk) => {
-                    parallel::for_each_chunk_mut(
-                        &mut act[..rows * inter],
-                        chunk * inter,
-                        |ci, part| {
-                            let first = ci * chunk;
-                            for (i, row) in part.chunks_exact_mut(inter).enumerate() {
-                                geglu(first + i, row);
-                            }
-                        },
-                    );
+                if let Some(eltwise) = eltwise.as_deref_mut() {
+                    eltwise.gelu(&mut act[..rows * inter])?;
                 }
-                None => {
-                    for (r, part) in act[..rows * inter].chunks_exact_mut(inter).enumerate() {
-                        geglu(r, part);
+                for r in 0..rows {
+                    let base = r * 2 * inter;
+                    let row = &mut act[r * inter..(r + 1) * inter];
+                    for j in 0..inter {
+                        row[j] *= up_gate[base + j];
                     }
+                }
+                timings.array_gemm += t_gelu.elapsed().as_secs_f64();
+            } else {
+                let geglu = |r: usize, out: &mut [f32]| {
+                    let base = r * 2 * inter;
+                    for (j, slot) in out.iter_mut().enumerate() {
+                        let upv = up_gate[base + j];
+                        let gate = up_gate[base + inter + j];
+                        *slot = upv * gelu_erf_f32(gate);
+                    }
+                };
+                // Every output element is one `erff` on its own gate, so a
+                // row split crosses no reduction and keeps the exact libm
+                // result.
+                match parallel::chunk_rows(
+                    rows,
+                    (rows as i64) * (inter as i64),
+                    parallel::threads(),
+                ) {
+                    Some(chunk) => {
+                        parallel::for_each_chunk_mut(
+                            &mut act[..rows * inter],
+                            chunk * inter,
+                            |ci, part| {
+                                let first = ci * chunk;
+                                for (i, row) in part.chunks_exact_mut(inter).enumerate() {
+                                    geglu(first + i, row);
+                                }
+                            },
+                        );
+                    }
+                    None => {
+                        for (r, part) in act[..rows * inter].chunks_exact_mut(inter).enumerate() {
+                            geglu(r, part);
+                        }
+                    }
+                }
+                let spent = t_gelu.elapsed().as_secs_f64();
+                match ops.place() {
+                    npum_model::Placement::Host => timings.host_gelu += spent,
+                    _ => timings.gpu += spent,
                 }
             }
             match array.as_deref_mut().filter(|_| gemm_on) {
@@ -844,13 +1004,35 @@ impl GteModel {
             ops.add_inplace(x, &down[..x.len()])?;
             // mlp_ln (post-LN)
             let t_ln = std::time::Instant::now();
-            ops.layernorm_rows(x, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
-            timings.host_layernorm += t_ln.elapsed().as_secs_f64();
+            if ln_on {
+                let params = layernorm_params(&layer.ln2_gamma, &layer.ln2_beta);
+                if let Some(eltwise) = eltwise.as_deref_mut() {
+                    eltwise.layernorm(&params, x, rows)?;
+                }
+                timings.array_gemm += t_ln.elapsed().as_secs_f64();
+            } else {
+                ops.layernorm_rows(x, rows, hidden, &layer.ln2_gamma, &layer.ln2_beta)?;
+                timings.host_layernorm += t_ln.elapsed().as_secs_f64();
+            }
         }
         Ok(x.to_vec())
     }
 
-    fn qk(&self, qkv: &[f32], scores: &mut [f32], batch: usize, seq: usize, add_mask: &[f32]) {
+    /// QK^T into score rows of stride `sc_cols`.
+    ///
+    /// The first `seq` columns are the real keys. The columns past them are
+    /// the array's padding when a device owns the softmax: they are filled
+    /// with -1e30 so its exponentials underflow them to zero. A zero there
+    /// would be a padding column attending to every key.
+    fn qk(
+        &self,
+        qkv: &[f32],
+        scores: &mut [f32],
+        batch: usize,
+        seq: usize,
+        add_mask: &[f32],
+        sc_cols: usize,
+    ) {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let head_dim = spec.head_dim;
@@ -862,31 +1044,49 @@ impl GteModel {
             let b = p / spec.heads;
             let h = p % spec.heads;
             let q = &qkv[(b * seq + i) * 3 * hidden + h * head_dim..][..head_dim];
-            for (j, slot) in dst.iter_mut().enumerate() {
+            for (j, slot) in dst[..seq].iter_mut().enumerate() {
                 let k = &qkv[(b * seq + j) * 3 * hidden + hidden + h * head_dim..][..head_dim];
                 // `dot8` keeps the first-eight-products / FMA-lanes / hsum8
                 // order of the old hand-rolled loop, bit for bit.
                 *slot = kernels::dot8(q, k) + add_mask[b * seq + j];
             }
+            dst[seq..].fill(-1.0e30);
         };
         match parallel::chunk_rows(rows, work, parallel::threads()) {
             Some(chunk) => {
-                parallel::for_each_chunk_mut(&mut scores[..rows * seq], chunk * seq, |ci, part| {
-                    let first = ci * chunk;
-                    for (i, row) in part.chunks_exact_mut(seq).enumerate() {
-                        qk_row(first + i, row);
-                    }
-                });
+                parallel::for_each_chunk_mut(
+                    &mut scores[..rows * sc_cols],
+                    chunk * sc_cols,
+                    |ci, part| {
+                        let first = ci * chunk;
+                        for (i, row) in part.chunks_exact_mut(sc_cols).enumerate() {
+                            qk_row(first + i, row);
+                        }
+                    },
+                );
             }
             None => {
-                for (row, part) in scores[..rows * seq].chunks_exact_mut(seq).enumerate() {
+                for (row, part) in scores[..rows * sc_cols]
+                    .chunks_exact_mut(sc_cols)
+                    .enumerate()
+                {
                     qk_row(row, part);
                 }
             }
         }
     }
 
-    fn av(&self, scores: &[f32], qkv: &[f32], ctx: &mut [f32], batch: usize, seq: usize) {
+    /// softmax.V from rows of stride `sc_cols`; only the first `seq` of each
+    /// row are keys, and the padded tail is never read.
+    fn av(
+        &self,
+        scores: &[f32],
+        qkv: &[f32],
+        ctx: &mut [f32],
+        batch: usize,
+        seq: usize,
+        sc_cols: usize,
+    ) {
         let spec = &self.spec;
         let hidden = spec.hidden;
         let head_dim = spec.head_dim;
@@ -896,7 +1096,7 @@ impl GteModel {
             let b = row / seq;
             let i = row % seq;
             for h in 0..spec.heads {
-                let a = &scores[((b * spec.heads + h) * seq + i) * seq..][..seq];
+                let a = &scores[((b * spec.heads + h) * seq + i) * sc_cols..][..seq];
                 let o = &mut out[h * head_dim..][..head_dim];
                 o.fill(0.0);
                 for (j, &aj) in a.iter().enumerate() {
@@ -1017,6 +1217,295 @@ fn gelu_erf_f32(x: f32) -> f32 {
 }
 
 #[cfg(test)]
+mod array_seam_tests {
+    use super::*;
+    use crate::ops::CpuOps;
+    use npum_model::array::{ArrayAttention, ArrayGemm, ArrayText};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Log {
+        gemms: Vec<String>,
+        attention: usize,
+        layernorm: usize,
+        gelu: usize,
+        softmax: usize,
+    }
+
+    struct MockText {
+        log: Rc<RefCell<Log>>,
+    }
+    impl ArrayGemm for MockText {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn gemm_on_array(&self) -> bool {
+            true
+        }
+        fn dispatches(&self) -> usize {
+            self.log.borrow().gemms.len()
+        }
+        fn staged_bytes(&self) -> usize {
+            0
+        }
+        fn gemm(
+            &mut self,
+            weight: &str,
+            _a: &[f32],
+            _rows: usize,
+            _k: usize,
+            _n: usize,
+            _bias: Option<&[f32]>,
+            out: &mut [f32],
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().gemms.push(weight.to_string());
+            out.fill(0.0);
+            Ok(())
+        }
+    }
+    impl ArrayAttention for MockText {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn on_array(&self) -> bool {
+            true
+        }
+        fn attn_dispatches(&self) -> usize {
+            self.log.borrow().attention
+        }
+        fn attn_seconds(&self) -> (f64, f64) {
+            (0.0, 0.0)
+        }
+        fn attention(
+            &mut self,
+            _qkv: &[f32],
+            _shape: AttentionShape,
+            _mask: &[f32],
+            _softmax: Option<&mut (dyn ArrayEltwise + '_)>,
+            ctx: &mut [f32],
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().attention += 1;
+            ctx.fill(0.0);
+            Ok(())
+        }
+    }
+    impl ArrayText for MockText {}
+
+    struct MockEltwise {
+        log: Rc<RefCell<Log>>,
+    }
+    impl ArrayEltwise for MockEltwise {
+        fn on_array(&self, _op: EltOp) -> bool {
+            true
+        }
+        fn layernorm(
+            &mut self,
+            _params: &[f32],
+            _x: &mut [f32],
+            _n_rows: usize,
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().layernorm += 1;
+            Ok(())
+        }
+        fn gelu(&mut self, _x: &mut [f32]) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().gelu += 1;
+            Ok(())
+        }
+        fn softmax(&mut self, _x: &mut [f32], _n_rows: usize) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().softmax += 1;
+            Ok(())
+        }
+        fn dispatches(&self) -> usize {
+            0
+        }
+    }
+
+    fn small_gte() -> GteModel {
+        let spec = GteSpec {
+            layers: 1,
+            heads: 2,
+            hidden: 8,
+            head_dim: 4,
+            ffn: 8,
+            vocab: 4,
+            max_seq_len: 4,
+            cls_pooling: true,
+            l2_normalize: false,
+            eps: 1e-5,
+            rope_inv_freq: vec![1.0, 0.5],
+        };
+        let layer = LayerWeights {
+            qkv: vec![0.0; spec.hidden * 3 * spec.hidden],
+            qkv_bias: vec![0.0; 3 * spec.hidden],
+            attn_out: vec![0.0; spec.hidden * spec.hidden],
+            attn_out_bias: vec![0.0; spec.hidden],
+            ln1_gamma: vec![1.0; spec.hidden],
+            ln1_beta: vec![0.0; spec.hidden],
+            ffn_up: vec![0.0; spec.hidden * 2 * spec.ffn],
+            ffn_down: vec![0.0; spec.ffn * spec.hidden],
+            ffn_down_bias: vec![0.0; spec.hidden],
+            ln2_gamma: vec![1.0; spec.hidden],
+            ln2_beta: vec![0.0; spec.hidden],
+        };
+        GteModel {
+            names: vec![[
+                "layer.0.qkv".into(),
+                "layer.0.attn_out".into(),
+                "layer.0.ffn_up".into(),
+                "layer.0.ffn_down".into(),
+            ]],
+            spec: spec.clone(),
+            weights: Weights {
+                word: vec![0.0; spec.vocab * spec.hidden],
+                token_type: vec![0.0; spec.hidden],
+                ln_gamma: vec![1.0; spec.hidden],
+                ln_beta: vec![0.0; spec.hidden],
+                layers: vec![layer],
+            },
+        }
+    }
+
+    #[test]
+    fn the_array_path_dispatches_the_projections_attention_and_eltwise() {
+        let model = small_gte();
+        let log = Rc::new(RefCell::new(Log::default()));
+        let mut text = MockText {
+            log: Rc::clone(&log),
+        };
+        let mut elt = MockEltwise {
+            log: Rc::clone(&log),
+        };
+        let mut ops = CpuOps::best();
+        let mut timings = Timings::default();
+        let ids = vec![0u32; 4];
+        let mask = vec![1u32; 4];
+
+        model
+            .embed_timed_with(
+                &mut ops,
+                &mut timings,
+                &ids,
+                &mask,
+                1,
+                4,
+                Some(&mut text),
+                Some(&mut elt),
+            )
+            .expect("the array path runs");
+
+        let log = log.borrow();
+        assert_eq!(
+            log.gemms,
+            vec![
+                "layer.0.qkv",
+                "layer.0.attn_out",
+                "layer.0.ffn_up",
+                "layer.0.ffn_down",
+            ]
+        );
+        // The attention block owns the softmax between its two GEMMs; the
+        // family does not dispatch a second one.
+        assert_eq!(log.attention, 1);
+        assert_eq!(log.softmax, 0);
+        // Embedding LN plus the layer's two post-LNs.
+        assert_eq!(log.layernorm, 3);
+        // The GEGLU gate's GELU is the one elementwise pass of the MLP.
+        assert_eq!(log.gelu, 1);
+    }
+
+    #[test]
+    fn the_host_path_is_byte_identical_with_both_seams_absent() {
+        let model = small_gte();
+        let ids = vec![0u32; 4];
+        let mask = vec![1u32; 4];
+        let mut ops = CpuOps::best();
+        let mut a = GteWorkspace::default();
+        let mut b = GteWorkspace::default();
+        let x = model
+            .embed_timed_with_workspace(
+                &mut ops,
+                &mut Timings::default(),
+                &ids,
+                &mask,
+                1,
+                4,
+                None,
+                None,
+                &mut a,
+            )
+            .expect("the first host run");
+        let y = model
+            .embed_timed_with_workspace(
+                &mut ops,
+                &mut Timings::default(),
+                &ids,
+                &mask,
+                1,
+                4,
+                None,
+                None,
+                &mut b,
+            )
+            .expect("the second host run");
+        assert_eq!(x, y);
+    }
+}
+
+#[cfg(test)]
+mod gelu_numerics_tests {
+    use super::*;
+
+    // Коэффициенты из `kernels/gelu_poly.cc` (degree-8 fit, R = 4), в том
+    // порядке, в каком их складывает Horner: p = C0; p = p*u + Ci.
+    // Это НЕ аппроксимация «похожая на дизайн» — это те же числа, что
+    // скомпилированы в artifacts_npu*/gelu.
+    const C: [f32; 9] = [
+        -7.234_028_2e-5,
+        1.817_951_8e-3,
+        -1.770_738_3e-2,
+        8.457_714_8e-2,
+        -1.922_867_2e-1,
+        9.843_112_4e-2,
+        3.613_785_2e-1,
+        -4.945_412_9e-1,
+        -1.300_701_0e-4,
+    ];
+
+    /// GELU дизайна: max(x, 0) + c(min(|x|, 4)), fp32 Horner WITHOUT tanh.
+    fn design_gelu(x: f32) -> f32 {
+        let u = x.abs().min(4.0);
+        let mut p = C[0];
+        for c in &C[1..] {
+            p = p * u + c;
+        }
+        x.max(0.0) + p
+    }
+
+    #[test]
+    fn the_design_gelu_is_within_the_measured_fit_error_of_the_hosts_erf() {
+        // 2.494e-3 — задокументированная в kernels/gelu_poly.cc погрешность
+        // фита на реальных активациях L0.ffn_up. Запас до 3e-3 учитывает
+        // округление коэффициентов при записи их сюда.
+        const TOL: f32 = 3e-3;
+        let mut worst = 0.0f32;
+        for i in -500..=500 {
+            let x = i as f32 / 100.0; // [-5, 5], шаг 0.01
+            let exact = gelu_erf_f32(x);
+            let approx = design_gelu(x);
+            // Пол с знаменателем только у нуля: GELU(0) = 0, и относительная
+            // ошибка там не определена. На масштабе сети 0.05 пренебрежимо.
+            let rel = (approx - exact).abs() / exact.abs().max(0.05);
+            worst = worst.max(rel);
+        }
+        assert!(
+            worst <= TOL,
+            "the polynomial is {worst:.3e} away from erf; the fit is measured at 2.494e-3"
+        );
+    }
+}
+
+#[cfg(test)]
 mod rope_cache_tests {
     use super::*;
 
@@ -1041,7 +1530,11 @@ mod rope_cache_tests {
         // fills the new positions.
         let (c16, _) = ensure_rope(&mut cos, &mut sin, &mut cached, 16, &inv_freq, head_dim);
         assert_eq!(cached, 16);
-        assert_eq!(&c16[..8 * head_dim], &first, "the prefix was not recomputed");
+        assert_eq!(
+            &c16[..8 * head_dim],
+            &first,
+            "the prefix was not recomputed"
+        );
         assert_eq!(c16[8 * head_dim], (8.0f32 * inv_freq[0]).cos());
         let c16_copy = c16.to_vec();
 

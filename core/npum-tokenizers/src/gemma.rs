@@ -105,6 +105,16 @@ impl Tokenizer for Gemma {
 
     fn decode(&self, ids: &[u32]) -> Result<String> {
         let mut out = String::new();
+        // Consecutive byte-fallback pieces are the UTF-8 bytes of ONE
+        // character (or of one run of characters). Decoding each byte on its
+        // own would replace every byte with U+FFFD and lose the text.
+        let mut bytes = Vec::new();
+        let flush = |out: &mut String, bytes: &mut Vec<u8>| {
+            if !bytes.is_empty() {
+                out.push_str(&String::from_utf8_lossy(bytes));
+                bytes.clear();
+            }
+        };
         for id in ids {
             let Some((piece, _)) = self.vocab.iter().find(|(_, v)| **v == *id) else {
                 return Err(Error::UnknownToken { id: *id });
@@ -114,16 +124,14 @@ impl Tokenizer for Gemma {
                 .and_then(|s| s.strip_suffix('>'))
             {
                 if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    // A byte fallback piece is a BYTE, and a byte is not
-                    // necessarily valid UTF-8 on its own. It is collected and
-                    // decoded as a run.
-                    out.push('\u{fffd}');
-                    let _ = byte;
+                    bytes.push(byte);
                     continue;
                 }
             }
+            flush(&mut out, &mut bytes);
             out.push_str(piece);
         }
+        flush(&mut out, &mut bytes);
         Ok(out)
     }
 }

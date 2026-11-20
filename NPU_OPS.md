@@ -9,10 +9,30 @@ The runtime has ONE flag for this, `--npu-ops CODES`, and its default is
 the empty set: **every op runs on the CPU.** That is where a run starts,
 not a verdict on where it should end, and the measurements now disagree
 with it for the ninth code: `gemm` on the array beats the host on every
-transformer here (bge, 15 texts 1.06 s -> 0.17 s; ViT 0.435 s -> 0.241 s;
-Gemma 0.69 s -> 0.10 s; Whisper's encoder 0.70 s -> 0.51 s), while `attn`
-and `softm` on the array stay slower than the host they replace. Passing
-codes is how you ask for the array instead, one op at a time.
+transformer here (bge, 4 texts 0.38 s -> 0.15 s at the re-measurement
+below; ViT 0.435 s -> 0.241 s; Gemma 0.69 s -> 0.10 s; Whisper's encoder
+0.70 s -> 0.51 s -- the last three were taken in earlier sessions), while
+`attn` and `softm` on the array stay slower than the host they replace.
+Passing codes is how you ask for the array instead, one op at a time.
+
+### Current measurements
+
+Re-measured at commit `412f80ee0c3d69d1b85c48fd95ef745327b814a7` (2026-11-19, "perf: P0/P1 optimization pass across XDNA, CPU and server"): AMD Ryzen 7 PRO 8845HS, XDNA1 (npu1), Rust 1.89.0. Corpus `tools/data/bench_corpus_4.txt` -- 4 texts, the longest padded to the design's 64 tokens (array attention requires a batch of 4); median wall time of 3 runs per arm, XRT environment from `/opt/xilinx/xrt/setup.sh`. Full protocol and reproduction commands are in `BUILD.md` §3.
+
+| `--npu-ops` | wall, s | dispatches | comparison |
+| --- | ---: | ---: | --- |
+| ~(all host) | 0.38 | 0 | reference arm |
+| `gemm` | 0.15 | 48 | 2.5x FASTER than all-host |
+| `softm` | 0.98 | 12 | 2.6x slower than all-host |
+| `gemm,softm` | 0.72 | 60 | 4.8x slower than `gemm` |
+| `attn` | 1.06 | 1152 | 2.8x slower than all-host |
+| `gemm,attn` | 0.74 | 1200 | 4.9x slower than `gemm` |
+| `gemm,attn,softm` | 26.36 | 1200 | 35.6x slower than `gemm,attn` |
+| `attn,softm` | 26.61 | 1152 | 70x slower than all-host |
+
+Where these figures differ from the older per-cell prose below, this table is the authoritative one for this commit.
+
+Scope: these are the text-embedder (`gemm_rtp`) cells. The other architectures were NOT re-measured at this commit: the Rust runtime refuses `--npu-ops` for `cls`, the gemma3 family's tokenizer is not wired into `embed`, and the speech/vision families have no array seam here. Their per-cell figures remain the earlier ones and are not claims about this commit.
 
 The exporter has **no such flag**. One command builds every design the
 target can use:
@@ -115,7 +135,7 @@ Design directory: `layernorm/`, built automatically by the exporter for any targ
 
 ### `softm` -- softmax: **honours**
 
-softmax over the score matrix, its own pass between the two attention GEMMs. MEASURED on bge-base-en-v1.5, 15 texts, arch 1: `--npu-ops gemm,softm` is 1.70 s against `--npu-ops gemm`'s 0.17 s (10.0x SLOWER), relfro 1.391e-02 / cos 0.999903381, min cos 0.999844372, max|d| 2.259e-03 against that same arm. Plain `--npu-ops softm`, the four GEMMs on this process as they now are by default, is 1.58 s against the all-host default's 1.06 s, 36 dispatches against 0. The reference arm is named rather than called 'host' because it is not one: `gemm` is what every run did before this code was split out, and it is what the original pairing was. The row WIDTH is the whole of the difficulty here, and it was wrong until it was measured: the design is compiled for sm_cols = padded n_kv (64 -> 384, resolve.py:414) because NpuAttention, its other consumer, pads its score rows to the kernel's own width, while the host's qk_impl laid rows g_seq wide. elt_chunks cannot catch that -- its only guard is `n % cols != 0`, and batch*heads*g_seq*g_seq is a multiple of 384 anyway -- so the kernel normalised 384-element windows, six real score rows at a time, and the embedding came back at relfro 7.08e-01 / cos 0.749237895. BertEncoder now lays the rows out at the design's width, with -1e30 past g_seq, whenever the array takes the softmax; the default path is byte-identical to what it was and `gemm,attn,softm` (relfro 1.21e-02) is unchanged. COST, and it is not a defect in this cell but in how the two flags combine: asking for attn,softm puts the softmax inside NpuAttention, which dispatches it once per head per chunk rather than once per layer, and every dispatch fills the design's whole 12288-row capacity -- 100.59 s for 15 texts against 1.36 s for `gemm,attn`, both re-measured with this change. Those numbers are the SHIPPED artifacts: a target export now sizes the design to one attention chunk (256 rows here), so the cost has to be re-measured after a re-export.
+softmax over the score matrix, its own pass between the two attention GEMMs. RE-MEASURED at commit 412f80e (see the table at the top of this file): bge-base-en-v1.5, 4 texts, arch 1, median of 3 -- `--npu-ops gemm,softm` is 0.72 s against `--npu-ops gemm`'s 0.15 s (4.8x SLOWER), 60 dispatches against 48, relfro 1.239e-02 / min cos 0.999888957 / max|d| 2.306e-03 against the all-host default. Plain `--npu-ops softm`, the four GEMMs on this process as they now are by default, is 0.98 s against that default's 0.38 s, 12 dispatches against 0. The reference arm is named rather than called 'host' because it is not one: `gemm` is what every run did before this code was split out, and it is what the original pairing was. The row WIDTH is the whole of the difficulty here, and it was wrong until it was measured: the design is compiled for sm_cols = padded n_kv (64 -> 384, resolve.py:414) because NpuAttention, its other consumer, pads its score rows to the kernel's own width, while the host's qk_impl laid rows g_seq wide. elt_chunks cannot catch that -- its only guard is `n % cols != 0`, and batch*heads*g_seq*g_seq is a multiple of 384 anyway -- so the kernel normalised 384-element windows, six real score rows at a time, and the embedding came back at relfro 7.08e-01 / cos 0.749237895. BertEncoder now lays the rows out at the design's width, with -1e30 past g_seq, whenever the array takes the softmax; the default path is byte-identical to what it was and `gemm,attn,softm` (relfro 1.21e-02) is unchanged. COST, and it is not a defect in this cell but in how the two flags combine: asking for attn,softm puts the softmax inside NpuAttention, which dispatches it once per head per chunk rather than once per layer, and every dispatch fills the design's whole 12288-row capacity -- 26.36 s for 4 texts against 0.74 s for `gemm,attn`, both re-measured at the same commit 412f80e. Plain `attn,softm` is 26.61 s. Those numbers are the SHIPPED artifacts: a target export now sizes the design to one attention chunk (256 rows here), so the cost has to be re-measured after a re-export.
 
 Design directory: `softmax/`, built automatically by the exporter for any target of this architecture.
 
@@ -125,7 +145,7 @@ names Whisper's conv1/conv2 -- an audio front end, and this architecture has non
 
 ### `attn` -- attention, as two GEMMs: **honours**
 
-qk() and av() in BertEncoder::run dispatch on the set's own attn_qk/attn_av streams through the shared NpuAttention. BERT's fused qkv is Q|K|V per position, so the K|V block the class wants is reached by passing qkv + d_model with a stride of 3*d_model -- the same offset Whisper's own self-attention uses, and no new code. The exporter builds the streams from the registry like any other honoured code; n_kv comes from the target's max_seq_len, which is the context the CONTAINER was packed for (all-MiniLM: 256, presliced) and not the checkpoint's 512 positions -- reading config.json instead would build a panel 512 wide over a tensor that cannot address past 256. Padding past the live positions is exact: NpuAttention writes -1e30 into those columns before the softmax, so a wider n_kv costs arithmetic and not accuracy. attn_qk's K is head_dim padded up to tile_k, which is what makes a 32-wide head (three of these eight models) buildable at all, and the runtime zeroes the matching rows of the gathered Q block so the extra MACs contribute 0*0. Same CAVEAT as cls/stt: attention on the array is SLOWER than the host pass. MEASURED on bge-base-en-v1.5, 15 texts, arch 1: `--npu-ops gemm,attn` is 1.36 s against `--npu-ops gemm`'s 0.17 s (8.0x SLOWER), with 4752 dispatches against that arm's 144 -- 4608 of them this code's, one per head per query chunk. Plain `--npu-ops attn` is 2.00 s against the all-host default's 1.06 s, 4608 dispatches against 0. Correctness against the `gemm` arm: relfro 1.398e-02, mean cos 0.999902308, min cos 0.999853313, max|d| 2.093e-03. This code makes the model runnable on the array, not faster.
+qk() and av() in BertEncoder::run dispatch on the set's own attn_qk/attn_av streams through the shared NpuAttention. BERT's fused qkv is Q|K|V per position, so the K|V block the class wants is reached by passing qkv + d_model with a stride of 3*d_model -- the same offset Whisper's own self-attention uses, and no new code. The exporter builds the streams from the registry like any other honoured code; n_kv comes from the target's max_seq_len, which is the context the CONTAINER was packed for (all-MiniLM: 256, presliced) and not the checkpoint's 512 positions -- reading config.json instead would build a panel 512 wide over a tensor that cannot address past 256. Padding past the live positions is exact: NpuAttention writes -1e30 into those columns before the softmax, so a wider n_kv costs arithmetic and not accuracy. attn_qk's K is head_dim padded up to tile_k, which is what makes a 32-wide head (three of these eight models) buildable at all, and the runtime zeroes the matching rows of the gathered Q block so the extra MACs contribute 0*0. Same CAVEAT as cls/stt: attention on the array is SLOWER than the host pass. RE-MEASURED at commit 412f80e (table at the top): bge-base-en-v1.5, 4 texts, arch 1, median of 3 -- `--npu-ops gemm,attn` is 0.74 s against `--npu-ops gemm`'s 0.15 s (4.9x SLOWER), with 1200 dispatches against that arm's 48 -- 1152 of them this code's, one per head per query chunk. Plain `--npu-ops attn` is 1.06 s against the all-host default's 0.38 s, 1152 dispatches against 0. Correctness against all-host: relfro 1.193e-02, min cos 0.999908328, max|d| 1.458e-03. This code makes the model runnable on the array, not faster.
 
 Design directory: none -- its two streams are added to the gemm_rtp and gemm_rtp_dec sets themselves, not as a directory of their own. See `STREAM_ONLY` in `tools/lib/npu_ops.py`.
 

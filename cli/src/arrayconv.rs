@@ -37,92 +37,20 @@ pub fn open(
     args: &crate::flags::Args,
     root: &Path,
 ) -> Result<Box<dyn npum_model::array::ArrayConvs>, String> {
-    use npum_xdna::array::ArrayDesign;
-    use npum_xdna::array_convs::ArrayConvs;
-
-    // THE PANELS.
-    let container =
-        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let streams = container.config_str("npu_streams").unwrap_or_default();
-    if streams.is_empty() {
-        return Err(format!(
-            "{}: --npu-ops conv needs the array panels, and this container does not carry \
-             any: it was packed without --npu. Repack with the packer's --npu, which stages \
-             a pre-tiled bf16 B panel for every DENSE convolution. (A design set is the \
-             SECOND requirement, and a separate one.)",
-            path.display()
-        ));
-    }
-
-    // THE CONVOLUTIONS.
-    if specs.is_empty() {
-        return Err(format!(
-            "{}: the container names array streams, and none of them belongs to a convolution \
-             this graph runs.",
-            path.display()
-        ));
-    }
-
-    // THE DESIGN SET.
-    //
-    // The container's own copy first, and then the directory: the container
-    // is self-sufficient when it carries the set, and a container that does
-    // not needs nothing beside it.
-    let own = container
-        .directory()
-        .tensor("design/gemm_rtp/design.json")
-        .is_some();
-    let dir =
-        if own {
-            None
-        } else {
-            Some(find_design(root, path, args.value("--artifacts")).ok_or_else(|| {
-            format!(
-                "{}: --npu-ops conv needs a design set on disk: pass --artifacts <dir> naming \
-                 one, or build it with the exporter. The flag has no default to fall back on, \
-                 because this container's padded (K, N) designs are its own -- and picking one \
-                 silently is how a run reports array numbers from a design set belonging to \
-                 another model.",
-                path.display()
-            )
-        })?)
-        };
-
-    // THE BOARD.
-    let transport = crate::transport::open().map_err(|e| format!("{}: {e}", path.display()))?;
-    let design = match dir {
-        Some(dir) => ArrayDesign::open(&dir, transport).map_err(|e| e.to_string())?,
-        None => ArrayDesign::open_from_container(path, "gemm_rtp", transport)
-            .map_err(|e| e.to_string())?,
-    };
-
-    let backend = ArrayConvs::open(path, design, specs).map_err(|e| e.to_string())?;
-    Ok(Box::new(backend))
+    // The opening rules are shared with every other family in `npu`. The set
+    // is named here, by this family, and not hardcoded in the opener: a family
+    // whose convolutions were compiled against a differently named set can say
+    // so without editing the common module.
+    let backend = crate::npu::open_convs(path, specs, args, root, "gemm_rtp")?;
+    Ok(backend as Box<dyn npum_model::array::ArrayConvs>)
 }
 
-/// The design set's directory, if one can be found.
+/// The convolution design set's directory, if one can be found.
 ///
-/// The `--artifacts` flag first -- it is the reader saying where their own
-/// design set is -- and then the tree's own artifacts, under the model's
-/// name. The model's name is the CONTAINER's file name, because that is
-/// what the artifacts are laid out under.
+/// The opener resolves the set from the container or from `--artifacts`; this
+/// is the directory form kept for callers that only want to print where the
+/// set came from.
 pub fn find_design(root: &Path, model: &Path, named: Option<&str>) -> Option<PathBuf> {
-    let usable = |dir: &Path| dir.join("gemm_rtp").join("design.json").is_file();
-    if let Some(named) = named {
-        let dir = PathBuf::from(named);
-        if usable(&dir) {
-            return Some(dir.join("gemm_rtp"));
-        }
-        if dir.join("design.json").is_file() {
-            return Some(dir);
-        }
-    }
-    let stem = model
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if stem.is_empty() {
-        return None;
-    }
-    crate::vit::find_designs(root, &stem).map(|dir| dir.join("gemm_rtp"))
+    let stem = crate::npu::model_name(model);
+    crate::npu::find_artifacts(root, &stem, named).map(|dir| dir.join("gemm_rtp"))
 }

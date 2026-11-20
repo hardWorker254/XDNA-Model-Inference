@@ -41,6 +41,7 @@ pub mod hands;
 pub mod help;
 pub mod list;
 pub mod mppose;
+pub mod npu;
 pub mod ocr;
 pub mod pose;
 pub mod root;
@@ -102,7 +103,16 @@ pub fn entry(binary: &'static str, argv: &[String]) -> i32 {
 
     if !owns(binary, verb) {
         let owner = npum_families::registry::owner_of(verb);
-        eprintln!("error: {}", refuse_subcommand(verb, owner, binary));
+        if npum_families::registry::binary_of(owner) == binary {
+            // `owner_of` defaults unknown verbs to the embedding family, so
+            // on THIS binary the refusal would name itself as the owner.
+            eprintln!(
+                "error: `{verb}` is not a verb this binary has.
+Use --help for the verbs this binary accepts."
+            );
+        } else {
+            eprintln!("error: {}", refuse_subcommand(verb, owner, binary));
+        }
         return EXIT_REFUSED;
     }
 
@@ -258,11 +268,16 @@ fn run_serve(binary: &'static str, args: &Args, argv: &[String], root: &PathBuf)
         return needs_a_model("serve");
     };
     let (port, bind, _found) = flags::read_serve(argv, 1);
-    let port = args
-        .value_i64("--port")
-        .map(|p| p as u16)
-        .or(port)
-        .unwrap_or(8080);
+    let port = match args.value_i64("--port") {
+        Some(p) => match u16::try_from(p) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("error: --port {p} is out of range (0..=65535)");
+                return EXIT_REFUSED;
+            }
+        },
+        None => port.unwrap_or(8080),
+    };
     let bind = args.value("--bind").map(|s| s.to_string()).unwrap_or(bind);
     serve::serve(binary, model, port, &bind, root, args)
 }

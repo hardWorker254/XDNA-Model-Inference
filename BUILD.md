@@ -480,6 +480,54 @@ worth reading before quoting any number. The short version:
 - **Every sweep needs a control with a known correct value**, or a silent
   corruption looks like a result.
 
+### 3.0 Provenance of the numbers in this tree
+
+The NPU figures quoted in `NPU_OPS.md` / `NPU_OPS.ru.md` and in the table
+below were re-measured at commit
+`412f80ee0c3d69d1b85c48fd95ef745327b814a7` ("perf: P0/P1 optimization pass
+across XDNA, CPU and server", 2026-11-19) on an AMD Ryzen 7 PRO 8845HS with
+XDNA1 (`npu1`), Rust 1.89.0, release build, XRT environment from
+`/opt/xilinx/xrt/setup.sh`. The corpus is `tools/data/bench_corpus_4.txt`:
+four texts, the longest padded to the design's 64 tokens (array attention
+needs a whole tier -- four sequences of 64). Each arm ran three times; the
+median wall time and the dispatch count are reported. One arm reproduces as:
+
+```sh
+source /opt/xilinx/xrt/setup.sh
+./target/release/npuembeddings embed models/bge-base-en-v1.5.npue \
+    tools/data/bench_corpus_4.txt /tmp/out.f32 --npu-ops gemm
+```
+
+The container and its design set must first be produced from this same
+checkout -- `export_gemm_rtp.py --target bge-base-en-v1.5 --arch 1`, then
+`pack_npue.py` with `--model-dir models/bge-base-en-v1.5`, `--device npu1`
+and `--embed-artifacts runtime/artifacts/bge-base-en-v1.5/artifacts_npu1` --
+or the numbers describe a different artifact than the code.
+
+| model / arm (`--npu-ops`) | wall, s | dispatches | note |
+|---|---:|---:|---|
+| bge-base, all-host default | 0.38 | 0 | reference arm |
+| bge-base, `gemm` | 0.15 | 48 | 2.5x faster than all-host |
+| bge-base, `softm` | 0.98 | 12 | slower than all-host |
+| bge-base, `gemm,softm` | 0.72 | 60 | 4.8x slower than `gemm` |
+| bge-base, `attn` | 1.06 | 1152 | slower than all-host |
+| bge-base, `gemm,attn` | 0.74 | 1200 | 4.9x slower than `gemm` |
+| bge-base, `gemm,attn,softm` | 26.36 | 1200 | softmax-inside-attention cost |
+| bge-base, `attn,softm` | 26.61 | 1152 | same cost without `gemm` |
+
+Correctness at this commit against the all-host arm, measured on the same
+four texts: `gemm` relfro 4.386e-03 / min cos 0.999987483, `softm` relfro
+1.223e-02 / min cos 0.999896526, `gemm,softm` relfro 1.239e-02 / min cos
+0.999888957, `attn` relfro 1.193e-02 / min cos 0.999908328, `gemm,attn`
+relfro 1.253e-02 / min cos 0.999892116. Where these figures differ from
+older per-cell prose, these are the current ones.
+
+Scope: only the text-embedder (`gemm_rtp`) cells could be re-measured. At
+this commit the runtime refuses `--npu-ops` for the `cls` family, `embed`
+does not wire in the gemma3 tokenizer, and the speech/vision families have
+no array seam here. Figures for those architectures in `NPU_OPS.md` remain
+the earlier ones and are not claims about this commit.
+
 ```powershell
 # end-to-end throughput, five encodes
 runtime\build\npuembeddings.exe . --artifacts artifacts_b128il --threads 24 --pipeline 2 --bench 5

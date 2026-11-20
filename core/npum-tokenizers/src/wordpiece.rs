@@ -180,6 +180,15 @@ impl WordPiece {
     ///
     /// The returned flag says whether anything was cut.
     pub fn encode_padded(&self, text: &str, max_len: usize) -> Result<(Encoding, bool)> {
+        if max_len < 2 {
+            // [CLS] and [SEP] are mandatory; a shorter buffer cannot hold a
+            // valid encoding, and silently returning two tokens would break
+            // the length contract for every caller.
+            return Err(Error::TooLong {
+                tokens: 2,
+                limit: max_len,
+            });
+        }
         let toks = self.tokenize(text);
         let room = max_len.saturating_sub(2);
         let take = toks.len().min(room);

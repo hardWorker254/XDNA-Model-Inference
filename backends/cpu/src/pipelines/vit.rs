@@ -30,6 +30,7 @@ use crate::vit_image::Resample;
 use crate::whisper::attention_into;
 use crate::whisper::{gelu_erf_rows, layernorm_rows, layernorm_rows_inplace};
 use npum_format::Container;
+use npum_model::array::{ArrayEltwise, ArrayText, ArrayTextRef, AttentionShape, EltOp};
 use std::path::Path;
 
 /// The ViT's geometry, as the container states it.
@@ -169,6 +170,8 @@ pub struct VitWorkspace {
     down: Vec<f32>,
     scores: Vec<f32>,
     acc: Vec<f32>,
+    /// gamma and beta, packed for the array's LayerNorm (2 * hidden).
+    ln_params: Vec<f32>,
 }
 
 impl Default for VitWorkspace {
@@ -191,6 +194,7 @@ impl VitWorkspace {
             down: Vec::new(),
             scores: Vec::new(),
             acc: Vec::new(),
+            ln_params: Vec::new(),
         }
     }
 
@@ -203,7 +207,15 @@ impl VitWorkspace {
         }
     }
 
-    fn ensure(&mut self, n_patches: usize, n_pos: usize, d: usize, width: usize, head_dim: usize) {
+    fn ensure(
+        &mut self,
+        n_patches: usize,
+        n_pos: usize,
+        d: usize,
+        width: usize,
+        head_dim: usize,
+        score_cols: usize,
+    ) {
         Self::grow(&mut self.patch_out, n_patches * d);
         Self::grow(&mut self.x, n_pos * d);
         Self::grow(&mut self.norm, n_pos * d);
@@ -212,8 +224,251 @@ impl VitWorkspace {
         Self::grow(&mut self.proj, n_pos * d);
         Self::grow(&mut self.up, n_pos * width);
         Self::grow(&mut self.down, n_pos * d);
-        Self::grow(&mut self.scores, n_pos);
+        Self::grow(&mut self.scores, n_pos * score_cols);
         Self::grow(&mut self.acc, head_dim);
+        Self::grow(&mut self.ln_params, 2 * d);
+    }
+}
+
+#[cfg(test)]
+mod array_seam_tests {
+    use super::*;
+    use npum_model::array::{ArrayAttention, ArrayGemm};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Log {
+        gemms: Vec<String>,
+        attention: usize,
+        ln: usize,
+        gelu: usize,
+    }
+
+    struct MockText {
+        log: Rc<RefCell<Log>>,
+    }
+    impl ArrayGemm for MockText {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn gemm_on_array(&self) -> bool {
+            true
+        }
+        fn dispatches(&self) -> usize {
+            self.log.borrow().gemms.len()
+        }
+        fn staged_bytes(&self) -> usize {
+            0
+        }
+        fn gemm(
+            &mut self,
+            weight: &str,
+            _a: &[f32],
+            _rows: usize,
+            _k: usize,
+            _n: usize,
+            _bias: Option<&[f32]>,
+            out: &mut [f32],
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().gemms.push(weight.to_string());
+            out.fill(0.0);
+            Ok(())
+        }
+    }
+    impl ArrayAttention for MockText {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn on_array(&self) -> bool {
+            true
+        }
+        fn attn_dispatches(&self) -> usize {
+            self.log.borrow().attention
+        }
+        fn attn_seconds(&self) -> (f64, f64) {
+            (0.0, 0.0)
+        }
+        fn attention(
+            &mut self,
+            _qkv: &[f32],
+            _shape: AttentionShape,
+            _mask: &[f32],
+            _softmax: Option<&mut (dyn ArrayEltwise + '_)>,
+            ctx: &mut [f32],
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().attention += 1;
+            ctx.fill(0.0);
+            Ok(())
+        }
+    }
+    impl ArrayText for MockText {}
+
+    struct MockEltwise {
+        log: Rc<RefCell<Log>>,
+    }
+    impl ArrayEltwise for MockEltwise {
+        fn on_array(&self, _op: EltOp) -> bool {
+            true
+        }
+        fn layernorm(
+            &mut self,
+            _params: &[f32],
+            _x: &mut [f32],
+            _n_rows: usize,
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().ln += 1;
+            Ok(())
+        }
+        fn gelu(&mut self, _x: &mut [f32]) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().gelu += 1;
+            Ok(())
+        }
+        fn softmax(&mut self, _x: &mut [f32], _n_rows: usize) -> npum_model::array::Result<()> {
+            Ok(())
+        }
+        fn dispatches(&self) -> usize {
+            0
+        }
+    }
+
+    fn small_vit() -> (Vit, Geometry) {
+        let g = Geometry {
+            model_name: "tiny".into(),
+            hidden: 8,
+            layers: 1,
+            heads: 2,
+            head_dim: 4,
+            image_size: 16,
+            patch_size: 8,
+            n_pos: 4,
+            n_patches: 3,
+            patch_dim: 8,
+            num_labels: 3,
+            ln_eps: 1e-5,
+            attn_scale: 0.5,
+            qkv_scale_folded: true,
+            mean: vec![0.0; 3],
+            std_dev: vec![1.0; 3],
+            resample: Resample::Bicubic,
+            num_channels: 3,
+        };
+        let layer = Layer {
+            ln1_gamma: vec![1.0; 8],
+            ln1_beta: vec![0.0; 8],
+            qkv: vec![0.0; 8 * 24],
+            qkv_bias: vec![0.0; 24],
+            attn_out: vec![0.0; 8 * 8],
+            attn_out_bias: vec![0.0; 8],
+            ln2_gamma: vec![1.0; 8],
+            ln2_beta: vec![0.0; 8],
+            ffn_up: vec![0.0; 8 * 16],
+            ffn_up_bias: vec![0.0; 16],
+            ffn_down: vec![0.0; 16 * 8],
+            ffn_down_bias: vec![0.0; 8],
+        };
+        let vit = Vit {
+            geometry: g.clone(),
+            layers: vec![layer],
+            positions: vec![0.0; 4 * 8],
+            cls_token: vec![0.0; 8],
+            patch_embed: vec![0.0; 8 * 8],
+            patch_embed_bias: vec![0.0; 8],
+            final_gamma: vec![1.0; 8],
+            final_beta: vec![0.0; 8],
+            head: vec![0.0; 8 * 3],
+            head_bias: vec![0.0; 3],
+            labels: vec!["a".into(), "b".into(), "c".into()],
+        };
+        (vit, g)
+    }
+
+    #[test]
+    fn the_encoder_dispatches_patch_embed_four_layer_gemms_and_attention() {
+        let (vit, g) = small_vit();
+        let patches = vec![0.0; g.n_patches as usize * g.patch_dim as usize];
+        let log = Rc::new(RefCell::new(Log::default()));
+        let mut text = MockText { log: log.clone() };
+        let mut eltwise = MockEltwise { log: log.clone() };
+        let mut ws = VitWorkspace::new();
+        let mut out = Vec::new();
+
+        vit.encode_into(
+            &patches,
+            &mut ws,
+            &mut out,
+            Some(&mut text),
+            Some(&mut eltwise),
+            true,
+            true,
+        )
+        .expect("the array path runs");
+
+        let recorded = log.borrow();
+        assert_eq!(recorded.gemms.len(), 5, "1 patch embed + 4 per layer");
+        assert_eq!(recorded.gemms[0], "frontend.patch_embed");
+        assert_eq!(recorded.gemms[1], "layer.0.qkv");
+        assert_eq!(recorded.gemms[2], "layer.0.attn_out");
+        assert_eq!(recorded.gemms[3], "layer.0.ffn_up");
+        assert_eq!(recorded.gemms[4], "layer.0.ffn_down");
+        assert_eq!(recorded.attention, 1);
+        assert_eq!(recorded.gelu, 1);
+        assert!(recorded.ln >= 3, "ln1, ln2 and the final norm");
+    }
+}
+
+/// One projection: the array's seam when asked, the host's kernel otherwise.
+#[allow(clippy::too_many_arguments)]
+fn gemm_seam(
+    array: Option<&mut (dyn ArrayText + '_)>,
+    gemm_on: bool,
+    weight: &str,
+    a: &[f32],
+    rows: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) -> Result<(), String> {
+    match array.filter(|_| gemm_on) {
+        Some(backend) => backend
+            .gemm(weight, a, rows, k, n, Some(bias), out)
+            .map_err(|e| e.to_string()),
+        None => {
+            kernels::gemm_nt_rows(a, rows, b, k, n, bias, out, threads);
+            Ok(())
+        }
+    }
+}
+
+/// One LayerNorm with a separate destination: copy and normalise on the
+/// array, or the host's fused copy-and-normalise kernel.
+#[allow(clippy::too_many_arguments)]
+fn layernorm_seam(
+    eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+    ln_on: bool,
+    params: &mut [f32],
+    gamma: &[f32],
+    beta: &[f32],
+    src: &[f32],
+    dst: &mut [f32],
+    rows: usize,
+    width: usize,
+    eps: f64,
+) -> Result<(), String> {
+    if let Some(eltwise) = eltwise.filter(|_| ln_on) {
+        let len = rows * width;
+        dst[..len].copy_from_slice(&src[..len]);
+        params[..width].copy_from_slice(gamma);
+        params[width..2 * width].copy_from_slice(beta);
+        eltwise
+            .layernorm(&params[..2 * width], &mut dst[..len], rows)
+            .map_err(|e| e.to_string())
+    } else {
+        layernorm_rows(src, dst, rows, width, gamma, beta, eps);
+        Ok(())
     }
 }
 
@@ -233,15 +488,15 @@ impl Vit {
             layers.push(Layer {
                 ln1_gamma: tensor(&container, &format!("{p}ln1.weight"))?,
                 ln1_beta: tensor(&container, &format!("{p}ln1.bias"))?,
-                qkv: tensor(&container, &format!("{p}qkv"))?,
+                qkv: operand(&container, &format!("{p}qkv"))?,
                 qkv_bias: tensor(&container, &format!("{p}qkv.bias"))?,
-                attn_out: tensor(&container, &format!("{p}attn_out"))?,
+                attn_out: operand(&container, &format!("{p}attn_out"))?,
                 attn_out_bias: tensor(&container, &format!("{p}attn_out.bias"))?,
                 ln2_gamma: tensor(&container, &format!("{p}ln2.weight"))?,
                 ln2_beta: tensor(&container, &format!("{p}ln2.bias"))?,
-                ffn_up: tensor(&container, &format!("{p}ffn_up"))?,
+                ffn_up: operand(&container, &format!("{p}ffn_up"))?,
                 ffn_up_bias: tensor(&container, &format!("{p}ffn_up.bias"))?,
-                ffn_down: tensor(&container, &format!("{p}ffn_down"))?,
+                ffn_down: operand(&container, &format!("{p}ffn_down"))?,
                 ffn_down_bias: tensor(&container, &format!("{p}ffn_down.bias"))?,
             });
         }
@@ -273,7 +528,7 @@ impl Vit {
         Ok(Vit {
             positions: tensor(&container, "frontend.position_embeddings")?,
             cls_token: tensor(&container, "frontend.cls_token")?,
-            patch_embed: tensor(&container, "frontend.patch_embed")?,
+            patch_embed: operand(&container, "frontend.patch_embed")?,
             patch_embed_bias: tensor(&container, "frontend.patch_embed.bias")?,
             final_gamma: tensor(&container, "layernorm.weight")?,
             final_beta: tensor(&container, "layernorm.bias")?,
@@ -301,11 +556,18 @@ impl Vit {
     /// convenience wrapper owns a fresh workspace; callers running more
     /// than one image should keep a [`VitWorkspace`] and use
     /// [`encode_into`](Self::encode_into).
-    pub fn encode(&self, patches: &[f32]) -> Vec<f32> {
+    pub fn encode(
+        &self,
+        patches: &[f32],
+        array: ArrayTextRef<'_, '_>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        gemm_on: bool,
+        conv_on: bool,
+    ) -> Result<Vec<f32>, String> {
         let mut ws = VitWorkspace::new();
         let mut out = Vec::new();
-        self.encode_into(patches, &mut ws, &mut out);
-        out
+        self.encode_into(patches, &mut ws, &mut out, array, eltwise, gemm_on, conv_on)?;
+        Ok(out)
     }
 
     /// The encoder, writing into the caller's output buffer and reusing a
@@ -315,7 +577,16 @@ impl Vit {
     /// the same `x.clone()` expressed as `copy_from_slice`, the same
     /// `attention_into` that `attention` itself calls, and the same residual
     /// adds. Only the addresses of the scratch buffers change.
-    pub fn encode_into(&self, patches: &[f32], ws: &mut VitWorkspace, out: &mut Vec<f32>) {
+    pub fn encode_into(
+        &self,
+        patches: &[f32],
+        ws: &mut VitWorkspace,
+        out: &mut Vec<f32>,
+        mut array: ArrayTextRef<'_, '_>,
+        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+        gemm_on: bool,
+        conv_on: bool,
+    ) -> Result<(), String> {
         let g = &self.geometry;
         let d = g.hidden as usize;
         let n_pos = g.n_pos as usize;
@@ -326,7 +597,54 @@ impl Vit {
             .map(|l| l.ffn_up.len() / d)
             .max()
             .unwrap_or(0);
-        ws.ensure(n_patches, n_pos, d, width, g.head_dim as usize);
+
+        // The array's softmax and attention normalise the DESIGN's padded key
+        // count, not the sequence. A design narrower than the sequence is
+        // refused; the two designs must agree on the score row's width.
+        let sc_cols = match eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+            Some(cols) => {
+                if cols < n_pos {
+                    return Err(format!(
+                        "the softmax design's score row is {cols} wide, but this ViT has {n_pos} positions"
+                    ));
+                }
+                cols
+            }
+            None => n_pos,
+        };
+        // `gemm_on` comes from the CALLER's flag, not from
+        // `ArrayGemm::gemm_on_array()`: the latter only says that SOME panel
+        // was staged, which is also true for a `conv`-only run that staged
+        // just the patch embedding. Asking that handle for the four layer
+        // projections would be a refusal at the first layer, not a dispatch.
+        let attn_on = array.as_deref().is_some_and(|a| a.on_array());
+        if attn_on {
+            let attn_cols = array
+                .as_deref()
+                .and_then(|a| a.score_cols())
+                .unwrap_or(n_pos);
+            if attn_cols < n_pos {
+                return Err(format!(
+                    "the attention design's score row is {attn_cols} wide, but this ViT has {n_pos} positions"
+                ));
+            }
+            if let Some(cols) = eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+                if cols != attn_cols {
+                    return Err(format!(
+                        "the softmax design's score row is {cols} wide and the attention's is {attn_cols} wide"
+                    ));
+                }
+            }
+        }
+        let ln_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::LayerNorm));
+        let gelu_on = eltwise.as_deref().is_some_and(|e| e.on_array(EltOp::Gelu));
+        let sm_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::Softmax));
+
+        ws.ensure(n_patches, n_pos, d, width, g.head_dim as usize, sc_cols);
 
         let VitWorkspace {
             patch_out,
@@ -339,6 +657,7 @@ impl Vit {
             down,
             scores,
             acc,
+            ln_params,
         } = ws;
         let patch_out = &mut patch_out[..n_patches * d];
         let x = &mut x[..n_pos * d];
@@ -348,10 +667,17 @@ impl Vit {
         let proj = &mut proj[..n_pos * d];
         let up = &mut up[..n_pos * width];
         let down = &mut down[..n_pos * d];
+        let mask = vec![0.0f32; n_pos];
 
         // The patch embedding: a conv rewritten as an exact GEMM, because
-        // the stride equals the kernel, so im2col is a permutation.
-        kernels::gemm_nt_rows(
+        // the stride equals the kernel, so im2col is a permutation. It is
+        // gated by `conv` and not by `gemm`: the status block calls this the
+        // architecture's one convolution, and a run that asked only for
+        // `conv` must not silently take over the four layer projections.
+        gemm_seam(
+            array.as_deref_mut().filter(|_| conv_on),
+            conv_on,
+            "frontend.patch_embed",
             patches,
             n_patches,
             &self.patch_embed,
@@ -360,7 +686,7 @@ impl Vit {
             &self.patch_embed_bias,
             patch_out,
             parallel::threads(),
-        );
+        )?;
 
         // The CLS row and the position table. Positions are added AFTER
         // the concatenation and BEFORE the first LayerNorm, which is HF's
@@ -394,19 +720,28 @@ impl Vit {
         };
 
         let threads = parallel::threads();
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
+            let qkv_name = format!("layer.{li}.qkv");
+            let attn_out_name = format!("layer.{li}.attn_out");
+            let ffn_up_name = format!("layer.{li}.ffn_up");
+            let ffn_down_name = format!("layer.{li}.ffn_down");
             // ---- self-attention, pre-LN ----
-            // One fused copy + normalise pass instead of a copy and a norm.
-            layernorm_rows(
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
                 x,
                 norm,
                 n_pos,
                 d,
-                &layer.ln1_gamma,
-                &layer.ln1_beta,
                 g.ln_eps,
-            );
-            kernels::gemm_nt_rows(
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &qkv_name,
                 norm,
                 n_pos,
                 &layer.qkv,
@@ -415,26 +750,65 @@ impl Vit {
                 &layer.qkv_bias,
                 qkv,
                 threads,
-            );
+            )?;
             // The fused [Q|K|V] row is Q at offset 0 and a K|V block at
             // offset d, both with row stride 3*d_model -- the same layout
             // the Whisper's encoder reads. There is NO mask.
-            attention_into(
-                qkv,
-                3 * d,
-                &qkv[d..],
-                3 * d,
-                n_pos,
-                n_pos,
-                d,
-                g.heads as usize,
-                g.head_dim as usize,
-                scale,
-                ctx,
-                scores,
-                acc,
-            );
-            kernels::gemm_nt_rows(
+            if attn_on {
+                if let Some(backend) = array.as_deref_mut() {
+                    let shape = AttentionShape {
+                        batch: 1,
+                        seq: n_pos,
+                        heads: g.heads as usize,
+                        head_dim: g.head_dim as usize,
+                        hidden: d,
+                    };
+                    let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
+                    backend
+                        .attention(qkv, shape, &mask, softmax, ctx)
+                        .map_err(|e| e.to_string())?;
+                }
+            } else if sm_on {
+                if let Some(softmax) = eltwise.as_deref_mut() {
+                    crate::whisper::attention_eltwise_into(
+                        qkv,
+                        3 * d,
+                        &qkv[d..],
+                        3 * d,
+                        n_pos,
+                        n_pos,
+                        d,
+                        g.heads as usize,
+                        g.head_dim as usize,
+                        scale,
+                        ctx,
+                        &mut scores[..n_pos * sc_cols],
+                        sc_cols,
+                        acc,
+                        softmax,
+                    )?;
+                }
+            } else {
+                attention_into(
+                    qkv,
+                    3 * d,
+                    &qkv[d..],
+                    3 * d,
+                    n_pos,
+                    n_pos,
+                    d,
+                    g.heads as usize,
+                    g.head_dim as usize,
+                    scale,
+                    ctx,
+                    scores,
+                    acc,
+                );
+            }
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &attn_out_name,
                 ctx,
                 n_pos,
                 &layer.attn_out,
@@ -443,31 +817,75 @@ impl Vit {
                 &layer.attn_out_bias,
                 proj,
                 threads,
-            );
+            )?;
             kernels::add_inplace(x, &proj[..n_pos * d]);
 
             // ---- feed-forward, pre-LN ----
-            layernorm_rows(
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
                 x,
                 norm,
                 n_pos,
                 d,
-                &layer.ln2_gamma,
-                &layer.ln2_beta,
                 g.ln_eps,
-            );
+            )?;
             let w = layer.ffn_up.len() / d;
             let up = &mut up[..n_pos * w];
-            kernels::gemm_nt_rows(norm, n_pos, &layer.ffn_up, d, w, &layer.ffn_up_bias, up, threads);
-            gelu_erf_rows(up);
-            kernels::gemm_nt_rows(up, n_pos, &layer.ffn_down, w, d, &layer.ffn_down_bias, down, threads);
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &ffn_up_name,
+                norm,
+                n_pos,
+                &layer.ffn_up,
+                d,
+                w,
+                &layer.ffn_up_bias,
+                up,
+                threads,
+            )?;
+            if gelu_on {
+                if let Some(backend) = eltwise.as_deref_mut() {
+                    backend.gelu(up).map_err(|e| e.to_string())?;
+                }
+            } else {
+                gelu_erf_rows(up);
+            }
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &ffn_down_name,
+                up,
+                n_pos,
+                &layer.ffn_down,
+                w,
+                d,
+                &layer.ffn_down_bias,
+                down,
+                threads,
+            )?;
             kernels::add_inplace(x, &down[..n_pos * d]);
         }
 
         // The final LayerNorm, over the whole stack and not per chunk.
-        layernorm_rows_inplace(x, n_pos, d, &self.final_gamma, &self.final_beta, g.ln_eps);
+        if ln_on {
+            if let Some(backend) = eltwise.as_deref_mut() {
+                ln_params[..d].copy_from_slice(&self.final_gamma);
+                ln_params[d..2 * d].copy_from_slice(&self.final_beta);
+                backend
+                    .layernorm(&ln_params[..2 * d], &mut x[..n_pos * d], n_pos)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            layernorm_rows_inplace(x, n_pos, d, &self.final_gamma, &self.final_beta, g.ln_eps);
+        }
         out.resize(n_pos * d, 0.0);
         out.copy_from_slice(x);
+        Ok(())
     }
 
     /// The head: the CLS row to the logits.
@@ -690,6 +1108,12 @@ fn trim_zeros(text: &str) -> String {
 }
 
 /// A tensor's values.
+/// A GEMM operand: F32 row-major in a host container, BF16 panels in one
+/// packed for the array. Both are valid inputs to this same forward pass.
+fn operand(container: &Container, name: &str) -> Result<Vec<f32>, String> {
+    super::operand::read_operand(container, name)
+}
+
 fn tensor(container: &Container, name: &str) -> Result<Vec<f32>, String> {
     let bytes = container
         .tensor_bytes(name)

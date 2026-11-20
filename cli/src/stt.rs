@@ -23,6 +23,7 @@
 //! once. Printing seven names three times reads as twenty-one GEMMs per
 //! layer.
 
+use npum_xdna::array_gemms::GemmSpec;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,10 @@ pub struct Geometry {
     pub enc_layers: i64,
     /// How many decoder layers.
     pub dec_layers: i64,
+    /// The encoder's FFN width.
+    pub enc_intermediate: i64,
+    /// The decoder's FFN width.
+    pub dec_intermediate: i64,
     /// How many heads.
     pub heads: i64,
     /// One head's width.
@@ -65,12 +70,134 @@ pub fn read_geometry(container: &npum_format::Container, path: &Path) -> Option<
         d_model: config.get_i64("d_model")?,
         enc_layers: config.get_i64("num_encoder_layers")?,
         dec_layers: config.get_i64("num_decoder_layers")?,
+        enc_intermediate: config.get_i64("encoder_intermediate")?,
+        dec_intermediate: config.get_i64("decoder_intermediate")?,
         heads: config.get_i64("num_heads")?,
         head_dim: config.get_i64("head_dim")?,
         mel_bins: config.get_i64("num_mel_bins")?,
         vocab: config.get_i64("vocab_size")?,
         max_seq: config.get_i64("max_seq_len")?,
     })
+}
+
+/// The encoder's projections, in the order they are dispatched.
+///
+/// The shape of each projection comes from the geometry the CPU pipeline also
+/// reads: `attn_out` is square, `qkv` is three widths, and the FFN's up and
+/// down projections are the transpose of one another. A design whose streams
+/// disagree with these numbers is a design for another model, and the array's
+/// own loader refuses it before the first dispatch.
+pub fn encoder_specs(g: &Geometry) -> Vec<GemmSpec> {
+    let d = g.d_model as usize;
+    let f = g.enc_intermediate as usize;
+    let mut specs = Vec::with_capacity(g.enc_layers as usize * 4);
+    for layer in 0..g.enc_layers as usize {
+        for (op, k, n) in [
+            ("qkv", d, 3 * d),
+            ("attn_out", d, d),
+            ("ffn_up", d, f),
+            ("ffn_down", f, d),
+        ] {
+            specs.push(GemmSpec {
+                weight: format!("encoder.layers.{layer}.{op}"),
+                op: op.to_string(),
+                k,
+                n,
+            });
+        }
+    }
+    specs
+}
+
+/// The decoder's projections, in the order they are dispatched.
+///
+/// `cross_kv` is deliberately absent: it is the cross-attention cache, built
+/// once per window rather than once per token, and no stream in the decoder's
+/// design set computes it. Building it on the host is the only correct path
+/// for it; calling the array with a name the design does not have would be a
+/// refusal at the first window, not a dispatch.
+pub fn decoder_specs(g: &Geometry) -> Vec<GemmSpec> {
+    let d = g.d_model as usize;
+    let f = g.dec_intermediate as usize;
+    let mut specs = Vec::with_capacity(g.dec_layers as usize * 6);
+    for layer in 0..g.dec_layers as usize {
+        for (op, k, n) in [
+            ("self_qkv", d, 3 * d),
+            ("self_attn_out", d, d),
+            ("cross_q", d, d),
+            ("cross_attn_out", d, d),
+            ("ffn_up", d, f),
+            ("ffn_down", f, d),
+        ] {
+            specs.push(GemmSpec {
+                weight: format!("decoder.layers.{layer}.{op}"),
+                op: op.to_string(),
+                k,
+                n,
+            });
+        }
+    }
+    specs
+}
+
+/// Where each requested operation actually runs, for the status block.
+///
+/// The array's place needs TWO things: the flag must name the code, and the
+/// design set the code would use must be present. A design on disk is not a
+/// dispatch, and a flag asking for a pass without a design is a refusal -- so
+/// the block says the host for it, and the refusal that follows says why.
+#[derive(Debug, Clone, Copy)]
+pub struct Places {
+    pub enc_gemm: bool,
+    pub dec_gemm: bool,
+    pub attn: bool,
+    pub layn: bool,
+    pub gelu: bool,
+    pub softm: bool,
+}
+
+impl Places {
+    pub fn none() -> Self {
+        Self {
+            enc_gemm: false,
+            dec_gemm: false,
+            attn: false,
+            layn: false,
+            gelu: false,
+            softm: false,
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.enc_gemm || self.dec_gemm || self.attn || self.layn || self.gelu || self.softm
+    }
+}
+
+/// Read the places from the flag and the designs that were found.
+pub fn places(
+    container: &npum_format::Container,
+    path: &Path,
+    root: &Path,
+    args: &Args,
+    encoder: Option<&Design>,
+    decoder: Option<&Design>,
+) -> Places {
+    let named = args.value("--artifacts");
+    let elt = |set: &str| crate::npu::eltwise_design_present(container, path, root, named, set);
+    let gemm = crate::npu::wants_op(args, "gemm");
+    // A container can carry its own design set, in which case there is no
+    // directory for `read_design` to read. That is still a design the run
+    // will open, so it counts as present here.
+    let enc = encoder.is_some() || crate::npu::has_own_design(container, "gemm_rtp");
+    let dec = decoder.is_some() || crate::npu::has_own_design(container, "gemm_rtp_dec");
+    Places {
+        enc_gemm: gemm && enc,
+        dec_gemm: gemm && dec,
+        attn: crate::npu::wants_op(args, "attn") && enc,
+        layn: crate::npu::wants_op(args, "layn") && (elt("layernorm") || elt("rmsnorm")),
+        gelu: crate::npu::wants_op(args, "gelu") && elt("gelu"),
+        softm: crate::npu::wants_op(args, "softm") && elt("softmax"),
+    }
 }
 
 /// What one design set says about itself.
@@ -184,6 +311,7 @@ pub fn print_block(
     designs: &Path,
     encoder: Option<&Design>,
     decoder: Option<&Design>,
+    places: &Places,
 ) {
     eprintln!("NpuEmbeddings -- Whisper speech to text on the AMD NPU");
     eprintln!(
@@ -223,7 +351,7 @@ pub fn print_block(
     let enc_rows = encoder.map(|d| d.rows).unwrap_or(0);
     row(
         &format!("encoder GEMMs, {} layers", g.enc_layers),
-        "host",
+        if places.enc_gemm { "npu" } else { "host" },
         &format!("{enc_ops}, M={enc_rows} rows; --npu-ops gemm sends them to the array"),
     );
     let dec_ops = decoder.map(|d| d.gemm_ops.join(", ")).unwrap_or_default();
@@ -238,22 +366,22 @@ pub fn print_block(
         .unwrap_or_default();
     row(
         &format!("decoder GEMMs, {} layers", g.dec_layers),
-        "host",
+        if places.dec_gemm { "npu" } else { "host" },
         &format!("{dec_ops}, M={tiers} rows per tier; --npu-ops gemm sends them to the array"),
     );
     row(
         "layer_norm",
-        "host",
+        if places.layn { "npu" } else { "host" },
         "fp32 on this process; --npu-ops layn sends it to the array",
     );
     row(
         "gelu",
-        "host",
+        if places.gelu { "npu" } else { "host" },
         "fp32 on this process; --npu-ops gelu sends it to the array",
     );
     row(
         "softmax",
-        "host",
+        if places.softm { "npu" } else { "host" },
         "fp32 on this process; --npu-ops softm sends it to the array",
     );
     // The score matrix attention allocates per window, in MB. It is the one
@@ -262,7 +390,7 @@ pub fn print_block(
     let score_mb = g.max_seq as f64 * g.heads as f64 * g.max_seq as f64 * 4.0 / (1024.0 * 1024.0);
     row(
         "attention",
-        "host",
+        if places.attn { "npu" } else { "host" },
         &format!(
             "one score row at a time: {} x {} x {} = {} MB at full length",
             g.max_seq, g.heads, g.max_seq, score_mb as i64
@@ -345,13 +473,30 @@ pub fn print_schedule(
 ///
 /// False when the run must not go on.
 pub fn check_context_budget(args: &crate::flags::Args) -> bool {
+    // Two GEMM sets are the floor, and every elementwise pass the flag names
+    // is one more xclbin and one more hw_context. Count what this run will
+    // actually open, so a five-context run cannot pass a two-context budget.
+    let mut contexts = 0usize;
+    if crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn") {
+        contexts += 2;
+    }
+    for code in ["layn", "gelu", "softm"] {
+        if crate::npu::wants_op(args, code) {
+            contexts += 1;
+        }
+    }
+    // A host run still checks the floor: `serve` calls this before it knows
+    // a request's codes, and the check there is a probe of the BOARD.
+    if contexts == 0 {
+        contexts = 2;
+    }
     let allow_contention = args.switch("--allow-contention");
     let report = npum_xdna::contention::survey_contexts();
-    if npum_xdna::contention::require_context_budget(&report, 2, allow_contention) {
+    if npum_xdna::contention::require_context_budget(&report, contexts, allow_contention) {
         return true;
     }
     eprintln!(
-        "error: NPU context budget: refusing to load 2 concurrent hw_context(s) -- see the report above (close the other process, or pass --allow-contention)"
+        "error: NPU context budget: refusing to load {contexts} concurrent hw_context(s) -- see the report above (close the other process, or pass --allow-contention)"
     );
     false
 }
@@ -371,7 +516,9 @@ pub fn options_from(args: &crate::flags::Args) -> npum_cpu::whisper_session::Opt
         stride_seconds: args
             .value_i64("--stride-seconds")
             .unwrap_or(default.stride_seconds),
-        max_new: args.value_i64("--max-new-tokens").unwrap_or(0).max(0) as usize,
+        // The flag table and the help both spell this `--max-new`. Reading
+        // `--max-new-tokens` silently ignored the user's cap.
+        max_new: args.value_i64("--max-new").unwrap_or(0).max(0) as usize,
     }
 }
 
@@ -380,27 +527,47 @@ pub fn options_from(args: &crate::flags::Args) -> npum_cpu::whisper_session::Opt
 /// A speech model needs TWO sets -- `gemm_rtp` for the encoder stack and
 /// `gemm_rtp_dec` for the decoder's seven streams -- and a directory with
 /// only one of them is not a design set this model can run on.
-pub fn find_designs(root: &Path, model_name: &str) -> Option<PathBuf> {
-    for base in [
-        root.join("runtime").join("artifacts"),
-        root.join("artifacts"),
-        root.join("runtime"),
-        root.to_path_buf(),
-    ] {
-        for sub in ["artifacts_npu1", "artifacts_npu2", "", "npu1", "npu2"] {
-            let dir = if sub.is_empty() {
-                base.join(model_name)
-            } else {
-                base.join(model_name).join(sub)
-            };
-            if dir.join("gemm_rtp").join("design.json").is_file()
-                && dir.join("gemm_rtp_dec").join("design.json").is_file()
-            {
-                return Some(dir);
-            }
-        }
-    }
-    None
+pub fn find_designs(root: &Path, model_name: &str, named: Option<&str>) -> Option<PathBuf> {
+    // The search is shared with every family, including `--artifacts`; a
+    // speech model still needs BOTH sets before the directory is usable.
+    crate::npu::find_artifacts(root, model_name, named).filter(|dir| {
+        dir.join("gemm_rtp").join("design.json").is_file()
+            && dir.join("gemm_rtp_dec").join("design.json").is_file()
+    })
+}
+
+/// Print the family's status block, before any refusal the work would give.
+///
+/// The block is a description of the run the flag asked for. Printing it
+/// after the `--npu-ops` gate would mean a refused command said nothing about
+/// which container and which designs it was refused for.
+pub fn announce(container: &npum_format::Container, path: &Path, args: &Args, root: &Path) {
+    let Some(geometry) = read_geometry(container, path) else {
+        return;
+    };
+    let designs = find_designs(root, &geometry.model_name, args.value("--artifacts"))
+        .unwrap_or_else(|| {
+            root.join("runtime")
+                .join("artifacts")
+                .join(&geometry.model_name)
+        });
+    let encoder = read_design(&designs, false);
+    let decoder = read_design(&designs, true);
+    let places = places(
+        container,
+        path,
+        root,
+        args,
+        encoder.as_ref(),
+        decoder.as_ref(),
+    );
+    print_block(
+        &geometry,
+        &designs,
+        encoder.as_ref(),
+        decoder.as_ref(),
+        &places,
+    );
 }
 
 /// Transcribe one file, and print the answers.
@@ -432,13 +599,55 @@ pub fn run(
         );
         return crate::EXIT_REFUSED;
     };
-    let designs = find_designs(root, &geometry.model_name).unwrap_or_else(|| {
-        root.join("runtime")
-            .join("artifacts")
-            .join(&geometry.model_name)
-    });
-    let encoder_design = read_design(&designs, false);
-    let decoder_design = read_design(&designs, true);
+    // THE ARRAY, OR THE HOST. The flag is a question about where the work
+    // happens, and the answer is the same one the status block just gave.
+    // Whisper has TWO design sets: the encoder's `gemm_rtp` and the decoder's
+    // `gemm_rtp_dec`. Both are opened when the flag asks for dense work,
+    // because a decoder left on the host while the command line says "array"
+    // would be a run that answered the flag with a lie.
+    let dense = crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let mut array_enc: Option<Box<dyn npum_model::array::ArrayText>> = None;
+    let mut array_dec: Option<Box<dyn npum_model::array::ArrayText>> = None;
+    if dense {
+        array_enc = match crate::npu::open_array_text_specs(
+            container,
+            path,
+            root,
+            args,
+            encoder_specs(&geometry),
+            "gemm_rtp",
+        ) {
+            Ok(a) => Some(a as Box<dyn npum_model::array::ArrayText>),
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+        array_dec = match crate::npu::open_array_text_specs(
+            container,
+            path,
+            root,
+            args,
+            decoder_specs(&geometry),
+            "gemm_rtp_dec",
+        ) {
+            Ok(a) => Some(a as Box<dyn npum_model::array::ArrayText>),
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
+        };
+    }
+    // The elementwise passes are separate designs and separate contexts: only
+    // the ones the flag named are opened, and a pass without a design stays on
+    // the host (and is named in the block above).
+    let mut eltwise = match crate::npu::open_eltwise(container, path, root, args) {
+        Ok(backend) => backend.map(|e| e as Box<dyn npum_model::array::ArrayEltwise>),
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+    };
 
     let started = std::time::Instant::now();
     let encoder = match npum_cpu::whisper::Encoder::open(path) {
@@ -501,13 +710,6 @@ pub fn run(
     };
     let setup_s = started.elapsed().as_secs_f64();
 
-    print_block(
-        &geometry,
-        &designs,
-        encoder_design.as_ref(),
-        decoder_design.as_ref(),
-    );
-
     let options = options_from(args);
     print_schedule(setup_s, &options, args.value("--language").is_some());
 
@@ -518,13 +720,16 @@ pub fn run(
             return crate::EXIT_REFUSED;
         }
     };
-    let transcript = match npum_cpu::whisper_session::transcribe_samples(
+    let mut transcript = match npum_cpu::whisper_session::transcribe_samples(
         &encoder,
         &mut decoder,
         &tokenizer,
         &samples,
         &options,
         &weights,
+        array_enc.as_deref_mut(),
+        array_dec.as_deref_mut(),
+        eltwise.as_deref_mut(),
     ) {
         Ok(t) => t,
         Err(reason) => {
@@ -532,6 +737,20 @@ pub fn run(
             return crate::EXIT_REFUSED;
         }
     };
+
+    // The dispatch count is the ARRAY's own, not an estimate: a count of zero
+    // on a run whose flag asked for array work would be the lie the flag
+    // exists to prevent. Each handle reports the calls it actually made.
+    transcript.n_dispatches = (array_enc
+        .as_ref()
+        .map(|a| a.dispatches() + a.attn_dispatches())
+        .unwrap_or(0)
+        + array_dec
+            .as_ref()
+            .map(|a| a.dispatches() + a.attn_dispatches())
+            .unwrap_or(0)
+        + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0))
+        as i64;
 
     eprintln!(
         "  chunks     {} of {:.1} s of audio",
@@ -592,6 +811,12 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             eprintln!("error: the audio file {audio} does not exist.");
             return crate::EXIT_REFUSED;
         }
+        // The block comes BEFORE the refusals: it says which container and
+        // which design sets a refused command was refused for. The places it
+        // prints come from the flag AND the designs that were found, so a
+        // request for a pass with no design says "host" and is then refused
+        // by the loader with the missing set's name.
+        crate::stt::announce(container, path, args, root);
         if let Some(reason) = crate::backend::refuse_if_vulkan(args, npum_families::Family::Stt) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -602,9 +827,15 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }
-        if let Some(reason) =
-            crate::families::refuse_array_not_ported(npum_families::Family::Stt, args, &[])
-        {
+        // Five of the eight codes are now real seams: the encoder and the
+        // decoder GEMMs, the attention, and the LayerNorm/GELU/softmax passes.
+        // The rest still name operations with no design or no seam, and are
+        // refused BY NAME rather than accepted and computed on the host.
+        if let Some(reason) = crate::families::refuse_array_not_ported(
+            npum_families::Family::Stt,
+            args,
+            &["gemm", "attn", "layn", "gelu", "softm"],
+        ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }

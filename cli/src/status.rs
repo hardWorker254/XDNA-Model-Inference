@@ -373,10 +373,13 @@ pub fn announce(
     container: &npum_format::Container,
     path: &Path,
     root: &Path,
+    named: Option<&str>,
     places: &Places,
 ) -> Option<Status> {
     let status = read_container(container, path);
-    let artifacts = crate::embed::find_artifacts(root, &status.model_name);
+    // The same search the run uses to OPEN the design, including `--artifacts`:
+    // a block that names a directory the run ignores describes a different run.
+    let artifacts = crate::npu::find_artifacts(root, &status.model_name, named);
     // THE CONTAINER'S OWN SET, OR THE DIRECTORY'S.
     //
     // The same order the run uses to load the design: the container's own

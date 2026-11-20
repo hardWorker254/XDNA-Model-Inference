@@ -43,6 +43,26 @@ pub const TORCH_REF_MS: f64 = 20.5;
 /// The 64 KiB the dump reserves for its header.
 const DUMP_HEADER: usize = 1 << 16;
 
+/// Refuse a threshold that cannot be parsed instead of quietly falling back
+/// to the default: a typo in `--conf` must not silently decode with a
+/// different threshold.
+pub fn refuse_bad_params(args: &crate::flags::Args) -> Option<String> {
+    for name in ["--conf", "--iou", "--kpt", "--max-det"] {
+        let Some(value) = args.value(name) else {
+            continue;
+        };
+        let valid = if name == "--max-det" {
+            value.parse::<i64>().map(|n| n >= 1).unwrap_or(false)
+        } else {
+            value.parse::<f64>().map(|f| f.is_finite()).unwrap_or(false)
+        };
+        if !valid {
+            return Some(format!("{name}='{value}' is not a valid number"));
+        }
+    }
+    None
+}
+
 /// The decode parameters, with the command line's overrides applied.
 ///
 /// The DEFAULTS are the container's absence of an opinion: a container that
@@ -472,6 +492,10 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         if let Some(reason) =
             crate::families::refuse_op_not_in_arch(args, npum_families::Family::Pose)
         {
+            eprintln!("error: {reason}");
+            return crate::EXIT_REFUSED;
+        }
+        if let Some(reason) = crate::pose::refuse_bad_params(args) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
         }

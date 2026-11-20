@@ -26,11 +26,11 @@
 //! on a Whisper container gets a 404 that says which endpoint to use, and
 //! not a transcription.
 
-use axum::Router;
-use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Router;
 use serde_json::Value;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -103,6 +103,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/labels", get(labels))
         .route("/health", get(health))
         .route("/", get(root))
+        // axum's default 2 MB cap rejects a body BEFORE a handler sees it,
+        // which makes the handlers' own 64 MB image / 200 MB audio checks
+        // unreachable. The handlers validate the sizes and the JSON themselves.
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -283,30 +287,37 @@ async fn embeddings(State(state): State<Shared>, body: axum::body::Bytes) -> Res
     let Some(encoder) = &state.encoder else {
         return not_found(&state, "/v1/embeddings");
     };
-    // Parse straight from the request bytes: a large embeddings input used
-    // to be copied into a `String` first. On error, retry through the lossy
-    // string so the exact error text the API returns does not change.
+    // Parse straight from the request bytes. A lossy retry would silently
+    // turn malformed UTF-8 into U+FFFD and embed text the caller never sent.
     let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => {
-            let lossy = String::from_utf8_lossy(&body).to_string();
-            match serde_json::from_str(&lossy) {
-                Ok(v) => v,
-                Err(e) => {
-                    return json(
-                        StatusCode::BAD_REQUEST,
-                        error_body(&e.to_string(), "invalid_request_error"),
-                    );
-                }
-            }
+        Err(e) => {
+            return json(
+                StatusCode::BAD_REQUEST,
+                error_body(&e.to_string(), "invalid_request_error"),
+            );
         }
     };
     let texts: Vec<String> = match &request["input"] {
         Value::String(s) => vec![s.clone()],
-        Value::Array(items) => items
-            .iter()
-            .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_default())
-            .collect(),
+        Value::Array(items) => {
+            let mut texts = Vec::with_capacity(items.len());
+            for item in items {
+                // A number, null or nested array is NOT text. Coercing it to
+                // "" would return a plausible embedding of the empty string.
+                let Some(s) = item.as_str() else {
+                    return json(
+                        StatusCode::BAD_REQUEST,
+                        error_body(
+                            "`input` must be a string or an array of strings",
+                            "invalid_request_error",
+                        ),
+                    );
+                };
+                texts.push(s.to_string());
+            }
+            texts
+        }
         _ => {
             return json(
                 StatusCode::BAD_REQUEST,
@@ -715,28 +726,34 @@ async fn pose(
         if want.trim().is_empty() {
             continue;
         }
-        let parsed = want.trim().parse::<f64>();
-        match (slot, parsed) {
-            (3, Ok(v)) if v >= 1.0 => params.max_det = v as i64,
-            (3, _) => {
-                return json(
-                    StatusCode::BAD_REQUEST,
-                    error_body(
-                        &format!("max_det='{want}' is not an integer of at least 1"),
-                        "invalid_request_error",
-                    ),
-                );
+        if slot == 3 {
+            // `2.5` is not an integer, and `1e300` must not saturate to
+            // i64::MAX -- the error text promises an integer of at least 1.
+            match want.trim().parse::<i64>() {
+                Ok(v) if v >= 1 => params.max_det = v,
+                _ => {
+                    return json(
+                        StatusCode::BAD_REQUEST,
+                        error_body(
+                            &format!("max_det='{want}' is not an integer of at least 1"),
+                            "invalid_request_error",
+                        ),
+                    );
+                }
             }
-            (_, Ok(v)) => match slot {
+            continue;
+        }
+        match want.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() => match slot {
                 0 => params.conf = v,
                 1 => params.iou = v,
                 _ => params.keypoint = v,
             },
-            (_, Err(_)) => {
+            _ => {
                 return json(
                     StatusCode::BAD_REQUEST,
                     error_body(
-                        &format!("{name}='{want}' is not a number"),
+                        &format!("{name}='{want}' is not a finite number"),
                         "invalid_request_error",
                     ),
                 );

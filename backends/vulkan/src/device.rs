@@ -162,6 +162,10 @@ pub struct Gpu {
     deferred: Vec<Deferred>,
     /// Reusable host staging for the GEMM bias epilogue, padded to `n`.
     bias_scratch: Vec<f32>,
+    /// Reusable host staging for the GEMM accumulator, padded to `m*n`.
+    /// A pool buffer recycled from another op still holds its old bytes, and
+    /// the shader reads every one of those `m*n` floats.
+    acc_scratch: Vec<f32>,
     name: String,
 }
 
@@ -252,6 +256,7 @@ impl Gpu {
                     batch_retired: Vec::new(),
                     deferred: Vec::new(),
                     bias_scratch: Vec::new(),
+                    acc_scratch: Vec::new(),
                     name,
                 };
                 // The dummy is what a shader's unused bindings point at.
@@ -475,6 +480,13 @@ impl Gpu {
         if values.is_empty() {
             return Ok(());
         }
+        if (values.len() * 4) as u64 > b.size {
+            return Err(format!(
+                "a {} f32 upload does not fit a {} byte device buffer",
+                values.len(),
+                b.size
+            ));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr() as *const u8,
@@ -496,6 +508,13 @@ impl Gpu {
     fn read_into(&self, b: &Buf, out: &mut [f32]) -> Result<(), String> {
         if out.is_empty() {
             return Ok(());
+        }
+        if (out.len() * 4) as u64 > b.size {
+            return Err(format!(
+                "a {} f32 read does not fit a {} byte device buffer",
+                out.len(),
+                b.size
+            ));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(b.ptr, out.as_mut_ptr() as *mut u8, out.len() * 4);
@@ -973,6 +992,17 @@ impl Gpu {
         out: Option<usize>,
         cache_b: bool,
     ) -> Result<Vec<f32>, String> {
+        // The shader reads exactly m*k, k*n and (with an accumulator) m*n
+        // floats. A short operand would leave recycled pool bytes in the
+        // unwritten tail; a long accumulator would overrun the buffer.
+        if a.len() < m * k || b.len() < k * n || acc.is_some_and(|v| v.len() > m * n) {
+            return Err(format!(
+                "gemm: operands are {}, {} and accumulator {:?}, but the shape is [{m},{k}]x[{k},{n}]",
+                a.len(),
+                b.len(),
+                acc.map(|v| v.len())
+            ));
+        }
         // A pending batch output can be consumed as an input without a
         // round-trip through the host. `take_input` says whether the buffer
         // was borrowed from the batch (and must not be released here).
@@ -1000,7 +1030,13 @@ impl Gpu {
             self.write(buf, &self.bias_scratch)?;
         }
         if let (Some(values), Some(buf)) = (acc, acc_buf.as_ref()) {
-            self.write(buf, values)?;
+            // The CPU reference treats a short accumulator as zero beyond its
+            // length. The shader reads all m*n lanes, so the tail has to be
+            // ZERO here -- a recycled pool buffer still holds another op's data.
+            self.acc_scratch.resize(m * n, 0.0);
+            self.acc_scratch.fill(0.0);
+            self.acc_scratch[..values.len()].copy_from_slice(values);
+            self.write(buf, &self.acc_scratch)?;
         }
 
         // Bindings are POSITIONAL: bias is 3 and acc is 4 even when one is

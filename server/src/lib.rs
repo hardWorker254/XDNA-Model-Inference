@@ -47,8 +47,8 @@ pub mod routes;
 use axum::Router;
 
 pub use engines::{
-    Classification, Classifier, DEFAULT_DECODER_POOL, Embedder, PoseDetector, PoseResult,
-    Transcriber,
+    Classification, Classifier, Embedder, PoseDetector, PoseResult, Transcriber, XdnaForCls,
+    XdnaForEmbed, XdnaForPose, XdnaForStt, DEFAULT_DECODER_POOL,
 };
 
 /// The result type of this crate.

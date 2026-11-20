@@ -742,6 +742,22 @@ impl<T: Transport> ArrayGemms<T> {
     }
 }
 
+impl<T: Transport> ArrayGemms<T> {
+    /// The largest row tile this projection was compiled for.
+    ///
+    /// A Whisper encoder's 1500 positions are computed as three dispatches of
+    /// 512, because a single dispatch may not hold more than four AIE row
+    /// blocks. The design describes the TILE, not the whole run, and the
+    /// caller must split a longer run into tiles -- an array that refused it
+    /// outright would make the family fall back to a host it never asked for.
+    fn max_tier_rows(&self, weight: &str) -> usize {
+        self.panels
+            .get(weight)
+            .and_then(|p| p.tiers.iter().map(|(rows, _)| *rows).max())
+            .unwrap_or(0)
+    }
+}
+
 impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
     fn name(&self) -> &'static str {
         "xrt"
@@ -769,6 +785,29 @@ impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
         bias: Option<&[f32]>,
         out: &mut [f32],
     ) -> npum_model::array::Result<()> {
+        // THE ROW TILE. A run longer than the design's largest tier is split
+        // into consecutive tiles; each tile is an independent GEMM over its
+        // own rows, so splitting changes no arithmetic and the last, partial
+        // tile pads inside the design exactly as a short run does.
+        let max_rows = self.max_tier_rows(weight);
+        if max_rows != 0 && rows > max_rows {
+            let mut done = 0usize;
+            while done < rows {
+                let take = max_rows.min(rows - done);
+                self.gemm(
+                    weight,
+                    &a[done * k..(done + take) * k],
+                    take,
+                    k,
+                    n,
+                    bias,
+                    &mut out[done * n..(done + take) * n],
+                )?;
+                done += take;
+            }
+            return Ok(());
+        }
+
         let resolved = self
             .resolve(weight, a.len(), rows, k, n, bias, out.len())
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;

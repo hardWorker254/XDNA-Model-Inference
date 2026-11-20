@@ -62,6 +62,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     var m_run: f32 = NEG_INF;
     var l_run: f32 = 0.0;
+    // Whether an EARLIER chunk contributed. `m_run` alone cannot answer this:
+    // a whole clamped chunk sets it to FLOOR_LOAD, which is also the value the
+    // first chunk can produce. Resetting then would discard every earlier key.
+    var has_prev: bool = false;
 
     for (var chunk = 0u; chunk < params.kv_len; chunk = chunk + CHUNK) {
         let cnt = min(CHUNK, params.kv_len - chunk);
@@ -95,7 +99,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let scale_old = select(
             0.0,
             exp2(max((m_run - m_new) * LOG2E, FLOOR_ARG)),
-            m_run > FLOOR_LOAD,
+            has_prev,
         );
         if (lane == 0u) {
             m_shared = m_new;
@@ -138,6 +142,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             }
         }
         m_run = m_shared;
+        has_prev = true;
     }
 
     if (params.kv_len == 0u || l_shared <= 0.0) {

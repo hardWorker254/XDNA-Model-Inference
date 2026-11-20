@@ -72,7 +72,7 @@ fn main() {
     let conv = whisper_features::conv_front_end(&mel, &w1, &b1, &w2, &b2, g.d_model);
 
     let n_src = conv.len() / g.d_model;
-    let hidden = encoder.run(&conv, n_src);
+    let hidden = encoder.run(&conv, n_src, None, None).expect("the encoder");
     decoder
         .set_source(&hidden, n_src)
         .expect("the cross-attention cache");
@@ -81,7 +81,7 @@ fn main() {
         let mut h = Vec::new();
         let mut lg = Vec::new();
         let top = decoder
-            .step(token, pos, Some(&mut h), Some(&mut lg))
+            .step(token, pos, Some(&mut h), Some(&mut lg), None, None)
             .expect("the step");
         println!("step {} {} {} {}", pos, top, h.len(), to_hex(&h));
         println!("logits {} {} {}", pos, lg.len(), to_hex(&lg));
@@ -94,7 +94,7 @@ fn main() {
         let tokenizer = Tokenizer::from_table(table).expect("the tokenizer's table");
         let stop = tokenizer.token_id("<|endoftext|>").expect("the stop token");
         let out = decoder
-            .greedy(&prompt, stop, max_new)
+            .greedy(&prompt, stop, max_new, None, None)
             .expect("the greedy chain");
         print!("greedy {}", out.len());
         for id in &out {

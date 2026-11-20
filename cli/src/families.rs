@@ -169,28 +169,6 @@ pub(crate) fn refuse_array_not_ported(
     ))
 }
 
-/// The refusal for `--npu-ops` on GTE.
-///
-/// GTE has its own forward pass and no seam that would route projections,
-/// attention or elementwise work to the array, so every requested code must
-/// be refused with that specific cause rather than the generic "no array-able
-/// operation in this runtime yet" wording.
-pub(crate) fn refuse_gte_array_ops(args: &Args, arch: &str) -> Option<String> {
-    let listing = args.value("--npu-ops")?;
-    let codes = crate::flags::parse_npu_ops(listing).ok()?;
-    if codes.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "--npu-ops {}: --npu-ops is not yet implemented for GTE models ({}). \
-         The array/eltwise dispatch seam is missing from the GTE forward pass, \
-         so accepting the flag would run on the host while reporting array work. \
-         Remove --npu-ops to run on the host.",
-        codes.join(", "),
-        arch,
-    ))
-}
-
 /// `add`.
 ///
 /// The sha256 is checked BEFORE anything else, and a pin that can never

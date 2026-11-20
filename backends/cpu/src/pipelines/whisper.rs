@@ -39,8 +39,9 @@
 
 use crate::kernels;
 use crate::parallel;
-use crate::whisper_features::{MelSpec, gelu_erf_exact};
+use crate::whisper_features::{gelu_erf_exact, MelSpec};
 use npum_format::Container;
+use npum_model::array::{ArrayEltwise, ArrayText, ArrayTextRef, AttentionShape, EltOp};
 use std::path::Path;
 
 /// The model's geometry, as the container states it.
@@ -130,6 +131,8 @@ struct EncoderLayer {
 pub struct Encoder {
     geometry: Geometry,
     layers: Vec<EncoderLayer>,
+    /// The encoder's projection names, in the order the run dispatches them.
+    gemm_names: Vec<[String; 4]>,
     embed_positions: Vec<f32>,
     final_gamma: Vec<f32>,
     final_beta: Vec<f32>,
@@ -153,6 +156,9 @@ pub struct EncoderWorkspace {
     down: Vec<f32>,
     scores: Vec<f32>,
     acc: Vec<f32>,
+    /// gamma|beta for the array's LayerNorm, and the zero attention mask.
+    ln_params: Vec<f32>,
+    mask: Vec<f32>,
 }
 
 impl EncoderWorkspace {
@@ -161,7 +167,7 @@ impl EncoderWorkspace {
         Self::default()
     }
 
-    fn ensure(&mut self, g: &Geometry, n_src: usize) {
+    fn ensure(&mut self, g: &Geometry, n_src: usize, score_cols: usize) {
         let d = g.d_model;
         let rows = n_src;
         resize_f32(&mut self.x, rows * d);
@@ -171,9 +177,15 @@ impl EncoderWorkspace {
         resize_f32(&mut self.proj, rows * d);
         resize_f32(&mut self.up, rows * g.enc_intermediate);
         resize_f32(&mut self.down, rows * d);
-        // The encoder's scores row has one entry per source position.
-        resize_f32(&mut self.scores, rows);
+        // The host's row is one entry per source position; the array's (and
+        // the array softmax's) row is the design's padded width.
+        resize_f32(&mut self.scores, rows * g.heads * score_cols);
         resize_f32(&mut self.acc, g.head_dim);
+        resize_f32(&mut self.ln_params, 2 * d);
+        // Whisper's encoder has no mask; the array's attention takes one
+        // value per query, all zero.
+        resize_f32(&mut self.mask, rows);
+        self.mask.fill(0.0);
     }
 }
 
@@ -181,6 +193,142 @@ impl EncoderWorkspace {
 fn resize_f32(buf: &mut Vec<f32>, len: usize) {
     if buf.len() != len {
         buf.resize(len, 0.0);
+    }
+}
+
+/// One projection: the array's seam when asked, the host's kernel otherwise.
+///
+/// The host arm is the ORIGINAL call, byte for byte; the array arm multiplies
+/// the same weights in bf16 and is the same network with a coarser operand.
+#[allow(clippy::too_many_arguments)]
+fn gemm_seam(
+    array: Option<&mut (dyn ArrayText + '_)>,
+    gemm_on: bool,
+    weight: &str,
+    a: &[f32],
+    rows: usize,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    bias: &[f32],
+    out: &mut [f32],
+    threads: usize,
+) -> Result<(), String> {
+    match array.filter(|_| gemm_on) {
+        Some(backend) => backend
+            .gemm(weight, a, rows, k, n, Some(bias), out)
+            .map_err(|e| e.to_string()),
+        None => {
+            kernels::gemm_nt_rows(a, rows, b, k, n, bias, out, threads);
+            Ok(())
+        }
+    }
+}
+
+/// One LayerNorm with a separate destination: copy and normalise on the
+/// array, or the host's fused copy-and-normalise kernel.
+#[allow(clippy::too_many_arguments)]
+fn layernorm_seam(
+    eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+    ln_on: bool,
+    params: &mut [f32],
+    gamma: &[f32],
+    beta: &[f32],
+    src: &[f32],
+    dst: &mut [f32],
+    rows: usize,
+    width: usize,
+    eps: f64,
+) -> Result<(), String> {
+    if let Some(eltwise) = eltwise.filter(|_| ln_on) {
+        let len = rows * width;
+        dst[..len].copy_from_slice(&src[..len]);
+        params[..width].copy_from_slice(gamma);
+        params[width..2 * width].copy_from_slice(beta);
+        eltwise
+            .layernorm(&params[..2 * width], &mut dst[..len], rows)
+            .map_err(|e| e.to_string())
+    } else {
+        layernorm_rows(src, dst, rows, width, gamma, beta, eps);
+        Ok(())
+    }
+}
+
+/// One decoder attention: the array's whole block when asked, the host's
+/// attention otherwise (with the eltwise softmax when only `softm` was named).
+///
+/// The array's attention takes Q|K|V in one buffer. The decoder keeps K|V in a
+/// cache of its own, so the caller's reusable buffers are filled with Q in the
+/// first row and K|V from the cache in every row. Rows past the first are
+/// queried and discarded -- they carry no answer, but they let the array read
+/// one [Q|K|V] block instead of three separate operands.
+#[allow(clippy::too_many_arguments)]
+fn decoder_attention(
+    array: Option<&mut (dyn ArrayText + '_)>,
+    attn_on: bool,
+    sm_on: bool,
+    q: &[f32],
+    kv: &[f32],
+    kv_stride: usize,
+    n_kv: usize,
+    d: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+    scores: &mut [f32],
+    sc_cols: usize,
+    acc: &mut [f32],
+    attn_qkv: &mut [f32],
+    attn_ctx: &mut [f32],
+    mask: &mut [f32],
+    softmax: Option<&mut (dyn ArrayEltwise + '_)>,
+) -> Result<(), String> {
+    if attn_on {
+        let backend = array.ok_or_else(|| {
+            "the array attention was asked for but no handle was given".to_string()
+        })?;
+        for j in 0..n_kv {
+            let row = &mut attn_qkv[j * 3 * d..][..3 * d];
+            row.fill(0.0);
+            if j == 0 {
+                row[..d].copy_from_slice(q);
+            }
+            row[d..2 * d].copy_from_slice(&kv[j * kv_stride..][..d]);
+            row[2 * d..3 * d].copy_from_slice(&kv[j * kv_stride + d..][..d]);
+        }
+        let shape = AttentionShape {
+            batch: 1,
+            seq: n_kv,
+            heads,
+            head_dim,
+            hidden: d,
+        };
+        let m = &mut mask[..n_kv];
+        m.fill(0.0);
+        backend
+            .attention(
+                &attn_qkv[..n_kv * 3 * d],
+                shape,
+                m,
+                softmax,
+                &mut attn_ctx[..n_kv * d],
+            )
+            .map_err(|e| e.to_string())?;
+        out[..d].copy_from_slice(&attn_ctx[..d]);
+        Ok(())
+    } else if sm_on {
+        let softmax = softmax
+            .ok_or_else(|| "the array softmax was asked for but no handle was given".to_string())?;
+        attention_eltwise_into(
+            q, d, kv, kv_stride, 1, n_kv, d, heads, head_dim, scale, out, scores, sc_cols, acc,
+            softmax,
+        )
+    } else {
+        attention_into(
+            q, d, kv, kv_stride, 1, n_kv, d, heads, head_dim, scale, out, scores, acc,
+        );
+        Ok(())
     }
 }
 
@@ -195,16 +343,23 @@ impl Encoder {
             )
         })?;
         let mut layers = Vec::with_capacity(geometry.enc_layers);
+        let mut gemm_names = Vec::with_capacity(geometry.enc_layers);
         for l in 0..geometry.enc_layers {
             let p = format!("encoder.layers.{l}.");
+            gemm_names.push([
+                format!("{p}qkv"),
+                format!("{p}attn_out"),
+                format!("{p}ffn_up"),
+                format!("{p}ffn_down"),
+            ]);
             layers.push(EncoderLayer {
-                qkv: tensor(&container, &format!("{p}qkv"))?,
+                qkv: operand(&container, &format!("{p}qkv"))?,
                 qkv_bias: tensor(&container, &format!("{p}qkv.bias"))?,
-                attn_out: tensor(&container, &format!("{p}attn_out"))?,
+                attn_out: operand(&container, &format!("{p}attn_out"))?,
                 attn_out_bias: tensor(&container, &format!("{p}attn_out.bias"))?,
-                ffn_up: tensor(&container, &format!("{p}ffn_up"))?,
+                ffn_up: operand(&container, &format!("{p}ffn_up"))?,
                 ffn_up_bias: tensor(&container, &format!("{p}ffn_up.bias"))?,
-                ffn_down: tensor(&container, &format!("{p}ffn_down"))?,
+                ffn_down: operand(&container, &format!("{p}ffn_down"))?,
                 ffn_down_bias: tensor(&container, &format!("{p}ffn_down.bias"))?,
                 ln1_gamma: tensor(&container, &format!("{p}ln1.weight"))?,
                 ln1_beta: tensor(&container, &format!("{p}ln1.bias"))?,
@@ -217,6 +372,7 @@ impl Encoder {
             final_gamma: tensor(&container, "encoder.layer_norm.weight")?,
             final_beta: tensor(&container, "encoder.layer_norm.bias")?,
             layers,
+            gemm_names,
             geometry,
         })
     }
@@ -232,9 +388,17 @@ impl Encoder {
     /// positional term yet, and `n_src` is how many positions of it are
     /// real. The result is `(n_src, d_model)` AFTER the final LayerNorm,
     /// which is what transformers hands the decoder.
-    pub fn run(&self, conv_out: &[f32], n_src: usize) -> Vec<f32> {
+    pub fn run(
+        &self,
+        conv_out: &[f32],
+        n_src: usize,
+        array: ArrayTextRef<'_, '_>,
+        eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+    ) -> Result<Vec<f32>, String> {
         let mut ws = EncoderWorkspace::new();
-        self.run_into(conv_out, n_src, &mut ws).to_vec()
+        Ok(self
+            .run_into(conv_out, n_src, &mut ws, array, eltwise)?
+            .to_vec())
     }
 
     /// The same pass, with the scratch buffers supplied by the caller.
@@ -243,15 +407,60 @@ impl Encoder {
     /// transcribes many windows can keep one workspace and hand it back on
     /// every call. Every buffer is overwritten before it is read, so the
     /// workspace needs no clearing between calls.
+    ///
+    /// `array` and `eltwise` are the array's seams. With both `None` every
+    /// call below is the ORIGINAL host call, byte for byte. A pass named by
+    /// `--npu-ops` goes through the trait instead, and an array that refuses
+    /// a dispatch is an error -- never a silent host computation.
     pub fn run_into<'ws>(
         &self,
         conv_out: &[f32],
         n_src: usize,
         ws: &'ws mut EncoderWorkspace,
-    ) -> &'ws [f32] {
+        mut array: ArrayTextRef<'_, '_>,
+        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
+    ) -> Result<&'ws [f32], String> {
         let g = &self.geometry;
         let d = g.d_model;
-        ws.ensure(g, n_src);
+
+        // THE SCORE ROW'S WIDTH. The array's softmax normalises the DESIGN's
+        // padded key count, so the scores must be laid out at that width --
+        // and a design narrower than the sequence cannot be used at all.
+        let sc_cols = match eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+            Some(cols) => {
+                if cols < n_src {
+                    return Err(format!(
+                        "the softmax design's score row is {cols} wide, but this encoder has {n_src} positions"
+                    ));
+                }
+                cols
+            }
+            None => n_src,
+        };
+        let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
+        let attn_on = array.as_deref().is_some_and(|a| a.on_array());
+        if attn_on {
+            let attn_cols = array
+                .as_deref()
+                .and_then(|a| a.score_cols())
+                .unwrap_or(n_src);
+            if let Some(cols) = eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+                if cols != attn_cols {
+                    return Err(format!(
+                        "the softmax design's score row is {cols} wide and the attention's is {attn_cols} wide"
+                    ));
+                }
+            }
+        }
+        let ln_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::LayerNorm));
+        let gelu_on = eltwise.as_deref().is_some_and(|e| e.on_array(EltOp::Gelu));
+        let sm_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::Softmax));
+
+        ws.ensure(g, n_src, sc_cols);
         let EncoderWorkspace {
             x,
             norm,
@@ -262,6 +471,8 @@ impl Encoder {
             down,
             scores,
             acc,
+            ln_params,
+            mask,
         } = ws;
 
         // + embed_positions, before the first LayerNorm: HF adds the position
@@ -284,20 +495,25 @@ impl Encoder {
         };
 
         let threads = parallel::threads();
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
+            let names = &self.gemm_names[li];
             // ---- self-attention, pre-LN ----
-            // Fused copy + norm: the old `copy_from_slice` walked these 3 MB
-            // once only to overwrite every byte in the next loop.
-            layernorm_rows(
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
                 x,
                 norm,
                 n_src,
                 d,
-                &layer.ln1_gamma,
-                &layer.ln1_beta,
                 g.ln_eps,
-            );
-            kernels::gemm_nt_rows(
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[0],
                 norm,
                 n_src,
                 &layer.qkv,
@@ -306,23 +522,62 @@ impl Encoder {
                 &layer.qkv_bias,
                 qkv,
                 threads,
-            );
-            attention_into(
-                qkv,
-                3 * d,
-                &qkv[d..],
-                3 * d,
-                n_src,
-                n_src,
-                d,
-                g.heads,
-                g.head_dim,
-                scale,
-                ctx,
-                scores,
-                acc,
-            );
-            kernels::gemm_nt_rows(
+            )?;
+            if attn_on {
+                if let Some(backend) = array.as_deref_mut() {
+                    let shape = AttentionShape {
+                        batch: 1,
+                        seq: n_src,
+                        heads: g.heads,
+                        head_dim: g.head_dim,
+                        hidden: d,
+                    };
+                    let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
+                    backend
+                        .attention(qkv, shape, &mask[..n_src], softmax, ctx)
+                        .map_err(|e| e.to_string())?;
+                }
+            } else if sm_on {
+                if let Some(softmax) = eltwise.as_deref_mut() {
+                    attention_eltwise_into(
+                        qkv,
+                        3 * d,
+                        &qkv[d..],
+                        3 * d,
+                        n_src,
+                        n_src,
+                        d,
+                        g.heads,
+                        g.head_dim,
+                        scale,
+                        ctx,
+                        &mut scores[..n_src * g.heads * sc_cols],
+                        sc_cols,
+                        acc,
+                        softmax,
+                    )?;
+                }
+            } else {
+                attention_into(
+                    qkv,
+                    3 * d,
+                    &qkv[d..],
+                    3 * d,
+                    n_src,
+                    n_src,
+                    d,
+                    g.heads,
+                    g.head_dim,
+                    scale,
+                    ctx,
+                    scores,
+                    acc,
+                );
+            }
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[1],
                 ctx,
                 n_src,
                 &layer.attn_out,
@@ -331,20 +586,26 @@ impl Encoder {
                 &layer.attn_out_bias,
                 proj,
                 threads,
-            );
+            )?;
             kernels::add_inplace(x, &proj[..n_src * d]);
 
             // ---- feed-forward, pre-LN ----
-            layernorm_rows(
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
                 x,
                 norm,
                 n_src,
                 d,
-                &layer.ln2_gamma,
-                &layer.ln2_beta,
                 g.ln_eps,
-            );
-            kernels::gemm_nt_rows(
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[2],
                 norm,
                 n_src,
                 &layer.ffn_up,
@@ -353,9 +614,20 @@ impl Encoder {
                 &layer.ffn_up_bias,
                 up,
                 threads,
-            );
-            gelu_erf_rows(&mut up[..n_src * g.enc_intermediate]);
-            kernels::gemm_nt_rows(
+            )?;
+            if gelu_on {
+                if let Some(backend) = eltwise.as_deref_mut() {
+                    backend
+                        .gelu(&mut up[..n_src * g.enc_intermediate])
+                        .map_err(|e| e.to_string())?;
+                }
+            } else {
+                gelu_erf_rows(&mut up[..n_src * g.enc_intermediate]);
+            }
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[3],
                 up,
                 n_src,
                 &layer.ffn_down,
@@ -364,14 +636,24 @@ impl Encoder {
                 &layer.ffn_down_bias,
                 down,
                 threads,
-            );
+            )?;
             kernels::add_inplace(x, &down[..n_src * d]);
         }
 
         // Whisper's encoder output is AFTER the final LayerNorm -- that is
         // what transformers hands the decoder.
-        layernorm_rows_inplace(x, n_src, d, &self.final_gamma, &self.final_beta, g.ln_eps);
-        x
+        if ln_on {
+            if let Some(backend) = eltwise.as_deref_mut() {
+                ln_params[..d].copy_from_slice(&self.final_gamma);
+                ln_params[d..2 * d].copy_from_slice(&self.final_beta);
+                backend
+                    .layernorm(&ln_params[..2 * d], &mut x[..n_src * d], n_src)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            layernorm_rows_inplace(x, n_src, d, &self.final_gamma, &self.final_beta, g.ln_eps);
+        }
+        Ok(x)
     }
 }
 
@@ -421,6 +703,12 @@ struct DecoderScratch {
     scores: Vec<f32>,
     acc: Vec<f32>,
     logits: Vec<f32>,
+    /// gamma|beta for the array's LayerNorm, and the array attention's mask.
+    ln_params: Vec<f32>,
+    mask: Vec<f32>,
+    /// Q|K|V rows and contexts assembled for the array's attention.
+    attn_qkv: Vec<f32>,
+    attn_ctx: Vec<f32>,
 }
 
 impl DecoderScratch {
@@ -439,6 +727,10 @@ impl DecoderScratch {
             scores: vec![0.0f32; g.max_target.max(g.max_seq)],
             acc: vec![0.0f32; g.head_dim],
             logits: vec![0.0f32; g.vocab],
+            ln_params: vec![0.0f32; 2 * g.d_model],
+            mask: vec![0.0f32; g.max_target.max(g.max_seq)],
+            attn_qkv: vec![0.0f32; g.max_target.max(g.max_seq) * 3 * g.d_model],
+            attn_ctx: vec![0.0f32; g.max_target.max(g.max_seq) * g.d_model],
         }
     }
 }
@@ -457,6 +749,8 @@ impl DecoderScratch {
 pub struct Decoder {
     geometry: Geometry,
     layers: Vec<DecoderLayer>,
+    /// The decoder's projection names, in the order a step dispatches them.
+    gemm_names: Vec<[String; 6]>,
     embed_positions: Vec<f32>,
     embed_tokens: Vec<f32>,
     final_gamma: Vec<f32>,
@@ -491,22 +785,31 @@ impl Decoder {
             )
         })?;
         let mut layers = Vec::with_capacity(geometry.dec_layers);
+        let mut gemm_names = Vec::with_capacity(geometry.dec_layers);
         for l in 0..geometry.dec_layers {
             let p = format!("decoder.layers.{l}.");
+            gemm_names.push([
+                format!("{p}self_qkv"),
+                format!("{p}self_attn_out"),
+                format!("{p}cross_q"),
+                format!("{p}cross_attn_out"),
+                format!("{p}ffn_up"),
+                format!("{p}ffn_down"),
+            ]);
             layers.push(DecoderLayer {
-                self_qkv: tensor(&container, &format!("{p}self_qkv"))?,
+                self_qkv: operand(&container, &format!("{p}self_qkv"))?,
                 self_qkv_bias: tensor(&container, &format!("{p}self_qkv.bias"))?,
-                self_attn_out: tensor(&container, &format!("{p}self_attn_out"))?,
+                self_attn_out: operand(&container, &format!("{p}self_attn_out"))?,
                 self_attn_out_bias: tensor(&container, &format!("{p}self_attn_out.bias"))?,
-                cross_q: tensor(&container, &format!("{p}cross_q"))?,
+                cross_q: operand(&container, &format!("{p}cross_q"))?,
                 cross_q_bias: tensor(&container, &format!("{p}cross_q.bias"))?,
-                cross_kv: tensor(&container, &format!("{p}cross_kv"))?,
+                cross_kv: operand(&container, &format!("{p}cross_kv"))?,
                 cross_kv_bias: tensor(&container, &format!("{p}cross_kv.bias"))?,
-                cross_attn_out: tensor(&container, &format!("{p}cross_attn_out"))?,
+                cross_attn_out: operand(&container, &format!("{p}cross_attn_out"))?,
                 cross_attn_out_bias: tensor(&container, &format!("{p}cross_attn_out.bias"))?,
-                ffn_up: tensor(&container, &format!("{p}ffn_up"))?,
+                ffn_up: operand(&container, &format!("{p}ffn_up"))?,
                 ffn_up_bias: tensor(&container, &format!("{p}ffn_up.bias"))?,
-                ffn_down: tensor(&container, &format!("{p}ffn_down"))?,
+                ffn_down: operand(&container, &format!("{p}ffn_down"))?,
                 ffn_down_bias: tensor(&container, &format!("{p}ffn_down.bias"))?,
                 ln1_gamma: tensor(&container, &format!("{p}ln1.weight"))?,
                 ln1_beta: tensor(&container, &format!("{p}ln1.bias"))?,
@@ -542,7 +845,7 @@ impl Decoder {
         let d = geometry.d_model;
         Ok(Decoder {
             embed_positions: tensor(&container, "decoder.embed_positions")?,
-            embed_tokens: tensor(&container, "decoder.embed_tokens")?,
+            embed_tokens: operand(&container, "decoder.embed_tokens")?,
             final_gamma: tensor(&container, "decoder.layer_norm.weight")?,
             final_beta: tensor(&container, "decoder.layer_norm.bias")?,
             cross_kv: vec![Vec::new(); geometry.dec_layers],
@@ -561,6 +864,7 @@ impl Decoder {
             begin_suppress,
             scratch: DecoderScratch::new(&geometry),
             layers,
+            gemm_names,
             geometry,
         })
     }
@@ -635,6 +939,8 @@ impl Decoder {
         position: usize,
         hidden: Option<&mut Vec<f32>>,
         logits: Option<&mut Vec<f32>>,
+        mut array: ArrayTextRef<'_, '_>,
+        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<i32, String> {
         let g = &self.geometry;
         let d = g.d_model;
@@ -665,6 +971,54 @@ impl Decoder {
             g.attn_scale as f32
         };
 
+        // The array's softmax and attention normalise the DESIGN's padded key
+        // count. A decoder step sees a variable number of keys (the cache
+        // grows, and cross-attention sees the source), so the design must be
+        // wide enough for the largest of them.
+        let widest = self.n_src.max(g.max_target).max(self.n_cached + 1);
+        let sc_cols = match eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+            Some(cols) => {
+                if cols < widest {
+                    return Err(format!(
+                        "the softmax design's score row is {cols} wide, but this decoder sees {widest} keys"
+                    ));
+                }
+                cols
+            }
+            None => widest,
+        };
+        let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
+        let attn_on = array.as_deref().is_some_and(|a| a.on_array());
+        if attn_on {
+            let attn_cols = array
+                .as_deref()
+                .and_then(|a| a.score_cols())
+                .unwrap_or(widest);
+            if attn_cols < widest {
+                return Err(format!(
+                    "the attention design's score row is {attn_cols} wide, but this decoder sees {widest} keys"
+                ));
+            }
+            if let Some(cols) = eltwise.as_deref().and_then(|e| e.softmax_cols()) {
+                if cols != attn_cols {
+                    return Err(format!(
+                        "the softmax design's score row is {cols} wide and the attention's is {attn_cols} wide"
+                    ));
+                }
+            }
+        }
+        let ln_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::LayerNorm));
+        let gelu_on = eltwise.as_deref().is_some_and(|e| e.on_array(EltOp::Gelu));
+        let sm_on = eltwise
+            .as_deref()
+            .is_some_and(|e| e.on_array(EltOp::Softmax));
+
+        if self.scratch.scores.len() < g.heads * sc_cols {
+            self.scratch.scores.resize(g.heads * sc_cols, 0.0);
+        }
+
         let DecoderScratch {
             h,
             norm,
@@ -676,6 +1030,10 @@ impl Decoder {
             scores,
             acc,
             logits: scratch_logits,
+            ln_params,
+            mask,
+            attn_qkv,
+            attn_ctx,
         } = &mut self.scratch;
 
         // embed_tokens + embed_positions, no norm in between: HF's decoder
@@ -692,138 +1050,204 @@ impl Decoder {
         // batch, so go through the same seam as the encoder.
         let threads = parallel::threads();
         for (l, layer) in self.layers.iter().enumerate() {
+            let names = &self.gemm_names[l];
             // ---- self-attention over the cache, one new row ----
-            layernorm_into(
-                &h[..d],
-                &mut norm[..d],
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
                 &layer.ln1_gamma,
                 &layer.ln1_beta,
+                h,
+                norm,
+                1,
+                d,
                 g.ln_eps,
-            );
-            kernels::gemm_nt_rows(
-                &norm[..d],
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[0],
+                norm,
                 1,
                 &layer.self_qkv,
                 d,
                 3 * d,
                 &layer.self_qkv_bias,
-                &mut qkv[..3 * d],
+                qkv,
                 threads,
-            );
+            )?;
             // The K|V half of the fused QKV joins the cache; the Q half is
             // this step's query.
             let cache = &mut self.self_kv[l];
             let n_kv = self.n_cached + 1;
             cache.extend_from_slice(&qkv[d..3 * d]);
-            attention_into(
-                &qkv[..3 * d],
-                3 * d,
+            let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
+            decoder_attention(
+                array.as_deref_mut(),
+                attn_on,
+                sm_on,
+                &qkv[..d],
                 cache,
                 2 * d,
-                1,
                 n_kv,
                 d,
                 g.heads,
                 g.head_dim,
                 scale,
                 &mut ctx[..d],
-                &mut scores[..n_kv],
-                &mut acc[..g.head_dim],
-            );
-            kernels::gemm_nt_rows(
-                &ctx[..d],
+                &mut scores[..g.heads * sc_cols],
+                sc_cols,
+                acc,
+                attn_qkv,
+                attn_ctx,
+                mask,
+                softmax,
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[1],
+                ctx,
                 1,
                 &layer.self_attn_out,
                 d,
                 d,
                 &layer.self_attn_out_bias,
-                &mut proj[..d],
+                proj,
                 threads,
-            );
+            )?;
             kernels::add_inplace(&mut h[..d], &proj[..d]);
 
             // ---- cross-attention over the encoder output ----
-            layernorm_into(
-                &h[..d],
-                &mut norm[..d],
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
                 &layer.ln2_gamma,
                 &layer.ln2_beta,
+                h,
+                norm,
+                1,
+                d,
                 g.ln_eps,
-            );
-            kernels::gemm_nt_rows(
-                &norm[..d],
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[2],
+                norm,
                 1,
                 &layer.cross_q,
                 d,
                 d,
                 &layer.cross_q_bias,
-                &mut qkv[..3 * d],
+                qkv,
                 threads,
-            );
+            )?;
             // The Q row is all this step needs from cross_q: its K|V half was
             // folded into a separate operand precisely so the two could be
             // fed from different A operands.
-            attention_into(
+            let softmax = if sm_on { eltwise.as_deref_mut() } else { None };
+            decoder_attention(
+                array.as_deref_mut(),
+                attn_on,
+                sm_on,
                 &qkv[..d],
-                d,
                 &self.cross_kv[l],
                 2 * d,
-                1,
                 self.n_src,
                 d,
                 g.heads,
                 g.head_dim,
                 scale,
                 &mut ctx[..d],
-                &mut scores[..self.n_src],
-                &mut acc[..g.head_dim],
-            );
-            kernels::gemm_nt_rows(
-                &ctx[..d],
+                &mut scores[..g.heads * sc_cols],
+                sc_cols,
+                acc,
+                attn_qkv,
+                attn_ctx,
+                mask,
+                softmax,
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[3],
+                ctx,
                 1,
                 &layer.cross_attn_out,
                 d,
                 d,
                 &layer.cross_attn_out_bias,
-                &mut proj[..d],
+                proj,
                 threads,
-            );
+            )?;
             kernels::add_inplace(&mut h[..d], &proj[..d]);
 
             // ---- feed-forward ----
-            layernorm_into(
-                &h[..d],
-                &mut norm[..d],
+            layernorm_seam(
+                eltwise.as_deref_mut(),
+                ln_on,
+                &mut ln_params[..2 * d],
                 &layer.ln3_gamma,
                 &layer.ln3_beta,
+                h,
+                norm,
+                1,
+                d,
                 g.ln_eps,
-            );
-            kernels::gemm_nt_rows(
-                &norm[..d],
+            )?;
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[4],
+                norm,
                 1,
                 &layer.ffn_up,
                 d,
                 g.dec_intermediate,
                 &layer.ffn_up_bias,
-                &mut up[..g.dec_intermediate],
+                up,
                 threads,
-            );
-            gelu_erf_rows(&mut up[..g.dec_intermediate]);
-            kernels::gemm_nt_rows(
-                &up[..g.dec_intermediate],
+            )?;
+            if gelu_on {
+                if let Some(backend) = eltwise.as_deref_mut() {
+                    backend
+                        .gelu(&mut up[..g.dec_intermediate])
+                        .map_err(|e| e.to_string())?;
+                }
+            } else {
+                gelu_erf_rows(&mut up[..g.dec_intermediate]);
+            }
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &names[5],
+                up,
                 1,
                 &layer.ffn_down,
                 g.dec_intermediate,
                 d,
                 &layer.ffn_down_bias,
-                &mut down[..d],
+                down,
                 threads,
-            );
+            )?;
             kernels::add_inplace(&mut h[..d], &down[..d]);
         }
 
         self.n_cached += 1;
-        layernorm_row(&mut h[..d], &self.final_gamma, &self.final_beta, g.ln_eps);
+        if ln_on {
+            if let Some(backend) = eltwise.as_deref_mut() {
+                ln_params[..d].copy_from_slice(&self.final_gamma);
+                ln_params[d..2 * d].copy_from_slice(&self.final_beta);
+                backend
+                    .layernorm(&ln_params[..2 * d], &mut h[..d], 1)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            layernorm_row(&mut h[..d], &self.final_gamma, &self.final_beta, g.ln_eps);
+        }
         logits_from_into(
             &h[..d],
             &self.embed_tokens,
@@ -911,6 +1335,8 @@ impl Decoder {
         prompt: &[i32],
         stop_id: i32,
         max_new: usize,
+        mut array: ArrayTextRef<'_, '_>,
+        mut eltwise: Option<&mut (dyn ArrayEltwise + '_)>,
     ) -> Result<Vec<i32>, String> {
         if prompt.is_empty() {
             return Err("whisper decoder: greedy() needs at least one prompt token (the control tokens are the model's own)".into());
@@ -925,7 +1351,14 @@ impl Decoder {
         self.reset();
         let mut next = 0;
         for (i, &token) in prompt.iter().enumerate() {
-            next = self.step(token, i, None, None)?;
+            next = self.step(
+                token,
+                i,
+                None,
+                None,
+                array.as_deref_mut(),
+                eltwise.as_deref_mut(),
+            )?;
             if next == stop_id {
                 return Ok(Vec::new());
             }
@@ -939,7 +1372,14 @@ impl Decoder {
                 break;
             };
             let position = self.n_cached;
-            out.push(self.step(token, position, None, None)?);
+            out.push(self.step(
+                token,
+                position,
+                None,
+                None,
+                array.as_deref_mut(),
+                eltwise.as_deref_mut(),
+            )?);
         }
         if out.last() == Some(&stop_id) {
             out.pop();
@@ -1061,11 +1501,9 @@ pub fn layernorm_rows(
     eps: f64,
 ) {
     let dst = &mut dst[..rows * width];
-    let Some(chunk) = parallel::chunk_rows(
-        rows,
-        (rows as i64) * (width as i64),
-        parallel::threads(),
-    ) else {
+    let Some(chunk) =
+        parallel::chunk_rows(rows, (rows as i64) * (width as i64), parallel::threads())
+    else {
         for i in 0..rows {
             layernorm_into(
                 &src[i * width..][..width],
@@ -1080,13 +1518,7 @@ pub fn layernorm_rows(
     parallel::for_each_chunk_mut(dst, chunk * width, |ci, part| {
         let first = ci * chunk;
         for (i, row) in part.chunks_exact_mut(width).enumerate() {
-            layernorm_into(
-                &src[(first + i) * width..][..width],
-                row,
-                gamma,
-                beta,
-                eps,
-            );
+            layernorm_into(&src[(first + i) * width..][..width], row, gamma, beta, eps);
         }
     });
 }
@@ -1101,11 +1533,9 @@ pub fn layernorm_rows_inplace(
     eps: f64,
 ) {
     let x = &mut x[..rows * width];
-    let Some(chunk) = parallel::chunk_rows(
-        rows,
-        (rows as i64) * (width as i64),
-        parallel::threads(),
-    ) else {
+    let Some(chunk) =
+        parallel::chunk_rows(rows, (rows as i64) * (width as i64), parallel::threads())
+    else {
         for row in x.chunks_exact_mut(width) {
             layernorm_row(row, gamma, beta, eps);
         }
@@ -1225,8 +1655,21 @@ pub fn attention_into(
             let mut scores = kernels::scratch_f32(n_kv);
             let mut acc = kernels::scratch_f32(head_dim);
             attention_rows(
-                q, q_stride, kv, kv_stride, first, rows, n_kv, d_model, 0, heads,
-                head_dim, scale, part, &mut scores, &mut acc,
+                q,
+                q_stride,
+                kv,
+                kv_stride,
+                first,
+                rows,
+                n_kv,
+                d_model,
+                0,
+                heads,
+                head_dim,
+                scale,
+                part,
+                &mut scores,
+                &mut acc,
             );
         });
         return;
@@ -1244,8 +1687,21 @@ pub fn attention_into(
                 let mut scores = kernels::scratch_f32(n_kv);
                 let mut acc = kernels::scratch_f32(head_dim);
                 attention_rows(
-                    q, q_stride, kv, kv_stride, 0, 1, n_kv, d_model, first,
-                    first + count, head_dim, scale, part, &mut scores, &mut acc,
+                    q,
+                    q_stride,
+                    kv,
+                    kv_stride,
+                    0,
+                    1,
+                    n_kv,
+                    d_model,
+                    first,
+                    first + count,
+                    head_dim,
+                    scale,
+                    part,
+                    &mut scores,
+                    &mut acc,
                 );
             });
             return;
@@ -1255,9 +1711,86 @@ pub fn attention_into(
     // Too small for a worker: the barrier costs more than the arithmetic.
     // The caller's reusable scratch is used only on this path.
     attention_rows(
-        q, q_stride, kv, kv_stride, 0, n_q, n_kv, d_model, 0, heads, head_dim,
-        scale, out, &mut scores[..n_kv], &mut acc[..head_dim],
+        q,
+        q_stride,
+        kv,
+        kv_stride,
+        0,
+        n_q,
+        n_kv,
+        d_model,
+        0,
+        heads,
+        head_dim,
+        scale,
+        out,
+        &mut scores[..n_kv],
+        &mut acc[..head_dim],
     );
+}
+
+/// The attention with the softmax on the array but its two GEMMs on the host.
+///
+/// The array's softmax normalises a row of the DESIGN's width -- the padded
+/// key count -- so the scores have to be laid out at that width even though
+/// the host computed them. Padding columns start at -1e30 and exponentiate to
+/// zero. The host-only [`attention_into`] is untouched by this path.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_eltwise_into(
+    q: &[f32],
+    q_stride: usize,
+    kv: &[f32],
+    kv_stride: usize,
+    n_q: usize,
+    n_kv: usize,
+    d_model: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+    scores: &mut [f32],
+    cols: usize,
+    acc: &mut [f32],
+    softmax: &mut (dyn ArrayEltwise + '_),
+) -> Result<(), String> {
+    if n_q == 0 || n_kv == 0 || heads == 0 {
+        return Ok(());
+    }
+    if cols < n_kv {
+        return Err(format!(
+            "the softmax design's score row is {cols} wide, but this attention reads {n_kv} keys"
+        ));
+    }
+    let rows = n_q * heads;
+    for i in 0..n_q {
+        for h in 0..heads {
+            let row = &mut scores[(i * heads + h) * cols..][..cols];
+            row.fill(-1e30);
+            for (j, slot) in row[..n_kv].iter_mut().enumerate() {
+                let qh = &q[i * q_stride + h * head_dim..][..head_dim];
+                let kj = &kv[j * kv_stride + h * head_dim..][..head_dim];
+                *slot = kernels::dot8(qh, kj) * scale;
+            }
+        }
+    }
+    softmax
+        .softmax(&mut scores[..rows * cols], rows)
+        .map_err(|e| e.to_string())?;
+    let out = &mut out[..n_q * d_model];
+    let acc = &mut acc[..head_dim];
+    for i in 0..n_q {
+        for h in 0..heads {
+            let row = &scores[(i * heads + h) * cols..][..n_kv];
+            let o = &mut out[i * d_model + h * head_dim..][..head_dim];
+            acc.fill(0.0);
+            for (j, &a) in row.iter().enumerate() {
+                let vj = &kv[j * kv_stride + d_model + h * head_dim..][..head_dim];
+                kernels::weighted_accumulate(acc, vj, a);
+            }
+            o.copy_from_slice(acc);
+        }
+    }
+    Ok(())
 }
 
 /// One slice of attention: queries `i0..i0+rows`, heads `h0..h1`.
@@ -1328,6 +1861,12 @@ fn attention_rows(
     }
 }
 
+/// A GEMM operand: F32 rows in a host container, de-tiled BF16 panels in one
+/// packed for the array. The same forward pass runs on both.
+fn operand(container: &Container, name: &str) -> Result<Vec<f32>, String> {
+    super::operand::read_operand(container, name)
+}
+
 /// A tensor's values.
 fn tensor(container: &Container, name: &str) -> Result<Vec<f32>, String> {
     let bytes = container
@@ -1378,6 +1917,7 @@ pub fn front_end(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use npum_model::array::{ArrayAttention, ArrayGemm};
 
     /// Deterministic, non-trivial f32 data in [-1, 1].
     fn noise(len: usize, seed: u32) -> Vec<f32> {
@@ -1485,6 +2025,12 @@ mod tests {
         let d = g.d_model;
         let encoder = Encoder {
             layers: vec![encoder_layer(&g, 10)],
+            gemm_names: vec![[
+                "encoder.layers.0.qkv".into(),
+                "encoder.layers.0.attn_out".into(),
+                "encoder.layers.0.ffn_up".into(),
+                "encoder.layers.0.ffn_down".into(),
+            ]],
             geometry: g.clone(),
             embed_positions: noise(g.max_seq * d, 20),
             final_gamma: noise(d, 21).iter().map(|v| v.abs() + 0.5).collect(),
@@ -1495,8 +2041,10 @@ mod tests {
         // Reuse at the same shape, then at a smaller one (the buffers shrink),
         // then back to the first shape.
         for &n_src in &[8usize, 8, 4, 8] {
-            let want = encoder.run(&conv[..n_src * d], n_src);
-            let got = encoder.run_into(&conv[..n_src * d], n_src, &mut ws);
+            let want = encoder.run(&conv[..n_src * d], n_src, None, None).unwrap();
+            let got = encoder
+                .run_into(&conv[..n_src * d], n_src, &mut ws, None, None)
+                .unwrap();
             assert_eq!(got, want.as_slice(), "n_src = {n_src}");
         }
     }
@@ -1533,6 +2081,14 @@ mod tests {
         Decoder {
             geometry: g.clone(),
             layers: vec![decoder_layer(g, 40)],
+            gemm_names: vec![[
+                "decoder.layers.0.self_qkv".into(),
+                "decoder.layers.0.self_attn_out".into(),
+                "decoder.layers.0.cross_q".into(),
+                "decoder.layers.0.cross_attn_out".into(),
+                "decoder.layers.0.ffn_up".into(),
+                "decoder.layers.0.ffn_down".into(),
+            ]],
             embed_positions: noise(g.max_target * d, 50),
             embed_tokens: noise(g.vocab * d, 51),
             final_gamma: noise(d, 52).iter().map(|v| v.abs() + 0.5).collect(),
@@ -1565,16 +2121,194 @@ mod tests {
             let mut h_fresh = Vec::new();
             let mut lg_fresh = Vec::new();
             let next_fresh = fresh
-                .step(token, pos, Some(&mut h_fresh), Some(&mut lg_fresh))
+                .step(
+                    token,
+                    pos,
+                    Some(&mut h_fresh),
+                    Some(&mut lg_fresh),
+                    None,
+                    None,
+                )
                 .unwrap();
             let mut h_reused = Vec::new();
             let mut lg_reused = Vec::new();
             let next_reused = reused
-                .step(token, pos, Some(&mut h_reused), Some(&mut lg_reused))
+                .step(
+                    token,
+                    pos,
+                    Some(&mut h_reused),
+                    Some(&mut lg_reused),
+                    None,
+                    None,
+                )
                 .unwrap();
             assert_eq!(next_reused, next_fresh, "position {pos}");
             assert_eq!(h_reused, h_fresh, "hidden at position {pos}");
             assert_eq!(lg_reused, lg_fresh, "logits at position {pos}");
         }
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// What the family asked the array to do, recorded by the mocks below.
+    #[derive(Default)]
+    struct SeamLog {
+        gemms: Vec<String>,
+        attention: usize,
+        ln: usize,
+        gelu: usize,
+        softmax: usize,
+    }
+
+    struct MockText {
+        log: Rc<RefCell<SeamLog>>,
+        cols: usize,
+    }
+
+    impl ArrayGemm for MockText {
+        fn name(&self) -> &'static str {
+            "mock-array"
+        }
+        fn gemm_on_array(&self) -> bool {
+            true
+        }
+        fn dispatches(&self) -> usize {
+            self.log.borrow().gemms.len()
+        }
+        fn staged_bytes(&self) -> usize {
+            0
+        }
+        fn gemm(
+            &mut self,
+            weight: &str,
+            _a: &[f32],
+            _rows: usize,
+            _k: usize,
+            _n: usize,
+            _bias: Option<&[f32]>,
+            out: &mut [f32],
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().gemms.push(weight.to_string());
+            out.fill(0.0);
+            Ok(())
+        }
+    }
+
+    impl ArrayAttention for MockText {
+        fn name(&self) -> &'static str {
+            "mock-array"
+        }
+        fn on_array(&self) -> bool {
+            true
+        }
+        fn score_cols(&self) -> Option<usize> {
+            Some(self.cols)
+        }
+        fn attn_dispatches(&self) -> usize {
+            self.log.borrow().attention
+        }
+        fn attn_seconds(&self) -> (f64, f64) {
+            (0.0, 0.0)
+        }
+        fn attention(
+            &mut self,
+            _qkv: &[f32],
+            _shape: AttentionShape,
+            _mask: &[f32],
+            _softmax: Option<&mut (dyn ArrayEltwise + '_)>,
+            ctx: &mut [f32],
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().attention += 1;
+            ctx.fill(0.0);
+            Ok(())
+        }
+    }
+
+    impl ArrayText for MockText {}
+
+    struct MockEltwise {
+        log: Rc<RefCell<SeamLog>>,
+        cols: usize,
+    }
+
+    impl ArrayEltwise for MockEltwise {
+        fn on_array(&self, _op: EltOp) -> bool {
+            true
+        }
+        fn layernorm(
+            &mut self,
+            _params: &[f32],
+            _x: &mut [f32],
+            _n_rows: usize,
+        ) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().ln += 1;
+            Ok(())
+        }
+        fn gelu(&mut self, _x: &mut [f32]) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().gelu += 1;
+            Ok(())
+        }
+        fn softmax(&mut self, _x: &mut [f32], _n_rows: usize) -> npum_model::array::Result<()> {
+            self.log.borrow_mut().softmax += 1;
+            Ok(())
+        }
+        fn softmax_cols(&self) -> Option<usize> {
+            Some(self.cols)
+        }
+        fn dispatches(&self) -> usize {
+            let l = self.log.borrow();
+            l.ln + l.gelu + l.softmax
+        }
+    }
+
+    #[test]
+    fn the_encoder_dispatches_the_dense_seams() {
+        let g = geometry();
+        let d = g.d_model;
+        let encoder = Encoder {
+            layers: vec![encoder_layer(&g, 10)],
+            gemm_names: vec![[
+                "encoder.layers.0.qkv".into(),
+                "encoder.layers.0.attn_out".into(),
+                "encoder.layers.0.ffn_up".into(),
+                "encoder.layers.0.ffn_down".into(),
+            ]],
+            geometry: g.clone(),
+            embed_positions: noise(g.max_seq * d, 20),
+            final_gamma: noise(d, 21).iter().map(|v| v.abs() + 0.5).collect(),
+            final_beta: noise(d, 22),
+        };
+        let conv = noise(g.max_seq * d, 30);
+        let log = Rc::new(RefCell::new(SeamLog::default()));
+        let mut text = MockText {
+            log: log.clone(),
+            cols: g.max_seq,
+        };
+        let mut eltwise = MockEltwise {
+            log: log.clone(),
+            cols: g.max_seq,
+        };
+
+        encoder
+            .run(&conv, g.max_seq, Some(&mut text), Some(&mut eltwise))
+            .expect("the array path runs");
+
+        let recorded = log.borrow();
+        assert_eq!(
+            recorded.gemms,
+            [
+                "encoder.layers.0.qkv",
+                "encoder.layers.0.attn_out",
+                "encoder.layers.0.ffn_up",
+                "encoder.layers.0.ffn_down"
+            ]
+        );
+        assert_eq!(recorded.attention, 1);
+        assert!(recorded.ln >= 3, "ln1, ln2 and the final norm");
+        assert_eq!(recorded.gelu, 1);
+        // The array's attention owns the softmax; the eltwise softmax is not
+        // dispatched a second time.
+        assert_eq!(recorded.softmax, 0);
     }
 }
