@@ -346,3 +346,60 @@ fn vit_head_reuses_the_qkv_stream() {
     eprintln!("ViT head: 1 - cos = {distance:.4e}, argmax {} / {}", argmax(&want), argmax(&got));
     assert!(distance <= 1e-3, "1 - cos = {distance:.4e}");
 }
+
+/// Whisper's conv1/conv2 on the encoder set's own streams, against the
+/// original fp32 convolution kernels on the SAME mel spectrogram.
+#[test]
+fn whisper_conv_streams_match_the_host() {
+    use npum_model::array::ArrayAudioConv;
+
+    if !board_present() {
+        return;
+    }
+    let Some(path) = container("NPUEMBEDDINGS_WHISPER_NPU") else {
+        return;
+    };
+    let audio = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/parity/fixtures/tone.wav");
+    let samples = npum_cpu::whisper_features::read_wav(&audio).expect("the WAV decodes").samples;
+    let file = npum_format::Container::open(&path).expect("the container opens");
+    let f32_tensor = |name: &str| -> Vec<f32> {
+        file.tensor_bytes(name)
+            .expect("the front end weight")
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let (mel, _) = npum_cpu::whisper_features::log_mel_30s_with_frontend(&samples, 80, None)
+        .expect("the host mel");
+    let hidden = 512usize;
+    let w1 = f32_tensor("frontend.conv1.weight");
+    let b1 = f32_tensor("frontend.conv1.bias");
+    let w2 = f32_tensor("frontend.conv2.weight");
+    let b2 = f32_tensor("frontend.conv2.bias");
+    let want = npum_cpu::whisper_features::conv_front_end(&mel, &w1, &b1, &w2, &b2, hidden);
+
+    let root = std::env::var("NPU_ARTIFACTS").ok().map(PathBuf::from);
+    let opts = args("conv", root.as_deref());
+    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let geometry = npuembeddings_cli::stt::read_geometry(&file, &path).expect("the geometry");
+    let mut array = npu::open_array_text_specs(
+        &file,
+        &path,
+        &root_dir,
+        &opts,
+        npuembeddings_cli::stt::encoder_specs(&geometry),
+        "gemm_rtp",
+    )
+    .expect("the conv design opens");
+    assert!(ArrayAudioConv::conv_on_array(array.as_ref()));
+    let got = npum_cpu::whisper_features::conv_front_end_with(
+        &mel, &w1, &b1, &w2, &b2, hidden, Some(&mut *array), true,
+    );
+    assert!(ArrayAudioConv::conv_dispatches(array.as_ref()) > 0);
+    assert_eq!(want.len(), got.len());
+    let num = want.iter().zip(&got).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum::<f64>();
+    let den = want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+    let rel = (num / den).sqrt();
+    eprintln!("conv: relative error = {rel:.4e}, {} dispatches", ArrayAudioConv::conv_dispatches(array.as_ref()));
+    assert!(rel <= 2e-2, "relative error = {rel:.4e}");
+}

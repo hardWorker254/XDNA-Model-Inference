@@ -158,6 +158,18 @@ struct HeadStream {
     num_labels: usize,
 }
 
+/// Whisper's two convolutions, staged into existing encoder streams.
+#[derive(Debug, Default)]
+struct AudioConvStreams {
+    conv1: Option<BakedStream>,
+    conv2: Option<BakedStream>,
+    a1: Vec<f32>,
+    a2: Vec<f32>,
+    c1: Vec<f32>,
+    c2: Vec<f32>,
+    dispatches: usize,
+}
+
 /// One projection the array will run.
 #[derive(Debug, Clone)]
 pub struct GemmSpec {
@@ -289,6 +301,8 @@ pub struct ArrayGemms<T: Transport> {
     head: Option<HeadStream>,
     /// Head dispatches are counted separately from GEMM dispatches.
     head_dispatches: usize,
+    /// Whisper's conv1/conv2 panels and scratch.
+    audio_conv: AudioConvStreams,
 }
 
 /// Stage a host-generated B operand (twiddles or the mel bank) in the
@@ -410,6 +424,7 @@ impl<T: Transport> ArrayGemms<T> {
         attention: bool,
         logit: bool,
         head: bool,
+        conv: bool,
     ) -> Result<Self, DesignError> {
         let file = Container::open(container).map_err(|e| {
             DesignError::Design(format!("cannot open {}: {e}", container.display()))
@@ -573,6 +588,82 @@ impl<T: Transport> ArrayGemms<T> {
             }
         }
 
+        // WHISPER'S AUDIO CONVOLUTIONS.
+        //
+        // Conv1d weights are [cout, cin, 3]. For one output frame the
+        // reduction is a flat (cin*3)-wide vector, so a convolution is a
+        // GEMM against a generated B panel. The encoder set already has
+        // streams of the right shapes: attn_out [512,512] and ffn_down
+        // [2048,512]. No new xclbin is compiled.
+        let mut audio_conv = AudioConvStreams::default();
+        if conv {
+            let hidden = file.config().get_i64("d_model").ok_or_else(|| {
+                DesignError::Design("the container has no d_model for the convolutions".to_string())
+            })? as usize;
+            let n_mels = file.config().get_i64("num_mel_bins").ok_or_else(|| {
+                DesignError::Design("the container has no num_mel_bins for the convolutions".to_string())
+            })? as usize;
+            let pick = |op: &str, k_need: usize| -> Option<BakedStream> {
+                streams
+                    .iter()
+                    .filter(|st| st.op == op && st.k as usize >= k_need && st.n as usize >= hidden)
+                    .max_by_key(|st| st.m)
+                    .map(|st| BakedStream {
+                        slot: st.slot as usize,
+                        m: st.m as usize,
+                        k: st.k as usize,
+                        n: st.n as usize,
+                        weight_slot: 0,
+                    })
+            };
+            let c1 = pick("attn_out", 3 * n_mels).ok_or_else(|| {
+                DesignError::Design(format!(
+                    "{}: no attn_out stream can carry conv1's {}x{} convolution",
+                    container.display(),
+                    3 * n_mels,
+                    hidden
+                ))
+            })?;
+            let c2 = pick("ffn_down", 3 * hidden).ok_or_else(|| {
+                DesignError::Design(format!(
+                    "{}: no ffn_down stream can carry conv2's {}x{} convolution",
+                    container.display(),
+                    3 * hidden,
+                    hidden
+                ))
+            })?;
+            let w1 = read_f32_tensor(&file, "frontend.conv1.weight", container)?;
+            let w2 = read_f32_tensor(&file, "frontend.conv2.weight", container)?;
+            let mut panel = |weight: &[f32], cin: usize, stream: &BakedStream| -> Result<usize, DesignError> {
+                if weight.len() < hidden * cin * 3 {
+                    return Err(DesignError::Design(format!(
+                        "a convolution weight holds {} floats and needs {}",
+                        weight.len(),
+                        hidden * cin * 3
+                    )));
+                }
+                let mut dense = vec![0.0f32; stream.k * stream.n];
+                for o in 0..hidden {
+                    for c in 0..cin {
+                        for tap in 0..3 {
+                            dense[(c * 3 + tap) * stream.n + o] = weight[(o * cin + c) * 3 + tap];
+                        }
+                    }
+                }
+                stage_frontend_b(&mut design, &dense, stream.k, stream.n)
+            };
+            let mut c1 = c1;
+            let mut c2 = c2;
+            c1.weight_slot = panel(&w1, n_mels, &c1)?;
+            c2.weight_slot = panel(&w2, hidden, &c2)?;
+            audio_conv.a1 = vec![0.0f32; c1.m * c1.k];
+            audio_conv.a2 = vec![0.0f32; c2.m * c2.k];
+            audio_conv.c1 = vec![0.0f32; c1.m * c1.n];
+            audio_conv.c2 = vec![0.0f32; c2.m * c2.n];
+            audio_conv.conv1 = Some(c1);
+            audio_conv.conv2 = Some(c2);
+        }
+
         // THE ViT CLASSIFIER HEAD.
         //
         // 1000 labels are not a legal B-panel width, but the set's `qkv`
@@ -705,7 +796,7 @@ impl<T: Transport> ArrayGemms<T> {
             logits.out = vec![0.0f32; logits.chunks[0].stream.m * logits.chunks[0].stream.n];
         }
 
-        if panels.is_empty() && !attention && frontend.dft.is_none() && frontend.mel.is_none() && logits.chunks.is_empty() && head_stream.is_none() {
+        if panels.is_empty() && !attention && frontend.dft.is_none() && frontend.mel.is_none() && logits.chunks.is_empty() && head_stream.is_none() && audio_conv.conv1.is_none() {
             return Err(DesignError::Design(format!(
                 "{}: the array was asked for and no projection could be staged.",
                 container.display()
@@ -743,6 +834,7 @@ impl<T: Transport> ArrayGemms<T> {
             logits,
             head: head_stream,
             head_dispatches: 0,
+            audio_conv,
         })
     }
 
@@ -1489,6 +1581,84 @@ impl<T: Transport> npum_model::array::ArrayHead for ArrayGemms<T> {
     }
 }
 
+impl<T: Transport> npum_model::array::ArrayAudioConv for ArrayGemms<T> {
+    fn conv_on_array(&self) -> bool {
+        self.audio_conv.conv1.is_some() && self.audio_conv.conv2.is_some()
+    }
+
+    fn conv_dispatches(&self) -> usize {
+        self.audio_conv.dispatches
+    }
+
+    fn conv1_k(&self) -> usize {
+        self.audio_conv.conv1.map(|s| s.k).unwrap_or(0)
+    }
+
+    fn conv2_k(&self) -> usize {
+        self.audio_conv.conv2.map(|s| s.k).unwrap_or(0)
+    }
+
+    fn conv1_gemm(&mut self, a: &[f32], frames: usize, out: &mut [f32]) -> npum_model::array::Result<()> {
+        let stream = self.audio_conv.conv1.ok_or_else(|| {
+            npum_model::array::ArrayError("this design has no conv1 stream".to_string())
+        })?;
+        if a.len() < frames * stream.k || out.len() < frames * stream.n {
+            return Err(npum_model::array::ArrayError(format!(
+                "conv1 needs {} input and {} output floats, got {} and {}",
+                frames * stream.k, frames * stream.n, a.len(), out.len()
+            )));
+        }
+        let mut a1 = std::mem::take(&mut self.audio_conv.a1);
+        let mut c1 = std::mem::take(&mut self.audio_conv.c1);
+        let mut done = 0usize;
+        while done < frames {
+            let take = stream.m.min(frames - done);
+            a1[..take * stream.k].copy_from_slice(&a[done * stream.k..(done + take) * stream.k]);
+            self.baked(stream, &a1, take, &mut c1)
+                .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+            for i in 0..take {
+                out[(done + i) * stream.n..(done + i + 1) * stream.n]
+                    .copy_from_slice(&c1[i * stream.n..(i + 1) * stream.n]);
+            }
+            self.audio_conv.dispatches += 1;
+            done += take;
+        }
+        self.audio_conv.a1 = a1;
+        self.audio_conv.c1 = c1;
+        Ok(())
+    }
+
+    fn conv2_gemm(&mut self, a: &[f32], frames: usize, out: &mut [f32]) -> npum_model::array::Result<()> {
+        let stream = self.audio_conv.conv2.ok_or_else(|| {
+            npum_model::array::ArrayError("this design has no conv2 stream".to_string())
+        })?;
+        if a.len() < frames * stream.k || out.len() < frames * stream.n {
+            return Err(npum_model::array::ArrayError(format!(
+                "conv2 needs {} input and {} output floats, got {} and {}",
+                frames * stream.k, frames * stream.n, a.len(), out.len()
+            )));
+        }
+        let mut a2 = std::mem::take(&mut self.audio_conv.a2);
+        let mut c2 = std::mem::take(&mut self.audio_conv.c2);
+        let mut done = 0usize;
+        while done < frames {
+            let take = stream.m.min(frames - done);
+            a2[..take * stream.k].copy_from_slice(&a[done * stream.k..(done + take) * stream.k]);
+            self.baked(stream, &a2, take, &mut c2)
+                .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+            for i in 0..take {
+                out[(done + i) * stream.n..(done + i + 1) * stream.n]
+                    .copy_from_slice(&c2[i * stream.n..(i + 1) * stream.n]);
+            }
+            self.audio_conv.dispatches += 1;
+            done += take;
+        }
+        self.audio_conv.a2 = a2;
+        self.audio_conv.c2 = c2;
+        Ok(())
+    }
+}
+
 impl<T: Transport> npum_model::array::ArrayText for ArrayGemms<T> {}
 
 #[cfg(test)]
@@ -1699,6 +1869,7 @@ mod int8_tests {
                 k: 4,
                 n: 2,
             }],
+            false,
             false,
             false,
             false,
@@ -1931,6 +2102,7 @@ mod async_tests {
                 logits: LogitStreams::default(),
                 head: None,
                 head_dispatches: 0,
+                audio_conv: AudioConvStreams::default(),
             },
             log,
         )

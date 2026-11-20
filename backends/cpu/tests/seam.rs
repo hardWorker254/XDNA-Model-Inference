@@ -284,6 +284,7 @@ impl npum_model::array::ArrayAttention for Dense {
 impl ArrayText for Dense {}
 impl ArrayLogits for Dense {}
 impl npum_model::array::ArrayHead for Dense {}
+impl npum_model::array::ArrayAudioConv for Dense {}
 use npum_model::array::ArrayFrontend;
 impl ArrayFrontend for Dense {}
 

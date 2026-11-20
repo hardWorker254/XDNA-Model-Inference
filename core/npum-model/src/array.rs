@@ -507,6 +507,46 @@ pub trait ArrayHead {
     }
 }
 
+/// Whisper's two audio convolutions, expressed as GEMMs on the encoder set's
+/// existing streams.
+///
+/// conv1 is `[frames, 3*n_mels] x [3*n_mels, hidden]` and conv2 is
+/// `[frames, 3*hidden] x [3*hidden, hidden]`; both B panels are generated
+/// from the Conv1d weights and staged like the front end's. The host gathers
+/// the windowed A rows and applies bias + GELU -- the design has no epilogue.
+/// Defaults fail closed.
+pub trait ArrayAudioConv {
+    fn conv_on_array(&self) -> bool {
+        false
+    }
+
+    fn conv_dispatches(&self) -> usize {
+        0
+    }
+
+    /// The reduction width the staged conv panels were compiled for.
+    fn conv1_k(&self) -> usize {
+        0
+    }
+
+    /// The reduction width of conv2's panel.
+    fn conv2_k(&self) -> usize {
+        0
+    }
+
+    fn conv1_gemm(&mut self, _a: &[f32], _frames: usize, _out: &mut [f32]) -> Result<()> {
+        Err(ArrayError(
+            "this array backend cannot dispatch Whisper's conv1".to_string(),
+        ))
+    }
+
+    fn conv2_gemm(&mut self, _a: &[f32], _frames: usize, _out: &mut [f32]) -> Result<()> {
+        Err(ArrayError(
+            "this array backend cannot dispatch Whisper's conv2".to_string(),
+        ))
+    }
+}
+
 /// The attention's own shape.
 ///
 /// The family knows it and the array's side needs it, and it is one struct
@@ -610,4 +650,4 @@ pub trait ArrayAttention {
 ///
 /// So the family holds ONE handle, and this trait is it: the two traits'
 /// operations, on one object.
-pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend + ArrayLogits + ArrayHead {}
+pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend + ArrayLogits + ArrayHead + ArrayAudioConv {}

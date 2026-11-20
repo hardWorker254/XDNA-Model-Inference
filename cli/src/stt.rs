@@ -157,6 +157,7 @@ pub struct Places {
     pub gelu: bool,
     pub softm: bool,
     pub logit: bool,
+    pub conv: bool,
 }
 
 impl Places {
@@ -171,6 +172,7 @@ impl Places {
             gelu: false,
             softm: false,
             logit: false,
+            conv: false,
         }
     }
 
@@ -184,6 +186,7 @@ impl Places {
             || self.gelu
             || self.softm
             || self.logit
+            || self.conv
     }
 }
 
@@ -224,6 +227,7 @@ pub fn places(
         gelu: crate::npu::wants_op(args, "gelu") && elt("gelu"),
         softm: crate::npu::wants_op(args, "softm") && elt("softmax"),
         logit: crate::npu::wants_op(args, "logit") && logit_present("logits_0"),
+        conv: crate::npu::wants_op(args, "conv") && enc,
     }
 }
 
@@ -386,8 +390,12 @@ pub fn print_block(
     );
     row(
         "conv1, conv2",
-        "host",
-        "fp32, d^2 MACs; --npu-ops conv sends it to the array",
+        if places.conv { "npu" } else { "host" },
+        if places.conv {
+            "windowed A rows gathered on the host; generated bf16 panels reuse attn_out and ffn_down"
+        } else {
+            "fp32, d^2 MACs; --npu-ops conv sends it to the array"
+        },
     );
     let enc_ops = encoder.map(|d| d.gemm_ops.join(", ")).unwrap_or_default();
     let enc_rows = encoder.map(|d| d.rows).unwrap_or(0);
@@ -656,7 +664,8 @@ pub fn run(
         || crate::npu::wants_op(args, "attn")
         || crate::npu::wants_op(args, "fft")
         || crate::npu::wants_op(args, "mproj")
-        || crate::npu::wants_op(args, "logit");
+        || crate::npu::wants_op(args, "logit")
+        || crate::npu::wants_op(args, "conv");
     let decode_dense = crate::npu::wants_op(args, "gemm")
         || crate::npu::wants_op(args, "attn")
         || crate::npu::wants_op(args, "logit");
@@ -892,7 +901,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         if let Some(reason) = crate::families::refuse_array_not_ported(
             npum_families::Family::Stt,
             args,
-            &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit"],
+            &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit", "conv"],
         ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;

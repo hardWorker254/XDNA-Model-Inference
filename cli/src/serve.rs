@@ -43,7 +43,8 @@ fn open_stt_xdna(
         || crate::npu::wants_op(args, "logit");
     let dense = decode_dense
         || crate::npu::wants_op(args, "fft")
-        || crate::npu::wants_op(args, "mproj");
+        || crate::npu::wants_op(args, "mproj")
+        || crate::npu::wants_op(args, "conv");
     let elt = ["layn", "gelu", "softm"]
         .iter()
         .any(|code| crate::npu::wants_op(args, code));
@@ -287,7 +288,7 @@ pub fn serve(
                 &["gemm", "attn", "layn", "gelu", "softm"]
             }
         }
-        npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit"],
+        npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit", "conv"],
         npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv", "logit"],
         // PoseDetector now takes the same ArrayConvs seam the CLI uses.
         // Hands/MpPose/Ocr have no HTTP engine in this tree, so they keep

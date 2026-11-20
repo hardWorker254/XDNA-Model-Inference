@@ -249,14 +249,16 @@ pub fn transcribe_samples(
     transcript.text = String::from_utf8_lossy(&bytes).into_owned();
     // THE DISPATCH COUNT IS READ FROM THE BACKENDS, not from the flags: a run
     // that asked for the array and dispatched nothing must report zero.
-    transcript.n_dispatches = array_enc
-        .as_deref()
-        .map(|a| a.dispatches() as i64 + a.attn_dispatches() as i64)
-        .unwrap_or(0)
-        + array_dec
-            .as_deref()
-            .map(|a| a.dispatches() as i64 + a.attn_dispatches() as i64)
-            .unwrap_or(0)
+    let dispatches = |a: &dyn npum_model::array::ArrayText| {
+        a.dispatches() as i64
+            + a.attn_dispatches() as i64
+            + a.frontend_dispatches() as i64
+            + a.logit_dispatches() as i64
+            + a.head_dispatches() as i64
+            + a.conv_dispatches() as i64
+    };
+    transcript.n_dispatches = array_enc.as_deref().map(&dispatches).unwrap_or(0)
+        + array_dec.as_deref().map(&dispatches).unwrap_or(0)
         + eltwise
             .as_deref()
             .map(|e| e.dispatches() as i64)
@@ -299,6 +301,7 @@ fn run_window(
     // encoder's design set. The same handle serves both; a design without
     // them leaves the pass on the host (the codes were refused by name
     // before this run if the user asked for them).
+    let conv_on = array_enc.as_deref().is_some_and(|a| a.conv_on_array());
     let frontend: Option<&mut (dyn npum_model::array::ArrayFrontend + '_)> =
         array_enc.as_deref_mut().map(|a| a as &mut dyn npum_model::array::ArrayFrontend);
     let (mel, _used) = crate::whisper_features::log_mel_30s_with_frontend(
@@ -309,13 +312,17 @@ fn run_window(
     transcript.mel_seconds += mel_start.elapsed().as_secs_f64();
 
     let conv_start = std::time::Instant::now();
-    let conv = crate::whisper_features::conv_front_end(
+    let audio_conv: Option<&mut (dyn npum_model::array::ArrayAudioConv + '_)> =
+        array_enc.as_deref_mut().map(|a| a as &mut dyn npum_model::array::ArrayAudioConv);
+    let conv = crate::whisper_features::conv_front_end_with(
         &mel,
         &weights.conv1_weight,
         &weights.conv1_bias,
         &weights.conv2_weight,
         &weights.conv2_bias,
         geometry.d_model,
+        audio_conv,
+        conv_on,
     );
     transcript.conv_seconds += conv_start.elapsed().as_secs_f64();
 

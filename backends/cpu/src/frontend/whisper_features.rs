@@ -51,7 +51,7 @@
 //! FLIPPED and starting AFTER the data.
 
 use crate::parallel;
-use npum_model::array::ArrayFrontend;
+use npum_model::array::{ArrayAudioConv, ArrayFrontend};
 use std::path::Path;
 
 /// Whisper's own numbers. 30 s at 16 kHz is 480000 samples; / 160 is
@@ -906,6 +906,95 @@ pub fn conv_front_end(
     // Permute to (T2, hidden): Conv1d is channels-first, the encoder's GEMM
     // is rows-are-tokens. Doing it here means the encoder never sees a
     // transposed operand.
+    let mut out = vec![0.0f32; t2 * hidden];
+    for o in 0..hidden {
+        for frame in 0..t2 {
+            out[frame * hidden + o] = h2[o * t2 + frame];
+        }
+    }
+    out
+}
+
+/// The front end's convolutions, with the array's GEMM seam when asked.
+///
+/// The host gathers the windowed activation rows (the design has no
+/// im2col), the array multiplies by the generated bf16 panels, and the host
+/// adds the Conv1d bias and applies the SAME exact-erf GELU as the host
+/// path. `None` runs the original convolution kernels unchanged.
+pub fn conv_front_end_with(
+    mel: &MelSpec,
+    w1: &[f32],
+    b1: &[f32],
+    w2: &[f32],
+    b2: &[f32],
+    hidden: usize,
+    array: Option<&mut (dyn ArrayAudioConv + '_)>,
+    conv_on: bool,
+) -> Vec<f32> {
+    let backend_k = array.as_deref().map(|a| (a.conv1_k(), a.conv2_k()));
+    match backend_k.filter(|_| conv_on) {
+        Some((k1, k2)) if k1 >= 3 * mel.n_mels && k2 >= 3 * hidden => {
+            array_conv_front_end(mel, b1, b2, hidden, k1, k2, array.unwrap())
+        }
+        _ => conv_front_end(mel, w1, b1, w2, b2, hidden),
+    }
+}
+
+fn array_conv_front_end(
+    mel: &MelSpec,
+    b1: &[f32],
+    b2: &[f32],
+    hidden: usize,
+    k1: usize,
+    k2: usize,
+    array: &mut (dyn ArrayAudioConv + '_),
+) -> Vec<f32> {
+    let t = mel.frames;
+    let t2 = t / 2;
+    // conv1: gather [frame, 3*n_mels] rows from the mel spectrogram.
+    let mut a1 = vec![0.0f32; t * k1];
+    for frame in 0..t {
+        let row = &mut a1[frame * k1..(frame + 1) * k1];
+        for c in 0..mel.n_mels {
+            for tap in 0..3 {
+                let ti = frame as isize + tap as isize - 1;
+                if ti >= 0 && ti < t as isize {
+                    row[c * 3 + tap] = mel.at(c, ti as usize);
+                }
+            }
+        }
+    }
+    let mut c1 = vec![0.0f32; t * hidden];
+    array.conv1_gemm(&a1, t, &mut c1).expect("the conv1 dispatch");
+    let mut h1 = vec![0.0f32; hidden * t];
+    for o in 0..hidden {
+        for frame in 0..t {
+            h1[o * t + frame] = gelu_erf_exact(c1[frame * hidden + o] + b1[o]);
+        }
+    }
+
+    // conv2: stride two over the SAME channels-first conv1 output.
+    let mut a2 = vec![0.0f32; t2 * k2];
+    for frame in 0..t2 {
+        let row = &mut a2[frame * k2..(frame + 1) * k2];
+        for c in 0..hidden {
+            for tap in 0..3 {
+                let ti = (frame * 2) as isize + tap as isize - 1;
+                if ti >= 0 && ti < t as isize {
+                    row[c * 3 + tap] = h1[c * t + ti as usize];
+                }
+            }
+        }
+    }
+    let mut c2 = vec![0.0f32; t2 * hidden];
+    array.conv2_gemm(&a2, t2, &mut c2).expect("the conv2 dispatch");
+    let mut h2 = vec![0.0f32; hidden * t2];
+    for o in 0..hidden {
+        for frame in 0..t2 {
+            h2[o * t2 + frame] = gelu_erf_exact(c2[frame * hidden + o] + b2[o]);
+        }
+    }
+
     let mut out = vec![0.0f32; t2 * hidden];
     for o in 0..hidden {
         for frame in 0..t2 {

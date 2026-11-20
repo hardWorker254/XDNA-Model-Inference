@@ -1294,6 +1294,7 @@ mod array_seam_tests {
 
 impl npum_model::array::ArrayLogits for MockText {}
 impl npum_model::array::ArrayHead for MockText {}
+impl npum_model::array::ArrayAudioConv for MockText {}
 use npum_model::array::ArrayFrontend;
     impl ArrayFrontend for MockText {}
 
