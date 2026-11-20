@@ -389,7 +389,11 @@ pub fn open_array_text_specs(
     let head = wants_op(args, "logit") && set == "gemm_rtp";
     // Whisper's convolutions reuse the encoder set's attn_out / ffn_down
     // streams with generated B panels, so they open the same set.
-    let conv = wants_op(args, "conv") && set == "gemm_rtp";
+    let whisper = container
+        .config()
+        .get_str("arch")
+        .is_some_and(|a| a.contains("whisper"));
+    let conv = wants_op(args, "conv") && set == "gemm_rtp" && whisper;
     if !gemm && !attn && !frontend && !logit && !head && !conv {
         return Err(format!(
             "{}: --npu-ops asks for no array work, so no design set should be opened",
