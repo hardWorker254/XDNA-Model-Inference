@@ -312,7 +312,6 @@ pub fn serve(
         | npum_families::Family::Hands
         | npum_families::Family::MpPose
         | npum_families::Family::Ocr => &["conv"],
-        _ => &[],
     };
     if let Some(reason) = crate::families::refuse_array_not_ported(family, args, honoured) {
         eprintln!("error: {reason}");
