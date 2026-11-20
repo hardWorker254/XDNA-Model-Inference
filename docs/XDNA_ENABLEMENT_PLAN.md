@@ -18,7 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 | Embed (BERT) | Да: `gemm/layn/gelu/softm/attn` | Да (этап G): `Embedder::with_xdna`, тот же список кодов | есть | — |
 | GTE | Да (этап E): `gemm/attn/layn/softm` (без `gelu` — FFN гейтированный) | Да (этап G): общий с BERT путь `Embedder::with_xdna` | есть: экспортирован `gte-multilingual-base/artifacts_npu1`, упакован в `.npue` | — |
 | EmbeddingGemma | Да (этап F): `gemm/softm`, остальные коды отвергаются по имени | Да (этап F): `EmbedModel::Gemma`, тот же список | есть: `embeddinggemma-300m/artifacts_npu1`, упакован в `.npue` |Четыре RMSNorm и GeGLU — на хосте (нет дизайнов); MQA-attention считается на хосте, но QK/V — через `ArrayText` |
-| Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit/conv`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv` считается на хосте; GELU `erf` хоста против полинома дизайна |
+| Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit/conv`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D + F): `gemm/attn/layn/gelu/softm/conv/logit` | Да (этап F), `XdnaForCls.logit` | есть (`vit-base-patch16-224/...`) | head 768×1000 упаковывается в stream `qkv` [768,2304] с нулевой панелью; не-свёрточные узлы — на хосте |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
 | Hands / MpPose / OCR | `conv` через `ArrayConvs` | нет HTTP-движков, отказ по имени | есть/частично | XDNA-инъекция в движки (движков нет); MpPose/OCR не имеют endpoint-а в эталоне |
@@ -33,6 +33,10 @@ SPDX-License-Identifier: Apache-2.0
 > так что `conv` в списке serve для Pose теперь честный. Оставшиеся семейства
 > (Hands/MpPose/OCR) не имеют HTTP-движков и продолжают отказываться по имени.
 > Gemma (этап F): `backends/cpu/src/pipelines/gemma.rs` — отдельный forward для `gemma3_mqa_rope_geglu` (MQA 3:1, RoPE с двумя базами, четыре RMSNorm, GeGLU tanh, mean-pooling + две Dense + L2). Важный момент: контейнер хранит СЫРОЙ вес RMSNorm, а эталонный ONNX — уже `1+w`, поэтому `+1` складывается при загрузке весов, а не в ядре. Дизайны `gemm_rtp` и `softmax/` дают честные коды `gemm` и `softm`; `layn`, `gelu`, `attn` отвергаются по имени. Паритет на плате: 1−cos = 4.7e-3 / 3.1e-3 (допуск 1e-2), `cli/tests/gemma_array_parity.rs`; CLI и `/v1/embeddings` через `serve` работают с `--npu-ops gemm,softm`.
+> Whisper `cross_kv` (этап F): поток `cross_kv` [512,1024] уже есть в
+> `gemm_rtp_dec` — это K|V-кэш для кросс-внимания, считаемый один раз на
+> окно в `set_source`. Добавлен в `decoder_specs` и идёт через тот же
+> `gemm_seam`; 1500 строк режутся на 6 диспатчей на слой, как и на хосте.
 > Whisper `conv` (этап F): conv1/conv2 — это тоже GEMM: A-строки собираются
 > на хосте из скользящего окна, B-панели генерируются из весов Conv1d
 > `[cout, cin, 3]` и тилируются, а сами умножения идут через существующие
@@ -143,7 +147,7 @@ SPDX-License-Identifier: Apache-2.0
 > и бюджет контекстов включены и для GTE. Mock-тест подтверждает 4 GEMM +
 > attention + 3 LN + 1 GELU, host-путь побайтно прежний. Stage G закрыт,
 Stage F частично закрыт (fft/mproj и logit — см. выше); остаются conv1/conv2,
-`cross_kv`, depthwise conv инекратные head-проекции.
+depthwise conv Pose.
 
 ### Этап A. Общая инфраструктура открытия дизайнов и спеков
 
@@ -227,7 +231,7 @@ Stage F частично закрыт (fft/mproj и logit — см. выше); �
 - Дизайн-сеты individual per model и только под npu1; npu2-наборов и платы в дереве нет (`tests/generations.rs:15-19`). Без корректного сета открытие обязано возвращать ошибку, а не считаться на хосте.
 - int8 attention отвергнут в `attention.rs:268-275`; conv-панели — bf16; `array_convs.rs` не проверяет `Datapath::of`.
 - Таймаут диспатча требует переоткрытия контекста (`direct.rs:1260-1265`, `NPU_DISPATCH_TIMEOUT_MS`).
-- Известные неполные места после A–E (не «тихие» отказы по коду, а отсутствующие потоки в наличных дизайнах): `cross_kv` декодера Whisper считается на хосте при `set_source` — в набор `gemm_rtp_dec` нет потока для этого кэша, и его нужно добавить в этапе F; хостовый GELU Whisper — точный `erf`, а дизайн `gelu/` — полином, поэтому численное сближение для `stt/gelu` проверяется отдельно в этапе G.
+- Известные неполные места после A–E: хостовый GELU Whisper — точный `erf`, а дизайн `gelu/` — полином, поэтому численное сближение для `stt/gelu` проверяется отдельно в этапе G. `cross_kv` больше не в этом списке: поток есть, `set_source` диспатчит его через общий `gemm_seam`.
 - **Gemma: токенизатор.** `tokenizer.gemma_table` разбирается как таблица кусков GEMATOK1, но Rust-токенизатор всё ещё побайтовый/посимвольный, а не SentencePiece BPE. Текстовые запросы через `embed`/`serve` дают корректный.forward для полученных id, но id отличаются от HF; паритет с эталоном проверялся на фиксированных id, а не на реальном тексте.
 - **Gemma: MQA attention** (QK^T и softmax·V) по-прежнему на хосте: `ArrayAttention` не умеет Q/K-нормы и RoPE перед оценкой. Проекции и softmax идут на массив; коды `layn/gelu/attn` честно отвергаются. Маска sliding window точна только до 512 токенов (дальше модель отвергается), как и оговорено в контейнере.
 

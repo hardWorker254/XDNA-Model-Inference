@@ -74,7 +74,7 @@ fn main() {
     let n_src = conv.len() / g.d_model;
     let hidden = encoder.run(&conv, n_src, None, None).expect("the encoder");
     decoder
-        .set_source(&hidden, n_src)
+        .set_source(&hidden, n_src, None)
         .expect("the cross-attention cache");
 
     for (pos, &token) in ids.iter().enumerate() {

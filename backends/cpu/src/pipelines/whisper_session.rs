@@ -292,7 +292,7 @@ fn run_window(
     weights: &FrontEndWeights,
     transcript: &mut Transcript,
     mut array_enc: npum_model::array::ArrayTextRef<'_, '_>,
-    array_dec: npum_model::array::ArrayTextRef<'_, '_>,
+    mut array_dec: npum_model::array::ArrayTextRef<'_, '_>,
     mut eltwise: Option<&mut (dyn npum_model::array::ArrayEltwise + '_)>,
 ) -> Result<Segment, String> {
     let geometry = encoder.geometry();
@@ -339,7 +339,7 @@ fn run_window(
     // The cross-attention cache is built once per WINDOW, not once per
     // session: it depends on the encoder output, and a second window is a
     // different audio.
-    decoder.set_source(&hidden, ENCODER_POSITIONS)?;
+    decoder.set_source(&hidden, ENCODER_POSITIONS, array_dec.as_deref_mut())?;
 
     let decoder_start = std::time::Instant::now();
     let ids = decoder.greedy(

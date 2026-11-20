@@ -904,7 +904,12 @@ impl Decoder {
     /// changes. The cache is built ONCE per transcription: the encoder's
     /// output does not change while the decoder runs, so 1500 positions at
     /// 256 rows is six dispatches per layer instead of 1500.
-    pub fn set_source(&mut self, enc: &[f32], n_src: usize) -> Result<(), String> {
+    pub fn set_source(
+        &mut self,
+        enc: &[f32],
+        n_src: usize,
+        mut array: ArrayTextRef<'_, '_>,
+    ) -> Result<(), String> {
         let d = self.geometry.d_model;
         if n_src == 0 || enc.len() < n_src * d {
             return Err(format!(
@@ -923,7 +928,11 @@ impl Decoder {
         for (l, layer) in self.layers.iter().enumerate() {
             let cache = &mut self.cross_kv[l];
             cache.resize(n_src * 2 * d, 0.0);
-            kernels::gemm_nt_rows(
+            let gemm_on = array.as_deref().is_some_and(|a| a.gemm_on_array());
+            gemm_seam(
+                array.as_deref_mut(),
+                gemm_on,
+                &format!("decoder.layers.{l}.cross_kv"),
                 enc,
                 n_src,
                 &layer.cross_kv,
@@ -932,7 +941,7 @@ impl Decoder {
                 &layer.cross_kv_bias,
                 cache,
                 parallel::threads(),
-            );
+            )?;
         }
         self.reset();
         Ok(())
@@ -2137,8 +2146,8 @@ mod tests {
         let enc = noise(g.max_seq * d, 60);
         let mut reused = decoder(&g);
         let mut fresh = decoder(&g);
-        reused.set_source(&enc, g.max_seq).unwrap();
-        fresh.set_source(&enc, g.max_seq).unwrap();
+        reused.set_source(&enc, g.max_seq, None).unwrap();
+        fresh.set_source(&enc, g.max_seq, None).unwrap();
 
         for pos in 0..4 {
             // The reference decoder gets a brand-new scratch every step.

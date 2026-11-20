@@ -111,11 +111,10 @@ pub fn encoder_specs(g: &Geometry) -> Vec<GemmSpec> {
 
 /// The decoder's projections, in the order they are dispatched.
 ///
-/// `cross_kv` is deliberately absent: it is the cross-attention cache, built
-/// once per window rather than once per token, and no stream in the decoder's
-/// design set computes it. Building it on the host is the only correct path
-/// for it; calling the array with a name the design does not have would be a
-/// refusal at the first window, not a dispatch.
+/// `cross_kv` is the cross-attention cache, built once per window rather than
+/// once per token. The decoder set DOES have the stream (K=512, N=1024), so
+/// it is staged like the other projections and dispatched through the same
+/// GEMM seam from `set_source`.
 pub fn decoder_specs(g: &Geometry) -> Vec<GemmSpec> {
     let d = g.d_model as usize;
     let f = g.dec_intermediate as usize;
@@ -125,6 +124,7 @@ pub fn decoder_specs(g: &Geometry) -> Vec<GemmSpec> {
             ("self_qkv", d, 3 * d),
             ("self_attn_out", d, d),
             ("cross_q", d, d),
+            ("cross_kv", d, 2 * d),
             ("cross_attn_out", d, d),
             ("ffn_up", d, f),
             ("ffn_down", f, d),
