@@ -21,7 +21,7 @@ SPDX-License-Identifier: Apache-2.0
 | Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit/conv`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D + F): `gemm/attn/layn/gelu/softm/conv/logit` | Да (этап F), `XdnaForCls.logit` | есть (`vit-base-patch16-224/...`) | head 768×1000 упаковывается в stream `qkv` [768,2304] с нулевой панелью; не-свёрточные узлы — на хосте |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
-| Hands / MpPose / OCR | `conv` через `ArrayConvs`, depthwise — на хосте | Да (этап F): `/v1/hands`, `/v1/mppose`, `/v1/ocr`, host-only, `--npu-ops` отказ по имени | контейнеры собраны из ONNX; дизайн-сетов нет | depthwise conv и XDNA-инъекция — только с новым kernel/design |
+| Hands / MpPose / OCR | `conv` через `ArrayConvs`, depthwise — на хосте | Да (этап F): `/v1/hands`, `/v1/mppose`, `/v1/ocr`, `--npu-ops conv` через `XdnaFor*` | контейнеры и conv-сеты (12/22/15 потоков) собраны | depthwise conv — только с новым kernel/design |
 
 ## 2. Этапы реализации
 
@@ -44,7 +44,8 @@ SPDX-License-Identifier: Apache-2.0
 > GELU-erf остаются на хосте (в дизайне нет эпилога). Fail-closed `ArrayAudioConv`
 > — supertrait `ArrayText`. На плате относительная ошибка 2.8e-3 при
 > 9 диспатчах, транскрипт ` you` из CLI и `serve`.
-> Hands/MpPose/OCR (этап F): добавлены host-only HTTP-движки и три новых
+> Hands/MpPose/OCR (этап F): экспортированы conv-сеты (12/22/15 потоков, tile 64×32), контейнеры переупакованы с `--npu` (61/99/81 панель). `--npu-ops conv` диспатчит плотные свёртки и в CLI, и в `serve`; depthwise (39/62/29) остаётся на хосте.
+> Hands/MpPose/OCR (этап F): добавлены HTTP-движки и три новых
 > endpoint-а (`/v1/hands`, `/v1/mppose`, `/v1/ocr`). JSON строится теми же
 > `*_decode::result_json`, что и в CLI, поэтому ответы не расходятся. Для
 > теста собраны `.npue`-контейнеры из ONNX (`--hands-onnx`, `--mppose-onnx`,

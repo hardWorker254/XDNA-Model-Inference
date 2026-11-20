@@ -188,6 +188,23 @@ fn open_embed_xdna(
     Ok(Some(npuembeddings_server::XdnaForEmbed { array, eltwise }))
 }
 
+/// Open the convolution handle for one of the four conv families.
+///
+/// `None` is the honest answer to a run that never named `conv`; a named
+/// code with no design set is a refusal, reported by the caller.
+fn open_conv_array(
+    path: &std::path::Path,
+    specs: &[npum_model::array::ConvSpec],
+    args: &crate::flags::Args,
+    root: &std::path::Path,
+) -> std::result::Result<Option<Box<dyn npum_model::array::ArrayConvs + Send>>, String> {
+    if !crate::ocr::wants_conv(args) {
+        return Ok(None);
+    }
+    let backend = crate::npu::open_convs(path, specs, args, root, "gemm_rtp")?;
+    Ok(Some(backend))
+}
+
 /// Serve one model.
 ///
 /// The refusal comes FIRST and the listener does not open until it has
@@ -290,10 +307,11 @@ pub fn serve(
         }
         npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit", "conv"],
         npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv", "logit"],
-        // PoseDetector now takes the same ArrayConvs seam the CLI uses.
-        // Hands/MpPose/Ocr have no HTTP engine in this tree, so they keep
-        // the empty list and refuse by name rather than run on the host.
-        npum_families::Family::Pose => &["conv"],
+        // These four families all take the same ArrayConvs seam the CLI uses.
+        npum_families::Family::Pose
+        | npum_families::Family::Hands
+        | npum_families::Family::MpPose
+        | npum_families::Family::Ocr => &["conv"],
         _ => &[],
     };
     if let Some(reason) = crate::families::refuse_array_not_ported(family, args, honoured) {
@@ -501,7 +519,21 @@ pub fn serve(
         }
         npum_families::Family::Hands => {
             match npuembeddings_server::HandsEngine::open(&path) {
-                Ok(engine) => hands = Some(engine),
+                Ok(engine) => {
+                    let array = match open_conv_array(
+                        &path,
+                        &npum_cpu::hands::array_specs(engine.geometry()),
+                        args,
+                        root,
+                    ) {
+                        Ok(a) => a,
+                        Err(reason) => {
+                            eprintln!("error: {reason}");
+                            return crate::EXIT_REFUSED;
+                        }
+                    };
+                    hands = Some(engine.with_xdna(array));
+                }
                 Err(reason) => {
                     eprintln!("error: {reason}");
                     return crate::EXIT_REFUSED;
@@ -510,7 +542,21 @@ pub fn serve(
         }
         npum_families::Family::MpPose => {
             match npuembeddings_server::MpPoseEngine::open(&path) {
-                Ok(engine) => mppose = Some(engine),
+                Ok(engine) => {
+                    let array = match open_conv_array(
+                        &path,
+                        &npum_cpu::mppose::array_specs(engine.geometry()),
+                        args,
+                        root,
+                    ) {
+                        Ok(a) => a,
+                        Err(reason) => {
+                            eprintln!("error: {reason}");
+                            return crate::EXIT_REFUSED;
+                        }
+                    };
+                    mppose = Some(engine.with_xdna(array));
+                }
                 Err(reason) => {
                     eprintln!("error: {reason}");
                     return crate::EXIT_REFUSED;
@@ -519,7 +565,21 @@ pub fn serve(
         }
         npum_families::Family::Ocr => {
             match npuembeddings_server::OcrEngine::open(&path) {
-                Ok(engine) => ocr = Some(engine),
+                Ok(engine) => {
+                    let array = match open_conv_array(
+                        &path,
+                        &npum_cpu::ocr::array_specs(&engine.geometry()),
+                        args,
+                        root,
+                    ) {
+                        Ok(a) => a,
+                        Err(reason) => {
+                            eprintln!("error: {reason}");
+                            return crate::EXIT_REFUSED;
+                        }
+                    };
+                    ocr = Some(engine.with_xdna(array));
+                }
                 Err(reason) => {
                     eprintln!("error: {reason}");
                     return crate::EXIT_REFUSED;
@@ -585,7 +645,7 @@ pub fn serve(
                 return crate::EXIT_REFUSED;
             }
         };
-        print_banner(binary, &state, &address);
+        print_banner(binary, &state, &address, args);
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
@@ -623,7 +683,12 @@ pub fn serve(
 }
 
 /// The endpoint's banner: which path it answers, and what a request is.
-fn print_banner(binary: &str, state: &ServerState, address: &str) {
+fn print_banner(
+    binary: &str,
+    state: &ServerState,
+    address: &str,
+    args: &crate::flags::Args,
+) {
     match state.arch.as_str() {
         arch if arch.contains("whisper") => {
             println!(
@@ -663,17 +728,26 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
         arch if arch.contains("hands") => {
             println!("\n  serving http://{address}/v1/hands   (model {})", state.model_id);
             println!("  POST multipart/form-data: image (required, PNG or JPEG), max_hands");
-            println!("  palm SSD + landmark heatmap, host backend");
+            println!(
+                "  palm SSD + landmark heatmap, {} backend",
+                if crate::ocr::wants_conv(args) { "array" } else { "host" }
+            );
         }
         arch if (arch.contains("mppose") || arch.contains("mediapipe_pose")) => {
             println!("\n  serving http://{address}/v1/mppose   (model {})", state.model_id);
             println!("  POST multipart/form-data: image (required, PNG or JPEG), max_people");
-            println!("  person SSD + landmark regression, host backend");
+            println!(
+                "  person SSD + landmark regression, {} backend",
+                if crate::ocr::wants_conv(args) { "array" } else { "host" }
+            );
         }
         arch if arch.contains("ocr") || arch.contains("paddleocr") => {
             println!("\n  serving http://{address}/v1/ocr   (model {})", state.model_id);
             println!("  POST multipart/form-data: image (required, PNG or JPEG), max_boxes");
-            println!("  DB detector + SVTR recogniser, host backend");
+            println!(
+                "  DB detector + SVTR recogniser, {} backend",
+                if crate::ocr::wants_conv(args) { "array" } else { "host" }
+            );
         }
         arch if arch.contains("pose") || arch.contains("mediapipe") => {
             println!(
@@ -814,7 +888,7 @@ fn build_state(
         state.not_found = "this model serves /v1/hands, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch.".to_string();
         return Ok(state);
     }
-    if (arch.contains("mppose") || arch.contains("mediapipe_pose")) {
+    if arch.contains("mppose") || arch.contains("mediapipe_pose") {
         state.health = format!(
             "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"mppose\",\"engine\":\"host\",\"max_people\":10}}",
             state.model_id

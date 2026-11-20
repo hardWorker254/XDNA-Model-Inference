@@ -540,12 +540,24 @@ pub struct Classification {
 /// the two paths cannot drift.
 pub struct HandsEngine {
     net: npum_cpu::hands::Hands,
+    xdna: Option<Arc<Mutex<Box<dyn ArrayConvs + Send>>>>,
 }
 
 impl HandsEngine {
+    pub fn geometry(&self) -> &npum_cpu::hands::Geometry {
+        self.net.geometry()
+    }
+
+    /// Give the engine the convolution handle `serve` opened at startup.
+    pub fn with_xdna(mut self, array: Option<Box<dyn ArrayConvs + Send>>) -> Self {
+        self.xdna = array.map(|a| Arc::new(Mutex::new(a)));
+        self
+    }
+
     pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         Ok(Self {
             net: npum_cpu::hands::Hands::open(path).map_err(|e| e.to_string())?,
+            xdna: None,
         })
     }
 
@@ -557,7 +569,9 @@ impl HandsEngine {
     ) -> std::result::Result<String, String> {
         let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
         let mut hook = |_: &str, _: usize, _: &npum_cpu::pose::Tensor| {};
-        let run = npum_cpu::hands_decode::detect(&self.net, &decoded, max_hands, &mut hook, None)?;
+        let mut guard = self.xdna.as_ref().map(|m| m.lock().unwrap());
+        let array = guard.as_deref_mut().map(|a| a.as_mut() as &mut dyn ArrayConvs);
+        let run = npum_cpu::hands_decode::detect(&self.net, &decoded, max_hands, &mut hook, array)?;
         Ok(npum_cpu::hands_decode::result_json(&run, name))
     }
 }
@@ -565,12 +579,23 @@ impl HandsEngine {
 /// Multi-person MediaPipe Pose, on the host -- same JSON as `npuimage mppose`.
 pub struct MpPoseEngine {
     net: npum_cpu::mppose::MpPose,
+    xdna: Option<Arc<Mutex<Box<dyn ArrayConvs + Send>>>>,
 }
 
 impl MpPoseEngine {
+    pub fn geometry(&self) -> &npum_cpu::mppose::Geometry {
+        self.net.geometry()
+    }
+
+    pub fn with_xdna(mut self, array: Option<Box<dyn ArrayConvs + Send>>) -> Self {
+        self.xdna = array.map(|a| Arc::new(Mutex::new(a)));
+        self
+    }
+
     pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         Ok(Self {
             net: npum_cpu::mppose::MpPose::open(path).map_err(|e| e.to_string())?,
+            xdna: None,
         })
     }
 
@@ -582,7 +607,9 @@ impl MpPoseEngine {
     ) -> std::result::Result<String, String> {
         let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
         let mut hook = |_: &str, _: usize, _: &npum_cpu::pose::Tensor| {};
-        let run = npum_cpu::mppose_decode::detect(&self.net, &decoded, max_people, &mut hook, None)?;
+        let mut guard = self.xdna.as_ref().map(|m| m.lock().unwrap());
+        let array = guard.as_deref_mut().map(|a| a.as_mut() as &mut dyn ArrayConvs);
+        let run = npum_cpu::mppose_decode::detect(&self.net, &decoded, max_people, &mut hook, array)?;
         Ok(npum_cpu::mppose_decode::result_json(&run, name))
     }
 }
@@ -601,6 +628,24 @@ unsafe impl Send for OcrEngine {}
 unsafe impl Sync for OcrEngine {}
 
 impl OcrEngine {
+    pub fn geometry(&self) -> npum_cpu::ocr::Geometry {
+        self.session
+            .lock()
+            .expect("the OCR session mutex was poisoned")
+            .geometry()
+            .clone()
+    }
+
+    pub fn with_xdna(self, array: Option<Box<dyn ArrayConvs + Send>>) -> Self {
+        if let Some(array) = array {
+            self.session
+                .lock()
+                .expect("the OCR session mutex was poisoned")
+                .set_array(Some(array));
+        }
+        self
+    }
+
     pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
         Ok(Self {
             session: Mutex::new(npum_cpu::ocr_session::Ocr::open(path, None).map_err(|e| e.to_string())?),
