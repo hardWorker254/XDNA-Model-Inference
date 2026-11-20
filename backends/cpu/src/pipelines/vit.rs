@@ -305,6 +305,7 @@ mod array_seam_tests {
     impl ArrayText for MockText {}
 
 impl npum_model::array::ArrayLogits for MockText {}
+impl npum_model::array::ArrayHead for MockText {}
 use npum_model::array::ArrayFrontend;
     impl ArrayFrontend for MockText {}
 
@@ -917,6 +918,25 @@ impl Vit {
             logits[j] = acc as f32;
         }
     }
+
+    /// The head, with the array's seam when asked and the host otherwise.
+    ///
+    /// The host arm is the original double-accumulation matvec, unchanged.
+    pub fn classify_into_with(
+        &self,
+        cls_row: &[f32],
+        logits: &mut [f32],
+        array: Option<&mut (dyn ArrayText + '_)>,
+        head_on: bool,
+    ) -> std::result::Result<(), String> {
+        if head_on {
+            if let Some(backend) = array {
+                return backend.head(cls_row, logits).map_err(|e| e.to_string());
+            }
+        }
+        self.classify_into(cls_row, logits);
+        Ok(())
+    }
 }
 
 /// A prediction: the label, its name and its probability.
@@ -983,6 +1003,20 @@ pub fn prediction_json(
     encoder_s: f64,
     head_s: f64,
 ) -> String {
+    prediction_json_with(prediction, image, top_k, front_end_s, encoder_s, head_s, 0, 0)
+}
+
+/// The same JSON, with the array's own dispatch counters rather than zeroes.
+pub fn prediction_json_with(
+    prediction: &Prediction,
+    image: &str,
+    top_k: usize,
+    front_end_s: f64,
+    encoder_s: f64,
+    head_s: f64,
+    dispatches: usize,
+    elt_dispatches: usize,
+) -> String {
     let mut out = format!(
         "{{\"image\": \"{}\", \"label\": {}, \"name\": \"{}\", \"p\": {}",
         json_escape(image),
@@ -1030,10 +1064,12 @@ pub fn prediction_json(
     }
     out.push_str(&format!(
         ", \"front_end_s\": {}, \"encoder_s\": {}, \"head_s\": {}, \
-         \"dispatches\": 0, \"elt_dispatches\": 0}}",
+         \"dispatches\": {}, \"elt_dispatches\": {}}}",
         format_g(front_end_s, 9),
         format_g(encoder_s, 9),
         format_g(head_s, 9),
+        dispatches,
+        elt_dispatches,
     ));
     out
 }

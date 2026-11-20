@@ -291,3 +291,58 @@ fn whisper_logit_streams_match_the_host() {
     eprintln!("logits: 1 - cos = {dist:.4e}, argmax {} / {}", argmax(&want), argmax(&got));
     assert!(dist <= 2e-2, "1 - cos = {dist:.4e}");
 }
+
+/// The classifier head reuses the set's `qkv` stream with a zero-padded B
+/// panel. Compare its logits to the host's double-accumulation matvec on the
+/// SAME CLS row, so any difference is the head alone.
+#[test]
+fn vit_head_reuses_the_qkv_stream() {
+    use npum_model::array::ArrayHead;
+
+    if !board_present() {
+        eprintln!("skipping: no NPU device node");
+        return;
+    }
+    let Some(path) = container("NPUEMBEDDINGS_VIT_NPU") else {
+        eprintln!("skipping: set NPUEMBEDDINGS_VIT_NPU");
+        return;
+    };
+    let image = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/parity/fixtures/bus.jpg");
+    if !image.is_file() {
+        return;
+    }
+    let root = std::env::var("NPU_ARTIFACTS").ok().map(PathBuf::from);
+    let file = npum_format::Container::open(&path).expect("the container opens");
+    let model = npum_cpu::vit::Vit::open(&path).expect("the ViT opens");
+    let geometry = model.geometry().clone();
+    let decoded = npum_cpu::vit_image::decode_image(&image).expect("the image decodes");
+    let patches = npum_cpu::vit_image::preprocess(&decoded, &geometry).expect("the patches");
+    let cls = model.encode(&patches, None, None, false, false).expect("the host encoder");
+    let nlab = geometry.num_labels as usize;
+    let want = model.classify(&cls[..geometry.hidden as usize]);
+
+    let opts = args("logit", root.as_deref());
+    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let specs = npuembeddings_cli::vit::gemm_specs(&file, &geometry).expect("the ViT specs");
+    let mut chosen = specs.layers;
+    chosen.push(specs.patch);
+    let mut array =
+        npu::open_array_text_specs(&file, &path, &root_dir, &opts, chosen, "gemm_rtp")
+            .expect("the head design opens");
+    assert!(ArrayHead::head_on_array(array.as_ref()));
+    let mut got = vec![0.0f32; nlab];
+    model
+        .classify_into_with(
+            &cls[..geometry.hidden as usize],
+            &mut got,
+            Some(&mut *array),
+            true,
+        )
+        .expect("the array head");
+    assert_eq!(ArrayHead::head_dispatches(array.as_ref()), 1);
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    assert_eq!(argmax(&want), argmax(&got), "the head chose another label");
+    let distance = cos_distance(&want, &got);
+    eprintln!("ViT head: 1 - cos = {distance:.4e}, argmax {} / {}", argmax(&want), argmax(&got));
+    assert!(distance <= 1e-3, "1 - cos = {distance:.4e}");
+}

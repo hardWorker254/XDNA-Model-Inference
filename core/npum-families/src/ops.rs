@@ -102,8 +102,8 @@ fn pose_refusal(listing: &str, codes: &[&str]) -> Option<String> {
 /// does honour, so the reader can fix the command line instead of
 /// guessing.
 fn vit_refusal(codes: &[&str]) -> Option<String> {
-    const DEAD: &[&str] = &["mproj", "fft", "logit"];
-    const KEPT: &[&str] = &["layn", "gelu", "attn", "softm", "conv", "gemm"];
+    const DEAD: &[&str] = &["mproj", "fft"];
+    const KEPT: &[&str] = &["layn", "gelu", "attn", "softm", "conv", "gemm", "logit"];
     let refused: Vec<&str> = codes.iter().copied().filter(|c| DEAD.contains(c)).collect();
     if refused.is_empty() {
         return None;

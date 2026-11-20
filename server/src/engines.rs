@@ -33,6 +33,7 @@ pub struct XdnaForCls {
     pub eltwise: Option<Box<dyn ArrayEltwise + Send>>,
     pub gemm: bool,
     pub conv: bool,
+    pub logit: bool,
 }
 
 /// The embedding endpoint's array handles, opened once at startup.
@@ -381,6 +382,7 @@ pub struct Classifier {
     /// staged projections the encoder actually submits to the array.
     xdna_gemm: bool,
     xdna_conv: bool,
+    xdna_head: bool,
 }
 
 impl Classifier {
@@ -396,6 +398,7 @@ impl Classifier {
             xdna_elt: None,
             xdna_gemm: false,
             xdna_conv: false,
+            xdna_head: false,
         })
     }
 
@@ -407,6 +410,7 @@ impl Classifier {
                 xdna_elt: h.eltwise.map(|e| Arc::new(Mutex::new(e))),
                 xdna_gemm: h.gemm,
                 xdna_conv: h.conv,
+                xdna_head: h.logit,
                 ..self
             },
             None => self,
@@ -465,7 +469,7 @@ impl Classifier {
         let enc = std::time::Instant::now();
         let mut array_guard = self.xdna_array.as_ref().map(|m| m.lock().unwrap());
         let mut elt_guard = self.xdna_elt.as_ref().map(|m| m.lock().unwrap());
-        let backend: Option<&mut dyn ArrayText> = match array_guard.as_deref_mut() {
+        let mut backend: Option<&mut dyn ArrayText> = match array_guard.as_deref_mut() {
             Some(b) => Some(b.as_mut()),
             None => None,
         };
@@ -477,7 +481,7 @@ impl Classifier {
             &patches,
             &mut scratch.workspace,
             &mut scratch.hidden,
-            backend,
+            backend.as_deref_mut(),
             eltwise,
             self.xdna_gemm,
             self.xdna_conv,
@@ -487,11 +491,24 @@ impl Classifier {
         let d = geometry.hidden as usize;
         let nlab = self.vit.geometry().num_labels as usize;
         scratch.logits.resize(nlab, 0.0);
+        let head_on = backend.as_ref().is_some_and(|b| b.head_on_array()) && self.xdna_head;
         self.vit
-            .classify_into(&scratch.hidden[..d], &mut scratch.logits[..nlab]);
+            .classify_into_with(
+                &scratch.hidden[..d],
+                &mut scratch.logits[..nlab],
+                backend.as_deref_mut(),
+                head_on,
+            )?;
         let prediction = npum_cpu::vit::predict(&scratch.logits[..nlab], self.vit.labels())?;
         let head_s = head.elapsed().as_secs_f64();
+        let dispatches = array_guard
+            .as_ref()
+            .map(|b| b.dispatches() + b.attn_dispatches() + b.head_dispatches())
+            .unwrap_or(0);
+        let elt_dispatches = elt_guard.as_ref().map(|e| e.dispatches()).unwrap_or(0);
         Ok(Classification {
+            dispatches,
+            elt_dispatches,
             prediction,
             front_end_s,
             encoder_s,
@@ -510,6 +527,9 @@ pub struct Classification {
     pub encoder_s: f64,
     /// The head's time.
     pub head_s: f64,
+    /// The array's own dispatch counters for this run.
+    pub dispatches: usize,
+    pub elt_dispatches: usize,
 }
 
 /// The pose endpoint's engine.

@@ -484,6 +484,29 @@ pub trait ArrayLogits {
     }
 }
 
+/// The ViT classifier head: one CLS row times a `[hidden, num_labels]` weight.
+///
+/// The labels are not a legal B-panel width (1000 is not a multiple of
+/// tile_n*cols), but the ViT set's `qkv` stream is `[hidden, 2304]`, so the
+/// backend can stage a zero-padded panel from `classifier.weight` and read
+/// only the real labels back. Like `ArrayLogits`, this is a supertrait of
+/// `ArrayText` with fail-closed defaults: an unported backend must refuse.
+pub trait ArrayHead {
+    fn head_on_array(&self) -> bool {
+        false
+    }
+
+    fn head_dispatches(&self) -> usize {
+        0
+    }
+
+    fn head(&mut self, _cls: &[f32], _logits: &mut [f32]) -> Result<()> {
+        Err(ArrayError(
+            "this array backend cannot dispatch the ViT classifier head".to_string(),
+        ))
+    }
+}
+
 /// The attention's own shape.
 ///
 /// The family knows it and the array's side needs it, and it is one struct
@@ -587,4 +610,4 @@ pub trait ArrayAttention {
 ///
 /// So the family holds ONE handle, and this trait is it: the two traits'
 /// operations, on one object.
-pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend + ArrayLogits {}
+pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend + ArrayLogits + ArrayHead {}

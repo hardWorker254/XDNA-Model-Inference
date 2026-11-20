@@ -127,7 +127,9 @@ fn open_cls_xdna(
         None
     };
     let eltwise = crate::npu::open_eltwise(container, path, root, args)?;
+    let logit = crate::npu::wants_op(args, "logit");
     Ok(Some(npuembeddings_server::XdnaForCls {
+        logit,
         array,
         eltwise,
         gemm: crate::npu::wants_op(args, "gemm"),
@@ -286,7 +288,7 @@ pub fn serve(
             }
         }
         npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit"],
-        npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv"],
+        npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv", "logit"],
         // PoseDetector now takes the same ArrayConvs seam the CLI uses.
         // Hands/MpPose/Ocr have no HTTP engine in this tree, so they keep
         // the empty list and refuse by name rather than run on the host.

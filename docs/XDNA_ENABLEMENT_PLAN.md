@@ -19,7 +19,7 @@ SPDX-License-Identifier: Apache-2.0
 | GTE | Да (этап E): `gemm/attn/layn/softm` (без `gelu` — FFN гейтированный) | Да (этап G): общий с BERT путь `Embedder::with_xdna` | есть: экспортирован `gte-multilingual-base/artifacts_npu1`, упакован в `.npue` | — |
 | EmbeddingGemma | Да (этап F): `gemm/softm`, остальные коды отвергаются по имени | Да (этап F): `EmbedModel::Gemma`, тот же список | есть: `embeddinggemma-300m/artifacts_npu1`, упакован в `.npue` |Четыре RMSNorm и GeGLU — на хосте (нет дизайнов); MQA-attention считается на хосте, но QK/V — через `ArrayText` |
 | Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F), `logit` через `ArrayLogits` в `XdnaForStt` | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv` и conv1/conv2 считаются на хосте; GELU `erf` хоста против полинома дизайна |
-| ViT Cls | Да (этапы B–D): `gemm/attn/layn/gelu/softm/conv`; `conv` = patch-embed GEMM, `gemm` = 4 GEMM на слой | Да (этап D) | есть (`vit-base-patch16-224/...`) | head (1000) не кратен `tile_n*cols=192`; не-свёрточные узлы — на хосте. Хостовый path с bf16-контейнером починен общим `operand::read_operand` (де-tiling панелей) |
+| ViT Cls | Да (этапы B–D + F): `gemm/attn/layn/gelu/softm/conv/logit` | Да (этап F), `XdnaForCls.logit` | есть (`vit-base-patch16-224/...`) | head 768×1000 упаковывается в stream `qkv` [768,2304] с нулевой панелью; не-свёрточные узлы — на хосте |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
 | Hands / MpPose / OCR | `conv` через `ArrayConvs` | нет HTTP-движков, отказ по имени | есть/частично | XDNA-инъекция в движки (движков нет); MpPose/OCR не имеют endpoint-а в эталоне |
 
@@ -33,6 +33,13 @@ SPDX-License-Identifier: Apache-2.0
 > так что `conv` в списке serve для Pose теперь честный. Оставшиеся семейства
 > (Hands/MpPose/OCR) не имеют HTTP-движков и продолжают отказываться по имени.
 > Gemma (этап F): `backends/cpu/src/pipelines/gemma.rs` — отдельный forward для `gemma3_mqa_rope_geglu` (MQA 3:1, RoPE с двумя базами, четыре RMSNorm, GeGLU tanh, mean-pooling + две Dense + L2). Важный момент: контейнер хранит СЫРОЙ вес RMSNorm, а эталонный ONNX — уже `1+w`, поэтому `+1` складывается при загрузке весов, а не в ядре. Дизайны `gemm_rtp` и `softmax/` дают честные коды `gemm` и `softm`; `layn`, `gelu`, `attn` отвергаются по имени. Паритет на плате: 1−cos = 4.7e-3 / 3.1e-3 (допуск 1e-2), `cli/tests/gemma_array_parity.rs`; CLI и `/v1/embeddings` через `serve` работают с `--npu-ops gemm,softm`.
+> ViT `logit` (этап F): head 768×1000 не является законной шириной B-панели
+> (1000 не кратно 192), но в наборе есть stream `qkv` [768,2304]. Бэкенд
+> генерирует нулевую панель from `classifier.weight`, dispatchит один
+> stream с M=1024 и читает только первые 1000 меток; новый AIE-stream не
+> нужен. `ArrayHead` — fail-closed supertrait `ArrayText`. На плате 1−cos =
+> 8.5e-5, argmax 654/654, 1 dispatch; `npuimage classify … --npu-ops logit`
+> и `/v1/classify` через `serve` работают.
 > Whisper `logit` (этап F): восемь потоков `logits_0..7` в `gemm_rtp_dec` — это
 > не 8 batch-тиров, а 8 срезов словаря по 6656 колонок (51865 = 7×6656 + 5273).
 > `ArrayGemms::open` при `--npu-ops logit` транспонирует `decoder.embed_tokens`

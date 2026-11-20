@@ -123,6 +123,7 @@ pub struct Places {
     pub layn: bool,
     pub gelu: bool,
     pub softm: bool,
+    pub logit: bool,
 }
 
 impl Places {
@@ -134,6 +135,7 @@ impl Places {
             layn: false,
             gelu: false,
             softm: false,
+            logit: false,
         }
     }
 }
@@ -154,6 +156,7 @@ pub fn places(
         layn: crate::npu::wants_op(args, "layn") && (elt("layernorm") || elt("rmsnorm")),
         gelu: crate::npu::wants_op(args, "gelu") && elt("gelu"),
         softm: crate::npu::wants_op(args, "softm") && elt("softmax"),
+        logit: crate::npu::wants_op(args, "logit") && design_present,
     }
 }
 
@@ -254,14 +257,23 @@ pub fn print_block(g: &Geometry, designs: &Path, setup_s: f64, places: &Places) 
         if places.softm { "npu" } else { "host" },
         &softmax,
     );
-    row(
-        "classifier head",
-        "host",
-        &format!(
+    let head_reason = if places.logit {
+        format!(
+            "{}x{} padded into the qkv stream's legal B width; only the real \
+             labels are read back",
+            g.hidden, g.num_labels
+        )
+    } else {
+        format!(
             "{}x{} matvec on the host; --npu-ops logit dispatches it by padding \
              the projection to the next legal width (speed is not a constraint)",
             g.hidden, g.num_labels
-        ),
+        )
+    };
+    row(
+        "classifier head",
+        if places.logit { "npu" } else { "host" },
+        &head_reason,
     );
     eprintln!(
         "  setup      {:.2} s (device, 1 design set, weights staged on it)",
@@ -341,8 +353,12 @@ pub fn prediction_json(
     front_end_s: f64,
     encoder_s: f64,
     head_s: f64,
+    dispatches: usize,
+    elt_dispatches: usize,
 ) -> String {
-    npum_cpu::vit::prediction_json(prediction, image, 1, front_end_s, encoder_s, head_s)
+    npum_cpu::vit::prediction_json_with(
+        prediction, image, 1, front_end_s, encoder_s, head_s, dispatches, elt_dispatches,
+    )
 }
 
 /// The design set's directory for a model, if there is one.
@@ -423,11 +439,12 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // Six codes are real seams: the four layer GEMMs, the patch-embed
         // convolution (a GEMM on the array), the attention, and the three
         // elementwise passes. `mproj`, `fft` and `logit` are still refused by
-        // name: the head cannot be tiled to a legal B width.
+        // name only where there is no seam -- the head now reuses the qkv
+        // stream with a padded panel.
         if let Some(reason) = crate::families::refuse_array_not_ported(
             npum_families::Family::Cls,
             args,
-            &["gemm", "attn", "layn", "gelu", "softm", "conv"],
+            &["gemm", "attn", "layn", "gelu", "softm", "conv", "logit"],
         ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;
@@ -437,7 +454,8 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // design; a design that happens to be on disk is not a dispatch.
         let want_array = crate::npu::wants_op(args, "gemm")
             || crate::npu::wants_op(args, "attn")
-            || crate::npu::wants_op(args, "conv");
+            || crate::npu::wants_op(args, "conv")
+            || crate::npu::wants_op(args, "logit");
         let mut array: Option<Box<dyn npum_model::array::ArrayText>> = None;
         if want_array {
             let specs = match crate::vit::gemm_specs(container, &geometry) {
@@ -521,18 +539,19 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                 }
             };
             let encoder_s = enc.elapsed().as_secs_f64();
-            // The count is the array's own, not an estimate. A run whose flag
-            // asked for array work but dispatched zero calls would be the lie
-            // the `--npu-ops` flag exists to prevent.
-            let dispatches = array
-                .as_ref()
-                .map(|a| a.dispatches() + a.attn_dispatches())
-                .unwrap_or(0)
-                + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
-
             let head = std::time::Instant::now();
             let d = geometry.hidden as usize;
-            let logits = vit.classify(&hidden[..d]);
+            let head_on = array.as_ref().is_some_and(|a| a.head_on_array());
+            let mut logits = vec![0.0f32; geometry.num_labels as usize];
+            if let Err(reason) = vit.classify_into_with(
+                &hidden[..d],
+                &mut logits,
+                array.as_deref_mut(),
+                head_on,
+            ) {
+                eprintln!("error: {reason}");
+                return crate::EXIT_REFUSED;
+            }
             let prediction = match npum_cpu::vit::predict(&logits, vit.labels()) {
                 Ok(p) => p,
                 Err(reason) => {
@@ -541,6 +560,13 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                 }
             };
             let head_s = head.elapsed().as_secs_f64();
+            // The count is the array's own, not an estimate, and it is read
+            // AFTER the head: a logit-only run's one dispatch happens there.
+            let dispatches = array
+                .as_ref()
+                .map(|a| a.dispatches() + a.attn_dispatches() + a.head_dispatches())
+                .unwrap_or(0)
+                + eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0);
 
             if json {
                 out.push_str("  ");
@@ -550,6 +576,8 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
                     front_end_s,
                     encoder_s,
                     head_s,
+                    dispatches,
+                    eltwise.as_ref().map(|e| e.dispatches()).unwrap_or(0),
                 ));
                 out.push_str(if i + 1 < images.len() { ",\n" } else { "\n" });
             } else {

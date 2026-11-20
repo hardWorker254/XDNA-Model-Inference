@@ -66,7 +66,7 @@ fn baked_dft_and_mel_streams_match_the_reference() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../runtime/artifacts/whisper-base/artifacts_npu1/gemm_rtp");
     let design = ArrayDesign::open(&dir, transport).expect("the design set loads");
-    let mut backend = ArrayGemms::open(&container, design, &[], false, false)
+    let mut backend = ArrayGemms::open(&container, design, &[], false, false, false)
         .expect("the front end streams open without staged GEMM panels");
     assert!(backend.frontend_on_array());
 

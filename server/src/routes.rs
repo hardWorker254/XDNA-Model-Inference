@@ -573,13 +573,15 @@ async fn classify(
 
     match outcome {
         Ok(classification) => {
-            let body = npum_cpu::vit::prediction_json(
+            let body = npum_cpu::vit::prediction_json_with(
                 &classification.prediction,
                 &label,
                 top_k,
                 classification.front_end_s,
                 classification.encoder_s,
                 classification.head_s,
+                classification.dispatches,
+                classification.elt_dispatches,
             );
             json(StatusCode::OK, body)
         }
