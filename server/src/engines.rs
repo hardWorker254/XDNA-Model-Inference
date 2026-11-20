@@ -532,6 +532,95 @@ pub struct Classification {
     pub elt_dispatches: usize,
 }
 
+/// Hands: the MediaPipe palm detector + landmark net, on the host.
+///
+/// There is no XDNA handle here by design: these families have no installed
+/// design set, and `--npu-ops` is refused by name before `serve` starts. The
+/// JSON comes from the same `hands_decode::result_json` the CLI prints, so
+/// the two paths cannot drift.
+pub struct HandsEngine {
+    net: npum_cpu::hands::Hands,
+}
+
+impl HandsEngine {
+    pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
+        Ok(Self {
+            net: npum_cpu::hands::Hands::open(path).map_err(|e| e.to_string())?,
+        })
+    }
+
+    pub fn detect_bytes(
+        &self,
+        image: &[u8],
+        name: &str,
+        max_hands: i64,
+    ) -> std::result::Result<String, String> {
+        let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
+        let mut hook = |_: &str, _: usize, _: &npum_cpu::pose::Tensor| {};
+        let run = npum_cpu::hands_decode::detect(&self.net, &decoded, max_hands, &mut hook, None)?;
+        Ok(npum_cpu::hands_decode::result_json(&run, name))
+    }
+}
+
+/// Multi-person MediaPipe Pose, on the host -- same JSON as `npuimage mppose`.
+pub struct MpPoseEngine {
+    net: npum_cpu::mppose::MpPose,
+}
+
+impl MpPoseEngine {
+    pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
+        Ok(Self {
+            net: npum_cpu::mppose::MpPose::open(path).map_err(|e| e.to_string())?,
+        })
+    }
+
+    pub fn detect_bytes(
+        &self,
+        image: &[u8],
+        name: &str,
+        max_people: i64,
+    ) -> std::result::Result<String, String> {
+        let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
+        let mut hook = |_: &str, _: usize, _: &npum_cpu::pose::Tensor| {};
+        let run = npum_cpu::mppose_decode::detect(&self.net, &decoded, max_people, &mut hook, None)?;
+        Ok(npum_cpu::mppose_decode::result_json(&run, name))
+    }
+}
+
+/// PaddleOCR, on the host. The session owns mutable detector/recogniser
+/// scratch, so one request at a time holds the mutex.
+pub struct OcrEngine {
+    session: Mutex<npum_cpu::ocr_session::Ocr>,
+}
+
+// SAFETY: this engine is constructed with `array = None` and never accepts
+// one. The `Option<Box<dyn ArrayConvs>>` inside `Ocr` is therefore always
+// empty, and the rest of the session is plain host tensors behind a Mutex.
+// No non-Send transport handle ever crosses a thread boundary.
+unsafe impl Send for OcrEngine {}
+unsafe impl Sync for OcrEngine {}
+
+impl OcrEngine {
+    pub fn open(path: &std::path::Path) -> std::result::Result<Self, String> {
+        Ok(Self {
+            session: Mutex::new(npum_cpu::ocr_session::Ocr::open(path, None).map_err(|e| e.to_string())?),
+        })
+    }
+
+    pub fn read_bytes(
+        &self,
+        image: &[u8],
+        name: &str,
+        max_boxes: i64,
+    ) -> std::result::Result<String, String> {
+        let decoded = npum_cpu::vit_image::decode_image_bytes(image, name)?;
+        let mut hook = |_: &str, _: i64, _: &npum_cpu::ocr::Tensor| {};
+        let mut session = self.session.lock().map_err(|e| e.to_string())?;
+        let result = session.read(&decoded, max_boxes, &mut hook)?;
+        Ok(npum_cpu::ocr_decode::result_json(&result, name))
+    }
+}
+
 /// The pose endpoint's engine.
 ///
 /// The YOLOv8-pose network and the geometry it describes. Like the

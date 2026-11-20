@@ -304,6 +304,9 @@ pub fn serve(
     let mut speech: Option<npuembeddings_server::Transcriber> = None;
     let mut image: Option<npuembeddings_server::Classifier> = None;
     let mut pose: Option<npuembeddings_server::PoseDetector> = None;
+    let mut hands: Option<npuembeddings_server::HandsEngine> = None;
+    let mut mppose: Option<npuembeddings_server::MpPoseEngine> = None;
+    let mut ocr: Option<npuembeddings_server::OcrEngine> = None;
     match family {
         npum_families::Family::Embed => {
             if !crate::npu::check_array_budget(args, 1) {
@@ -496,49 +499,32 @@ pub fn serve(
             );
             pose = Some(detector);
         }
+        npum_families::Family::Hands => {
+            match npuembeddings_server::HandsEngine::open(&path) {
+                Ok(engine) => hands = Some(engine),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
+        }
         npum_families::Family::MpPose => {
-            // NOT "not ported": the block IS ported and `npuimage mppose`
-            // prints it. The reason there is no server here is the oracle's
-            // own -- arch 8 has no endpoint in the reference implementation either -- and saying
-            // otherwise would name a gap that does not exist while hiding the
-            // one that does.
-            eprintln!(
-                "error: this architecture has no HTTP endpoint yet, so `serve` cannot be \
-                 honoured for a MediaPipe Pose container. `npuimage mppose` is the whole \
-                 answer: a server answering from a different code path than the CLI is \
-                 exactly the drift the pose endpoint documents as a contract."
-            );
-            return crate::EXIT_REFUSED;
+            match npuembeddings_server::MpPoseEngine::open(&path) {
+                Ok(engine) => mppose = Some(engine),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
         }
         npum_families::Family::Ocr => {
-            // The oracle's refusal, in the oracle's words: arch 9 has no
-            // endpoint in the reference implementation either, and saying "not ported" would name a
-            // gap that does not exist -- the CLI reads text -- while hiding
-            // the one that does: there is no endpoint to land on.
-            eprintln!(
-                "error: this architecture has no HTTP endpoint yet, so `serve` cannot be \
-                 honoured for an OCR container. The four that exist are /v1/embeddings \
-                 (arch 1,2,3), /v1/audio/transcriptions (arch 4), /v1/classify (arch 5) \
-                 and /v1/pose (arch 6, YOLOv8n-pose -- a DIFFERENT pose model); arch 9 is \
-                 the third container whose arch the dispatcher routes here without an \
-                 endpoint to land on. Not refused because a text cannot be found over \
-                 HTTP -- it can -- but because a server that answers from a DIFFERENT \
-                 code path than `npuimage ocr` is exactly the drift the pose endpoint \
-                 documents as a contract. Until the endpoint exists, the CLI is the whole \
-                 answer."
-            );
-            return crate::EXIT_REFUSED;
-        }
-        _ => {
-            // The families whose block is not written yet refuse to start.
-            // A server that answered a request it cannot answer would be
-            // worse than one that says it is not here.
-            eprintln!(
-                "error: the {} family's status block is not ported yet, so this \
-                 server has nothing honest to say about itself.",
-                family.as_str()
-            );
-            return crate::EXIT_REFUSED;
+            match npuembeddings_server::OcrEngine::open(&path) {
+                Ok(engine) => ocr = Some(engine),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            }
         }
     }
     let status = crate::status::read_container(&container, &path);
@@ -568,6 +554,15 @@ pub fn serve(
     }
     if let Some(detector) = pose {
         state.pose = Some(std::sync::Arc::new(detector));
+    }
+    if let Some(engine) = hands {
+        state.hands = Some(std::sync::Arc::new(engine));
+    }
+    if let Some(engine) = mppose {
+        state.mppose = Some(std::sync::Arc::new(engine));
+    }
+    if let Some(engine) = ocr {
+        state.ocr = Some(std::sync::Arc::new(engine));
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -664,6 +659,21 @@ fn print_banner(binary: &str, state: &ServerState, address: &str) {
                 .map(|c| (c.num_labels(), c.image_size()))
                 .unwrap_or((0, 0));
             println!("  {labels} labels, {size}px input");
+        }
+        arch if arch.contains("hands") => {
+            println!("\n  serving http://{address}/v1/hands   (model {})", state.model_id);
+            println!("  POST multipart/form-data: image (required, PNG or JPEG), max_hands");
+            println!("  palm SSD + landmark heatmap, host backend");
+        }
+        arch if (arch.contains("mppose") || arch.contains("mediapipe_pose")) => {
+            println!("\n  serving http://{address}/v1/mppose   (model {})", state.model_id);
+            println!("  POST multipart/form-data: image (required, PNG or JPEG), max_people");
+            println!("  person SSD + landmark regression, host backend");
+        }
+        arch if arch.contains("ocr") || arch.contains("paddleocr") => {
+            println!("\n  serving http://{address}/v1/ocr   (model {})", state.model_id);
+            println!("  POST multipart/form-data: image (required, PNG or JPEG), max_boxes");
+            println!("  DB detector + SVTR recogniser, host backend");
         }
         arch if arch.contains("pose") || arch.contains("mediapipe") => {
             println!(
@@ -794,6 +804,30 @@ fn build_state(
             state.model_id
         );
         state.not_found = "this model serves /v1/classify, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch: text models answer /v1/embeddings, Whisper /v1/audio/transcriptions, a ViT /v1/classify and YOLOv8-pose /v1/pose.".to_string();
+        return Ok(state);
+    }
+    if arch.contains("hands") {
+        state.health = format!(
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"hands\",\"engine\":\"host\",\"max_hands\":10}}",
+            state.model_id
+        );
+        state.not_found = "this model serves /v1/hands, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch.".to_string();
+        return Ok(state);
+    }
+    if (arch.contains("mppose") || arch.contains("mediapipe_pose")) {
+        state.health = format!(
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"mppose\",\"engine\":\"host\",\"max_people\":10}}",
+            state.model_id
+        );
+        state.not_found = "this model serves /v1/mppose, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch.".to_string();
+        return Ok(state);
+    }
+    if arch.contains("ocr") || arch.contains("paddleocr") {
+        state.health = format!(
+            "{{\"status\":\"ok\",\"model\":\"{}\",\"backend\":\"{backend}\",\"kind\":\"ocr\",\"engine\":\"host\",\"max_boxes\":100}}",
+            state.model_id
+        );
+        state.not_found = "this model serves /v1/ocr, not /v1/embeddings. `npuimage serve <model>` picks the endpoint from the container's arch.".to_string();
         return Ok(state);
     }
     if arch.contains("pose") || arch.contains("mediapipe") {

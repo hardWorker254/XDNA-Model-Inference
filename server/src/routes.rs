@@ -66,6 +66,9 @@ pub struct ServerState {
     pub classifier: Option<Arc<crate::Classifier>>,
     /// The pose endpoint's engine, for the pose family.
     pub pose: Option<Arc<crate::PoseDetector>>,
+    pub hands: Option<Arc<crate::HandsEngine>>,
+    pub mppose: Option<Arc<crate::MpPoseEngine>>,
+    pub ocr: Option<Arc<crate::OcrEngine>>,
 }
 
 impl ServerState {
@@ -84,6 +87,9 @@ impl ServerState {
             transcriber: None,
             classifier: None,
             pose: None,
+            hands: None,
+            mppose: None,
+            ocr: None,
         }
     }
 }
@@ -99,6 +105,9 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/classify", post(classify))
         .route("/v1/pose", post(pose))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/hands", post(hands))
+        .route("/v1/mppose", post(mppose))
+        .route("/v1/ocr", post(ocr))
         .route("/v1/models", get(models))
         .route("/v1/labels", get(labels))
         .route("/health", get(health))
@@ -265,6 +274,144 @@ async fn health(State(state): State<Shared>) -> Response {
 }
 
 /// `GET /`.
+/// Parse a multipart image upload for the three additional image families.
+fn image_form(
+    headers: &axum::http::HeaderMap,
+    body: &axum::body::Bytes,
+) -> std::result::Result<Vec<crate::multipart::Part>, Response> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(boundary) = crate::multipart::boundary(content_type) else {
+        return Err(json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                &format!(
+                    "expected Content-Type: multipart/form-data with a boundary; got '{content_type}'"
+                ),
+                "invalid_request_error",
+            ),
+        ));
+    };
+    crate::multipart::parse(body, &boundary).map_err(|reason| {
+        json(
+            StatusCode::BAD_REQUEST,
+            error_body(&format!("multipart: {reason}"), "invalid_request_error"),
+        )
+    })
+}
+
+fn uploaded_image(parts: &[crate::multipart::Part]) -> std::result::Result<(Vec<u8>, String), Response> {
+    let matches: Vec<usize> = parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.name == "image" || p.name == "file")
+        .map(|(i, _)| i)
+        .collect();
+    if matches.len() != 1 {
+        return Err(json(
+            StatusCode::BAD_REQUEST,
+            error_body(
+                &format!("the request carries {} image parts; exactly one is required", matches.len()),
+                "invalid_request_error",
+            ),
+        ));
+    }
+    let part = &parts[matches[0]];
+    let name = if part.filename.is_empty() { "image" } else { &part.filename };
+    Ok((part.data.to_vec(), name.to_string()))
+}
+
+fn form_limit(parts: &[crate::multipart::Part], field: &str, default: i64) -> i64 {
+    parts
+        .iter()
+        .find(|p| p.name == field)
+        .and_then(|p| String::from_utf8_lossy(&p.data).trim().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+async fn hands(
+    State(state): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.arch.contains("hands") {
+        return not_found(&state, "/v1/hands");
+    }
+    let Some(engine) = &state.hands else {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body("the hands engine is not here", "not_implemented"),
+        );
+    };
+    let parts = match image_form(&headers, &body) { Ok(p) => p, Err(r) => return r };
+    let (data, name) = match uploaded_image(&parts) { Ok(v) => v, Err(r) => return r };
+    let max = form_limit(&parts, "max_hands", 10);
+    let engine = engine.clone();
+    let outcome = tokio::task::spawn_blocking(move || engine.detect_bytes(&data, &name, max))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match outcome {
+        Ok(body) => json(StatusCode::OK, body),
+        Err(reason) => json(StatusCode::BAD_REQUEST, error_body(&reason, "invalid_request_error")),
+    }
+}
+
+async fn mppose(
+    State(state): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !(state.arch.contains("mppose") || state.arch.contains("mediapipe_pose")) {
+        return not_found(&state, "/v1/mppose");
+    }
+    let Some(engine) = &state.mppose else {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body("the mppose engine is not here", "not_implemented"),
+        );
+    };
+    let parts = match image_form(&headers, &body) { Ok(p) => p, Err(r) => return r };
+    let (data, name) = match uploaded_image(&parts) { Ok(v) => v, Err(r) => return r };
+    let max = form_limit(&parts, "max_people", 10);
+    let engine = engine.clone();
+    let outcome = tokio::task::spawn_blocking(move || engine.detect_bytes(&data, &name, max))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match outcome {
+        Ok(body) => json(StatusCode::OK, body),
+        Err(reason) => json(StatusCode::BAD_REQUEST, error_body(&reason, "invalid_request_error")),
+    }
+}
+
+async fn ocr(
+    State(state): State<Shared>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.arch.contains("ocr") && !state.arch.contains("paddleocr") {
+        return not_found(&state, "/v1/ocr");
+    }
+    let Some(engine) = &state.ocr else {
+        return json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_body("the ocr engine is not here", "not_implemented"),
+        );
+    };
+    let parts = match image_form(&headers, &body) { Ok(p) => p, Err(r) => return r };
+    let (data, name) = match uploaded_image(&parts) { Ok(v) => v, Err(r) => return r };
+    let max = form_limit(&parts, "max_boxes", 100);
+    let engine = engine.clone();
+    let outcome = tokio::task::spawn_blocking(move || engine.read_bytes(&data, &name, max))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match outcome {
+        Ok(body) => json(StatusCode::OK, body),
+        Err(reason) => json(StatusCode::BAD_REQUEST, error_body(&reason, "invalid_request_error")),
+    }
+}
+
 async fn root(State(state): State<Shared>) -> Response {
     json(StatusCode::OK, state.health.clone())
 }

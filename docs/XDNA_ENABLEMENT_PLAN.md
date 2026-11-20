@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 1. `npum_xdna::XdnaBackend` (`backends/xdna/src/lib.rs:77`) реализует `npum_model::Backend`, но **все** его методы (`dispatch.rs:49-135`) возвращают `Error::NotImplemented`. Это устаревший слой; `prepare()` при этом объявляет `OpKind::ALL` (`lib.rs:119-134`) — использовать это как признак готовности **нельзя**.
 2. Реальный путь — сейм-трейты `core/npum-model/src/array.rs`: `ArrayGemm` (`:224`), `ArrayAttention` (`:422`), `ArrayText` (`:490`), `ArrayConvs` (`:325`), `ArrayEltwise` (`:145`). Их реализуют `ArrayGemms` (`backends/xdna/src/array_gemms.rs:196`), `ArrayConvs` (`array_convs.rs:73`), `Eltwise` (`eltwise.rs:425`) и `attention::run` (`attention.rs:410`). Диспатч идёт только через `ArrayDesign` (`array.rs:90`), который один выделяет/биндит/запускает буферы.
 
-**Вывод:** новые подключения делать через `array`-трейты, а не через `Backend`/`dispatch`. `--npu-ops` — это вопрос «где выполняется операция»: пока сейма нет, код должен **отвергаться по имени**, а не молча считаться на хосте (`cli/src/families.rs`). Отказ в `cli/src/serve.rs` теперь применяется ко ВСЕМ семействам, включая Embed (раньше Embed его обходил и молча запускал хост при `--npu-ops`); списки заменены реальными: Embed/Stt — `gemm,attn,layn,gelu,softm`, Cls — те же плюс `conv`, Pose — `conv`. Hands/MpPose/OCR остаются с пустым списком, пока у них нет HTTP-движка.
+**Вывод:** новые подключения делать через `array`-трейты, а не через `Backend`/`dispatch`. `--npu-ops` — это вопрос «где выполняется операция»: пока сейма нет, код должен **отвергаться по имени**, а не молча считаться на хосте (`cli/src/families.rs`). Отказ в `cli/src/serve.rs` теперь применяется ко ВСЕМ семействам, включая Embed (раньше Embed его обходил и молча запускал хост при `--npu-ops`); списки заменены реальными: Embed/Stt — `gemm,attn,layn,gelu,softm`, Cls — те же плюс `conv`, Pose — `conv`. Hands/MpPose/OCR получили HTTP-движки, но список кодов у них пустой: дизайн-сетов нет, `--npu-ops` отвергается по имени.
 
 ## 1. Текущее состояние
 
@@ -21,7 +21,7 @@ SPDX-License-Identifier: Apache-2.0
 | Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit/conv`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D + F): `gemm/attn/layn/gelu/softm/conv/logit` | Да (этап F), `XdnaForCls.logit` | есть (`vit-base-patch16-224/...`) | head 768×1000 упаковывается в stream `qkv` [768,2304] с нулевой панелью; не-свёрточные узлы — на хосте |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
-| Hands / MpPose / OCR | `conv` через `ArrayConvs` | нет HTTP-движков, отказ по имени | есть/частично | XDNA-инъекция в движки (движков нет); MpPose/OCR не имеют endpoint-а в эталоне |
+| Hands / MpPose / OCR | `conv` через `ArrayConvs`, depthwise — на хосте | Да (этап F): `/v1/hands`, `/v1/mppose`, `/v1/ocr`, host-only, `--npu-ops` отказ по имени | контейнеры собраны из ONNX; дизайн-сетов нет | depthwise conv и XDNA-инъекция — только с новым kernel/design |
 
 ## 2. Этапы реализации
 
@@ -31,7 +31,7 @@ SPDX-License-Identifier: Apache-2.0
 > инъецирует XDNA-хендлы в `Embedder` (BERT и GTE, тот же сейм, что у CLI);
 > `PoseDetector` получил `with_xdna` и диспатчит свёртки через `ArrayConvs`,
 > так что `conv` в списке serve для Pose теперь честный. Оставшиеся семейства
-> (Hands/MpPose/OCR) не имеют HTTP-движков и продолжают отказываться по имени.
+> (Hands/MpPose/OCR) получили host-only HTTP-движки; `--npu-ops` у них по-прежнему отказывается по имени.
 > Gemma (этап F): `backends/cpu/src/pipelines/gemma.rs` — отдельный forward для `gemma3_mqa_rope_geglu` (MQA 3:1, RoPE с двумя базами, четыре RMSNorm, GeGLU tanh, mean-pooling + две Dense + L2). Важный момент: контейнер хранит СЫРОЙ вес RMSNorm, а эталонный ONNX — уже `1+w`, поэтому `+1` складывается при загрузке весов, а не в ядре. Дизайны `gemm_rtp` и `softmax/` дают честные коды `gemm` и `softm`; `layn`, `gelu`, `attn` отвергаются по имени. Паритет на плате: 1−cos = 4.7e-3 / 3.1e-3 (допуск 1e-2), `cli/tests/gemma_array_parity.rs`; CLI и `/v1/embeddings` через `serve` работают с `--npu-ops gemm,softm`.
 > Whisper `cross_kv` (этап F): поток `cross_kv` [512,1024] уже есть в
 > `gemm_rtp_dec` — это K|V-кэш для кросс-внимания, считаемый один раз на
@@ -44,6 +44,12 @@ SPDX-License-Identifier: Apache-2.0
 > GELU-erf остаются на хосте (в дизайне нет эпилога). Fail-closed `ArrayAudioConv`
 > — supertrait `ArrayText`. На плате относительная ошибка 2.8e-3 при
 > 9 диспатчах, транскрипт ` you` из CLI и `serve`.
+> Hands/MpPose/OCR (этап F): добавлены host-only HTTP-движки и три новых
+> endpoint-а (`/v1/hands`, `/v1/mppose`, `/v1/ocr`). JSON строится теми же
+> `*_decode::result_json`, что и в CLI, поэтому ответы не расходятся. Для
+> теста собраны `.npue`-контейнеры из ONNX (`--hands-onnx`, `--mppose-onnx`,
+> `--ocr-det/rec/dict`); `--npu-ops` для этих семейств по-прежнему отказывается
+> по имени — установленных дизайн-сетов нет.
 > ViT `logit` (этап F): head 768×1000 не является законной шириной B-панели
 > (1000 не кратно 192), но в наборе есть stream `qkv` [768,2304]. Бэкенд
 > генерирует нулевую панель from `classifier.weight`, dispatchит один
