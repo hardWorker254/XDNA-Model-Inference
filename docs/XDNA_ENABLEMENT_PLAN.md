@@ -21,7 +21,7 @@ SPDX-License-Identifier: Apache-2.0
 | Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit/conv`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D + F): `gemm/attn/layn/gelu/softm/conv/logit` | Да (этап F), `XdnaForCls.logit` | есть (`vit-base-patch16-224/...`) | head 768×1000 упаковывается в stream `qkv` [768,2304] с нулевой панелью; не-свёрточные узлы — на хосте |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
-| Hands / MpPose / OCR | `conv` через `ArrayConvs`, depthwise — на хосте | Да (этап F): `/v1/hands`, `/v1/mppose`, `/v1/ocr`, `--npu-ops conv` через `XdnaFor*` | контейнеры и conv-сеты (12/22/15 потоков) собраны | depthwise conv — только с новым kernel/design |
+| Hands / MpPose / OCR | `conv` + `dwconv` через `ArrayConvs` | Да (этап F): `/v1/hands`, `/v1/mppose`, `/v1/ocr`, `--npu-ops conv` через `XdnaFor*` | контейнеры и conv-сеты (12/22/15 потоков) собраны | depthwise — отдельный `dwconv9x3` design set (этап F) |
 
 ## 2. Этапы реализации
 
@@ -44,7 +44,7 @@ SPDX-License-Identifier: Apache-2.0
 > GELU-erf остаются на хосте (в дизайне нет эпилога). Fail-closed `ArrayAudioConv`
 > — supertrait `ArrayText`. На плате относительная ошибка 2.8e-3 при
 > 9 диспатчах, транскрипт ` you` из CLI и `serve`.
-> Hands/MpPose/OCR (этап F): экспортированы conv-сеты (12/22/15 потоков, tile 64×32), контейнеры переупакованы с `--npu` (61/99/81 панель). `--npu-ops conv` диспатчит плотные свёртки и в CLI, и в `serve`; depthwise (39/62/29) остаётся на хосте.
+> Hands/MpPose/OCR (этап F): экспортированы conv-сеты (12/22/15 потоков, tile 64×32), контейнеры переупакованы с `--npu` (61/99/81 панель). `--npu-ops conv` диспатчит плотные свёртки и в CLI, и в `serve`; `--npu-ops dwconv` включает depthwise на отдельном design set (39/62/29 слоя).
 > Hands/MpPose/OCR (этап F): добавлены HTTP-движки и три новых
 > endpoint-а (`/v1/hands`, `/v1/mppose`, `/v1/ocr`). JSON строится теми же
 > `*_decode::result_json`, что и в CLI, поэтому ответы не расходятся. Для
@@ -210,7 +210,7 @@ depthwise conv Pose.
 
 - новые дизайны/потоки для `conv1/conv2` Whisper, mel-банка, 400-точечного FFT, связанного эмбеддинга-логитов;
 - новые трейты/методы в `core/npum-model/src/array.rs` и их реализации в `backends/xdna`;
-- для depthwise/transposed conv — отдельный путь: `ArrayConvs` явно их не поддерживает (`array.rs:317-324`), `array_convs.rs` не проверяет `Datapath::of`.
+- transposed conv остаётся на хосте; depthwise 3x3 теперь имеет свой `dwconv9x3` design set и метод `ArrayConvs::dwconv`.
 
 Пока этого нет — оставить операции на хосте и **называть их в статусе**, не принимать `--npu-ops` молча. Приоритет по выгоде: `gemm` (уже даёт 0.241 с против 0.435 с на ViT) > `conv` > eltwise/attn (замеры в `NPU_OPS.ru.md` показывают, что attn на массиве медленнее хоста).
 
@@ -219,7 +219,7 @@ depthwise conv Pose.
 1. Новые тесты паритета (device-gated, с skip как в `backends/xdna/tests/*`):
    - Whisper: энкодер/декодер через сеймы — mel-величины, hidden, токены greedy; отдельная оговорка для `gelu_erf` против дизайн-GELU.
    - ViT: patch-embed GEMM, hidden по слоям, logits/top-1, счётчик диспатчей (ожидаемо 48 GEMM + 1 patch embed).
-   - Server: те же проверки через `Transcriber`/`Classifier`/`PoseDetector`, а не только через CLI; для pose — подтвердить, что depthwise остался на хосте и посчитан.
+   - Server: те же проверки через `Transcriber`/`Classifier`/`PoseDetector`, а не только через CLI; для pose — подтвердить, что depthwise остался на хосте и посчитан (у YOLOv8-pose его нет).
    - int8: `.asmooth`/`.wscale` end-to-end, int8 attention → host-fallback.
    - `require_context_budget`: `tool_ran=false` и `--allow-contention`; отказ по generation/dtype через `DesignSet::fits`.
 2. Пороги: `BF16_HALF_ULP = 1/512`, `MAX_RELATIVE = 4*half_ulp`, `MAX_ONE_MINUS_COS = 2e-3` (`tests/design_numerics.rs:34-42`). Точного совпадения с CPU нет (`caps.bit_exact_with_cpu=false`, `lib.rs:92-95`).
@@ -229,7 +229,7 @@ depthwise conv Pose.
 
 - `npuimage classify … --npu-ops gemm` реально диспатчит GEMM и в статусе стоит `on the ARRAY`; паритет в пределах порогов; `classify` через `serve` делает то же.
 - `npuaudio transcribe … --npu-ops gemm,layn,gelu,softm,attn` и `npuaudio serve …` с теми же кодами идут через сеймы; два контекста (`gemm_rtp` + `gemm_rtp_dec`) проверены бюджетом.
-- Непортированные коды (`mproj`, `fft`, `logit`, depthwise conv, GTE до этапа E) по-прежнему отвергаются **по имени**, а не игнорируются.
+- Непортированные коды (`mproj`, `fft`, `logit`) по-прежнему отвергаются **по имени**, а не игнорируются; depthwise — опция `--npu-ops dwconv`, без неё остаётся на хосте.
 - Все существующие тесты (`cargo test --workspace`) и модельные гейты (`verify_tail.py`) остаются зелёными.
 
 ## 4. Риски
@@ -298,13 +298,6 @@ Depthwise теперь **есть в продакшене как отдельн�
 
 **Решение по умолчанию:** `dwconv` не входит в обычные honour-списки; это
 опция, которую надо назвать явно. fail-closed по умолчанию сохранён.
-
-**Решение:** оставляем depthwise fail-closed. Не потому что «нельзя» — ядро
-работает и считает верно — а потому что измерено: ускорения нет, а цена
-интеграции (kernel → IRON → exporter → xclbin → ConvSpec → trait → runtime →
-packer → verifier;.order 1.3–2.5k строк в 15–25 файлах) существенно превышает
-выгоду. Обе версии ядра и оба режима сохранены в дереве как research-опция,
-поэтому решение обратимо.
 
 ---
 

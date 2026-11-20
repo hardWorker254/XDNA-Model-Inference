@@ -473,11 +473,10 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // THE ARRAY, OR THE HOST.
         //
         // The flag is a question about where the run happens, and it is
-        // answered here and nowhere else: the DENSE convolutions go to the
-        // array and the depthwise ones stay on the host -- a depthwise
-        // filter reduces WITHIN one channel and has no [M, N] product in it
-        // at all. A container that cannot do it is refused HERE, before the
-        // first image, with the reason.
+        // answered here and nowhere else: dense convolutions go to the
+        // array when `conv` is named, and 3x3 depthwise goes to its own
+        // design when `dwconv` is named. A missing design set is refused
+        // HERE, before the first image, with the reason.
         let wants_dw = crate::npu::wants_op(args, "dwconv");
         let mut array = if crate::ocr::wants_conv(args) || wants_dw {
             let specs = npum_cpu::mppose::array_specs(network.geometry());

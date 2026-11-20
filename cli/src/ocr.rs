@@ -396,9 +396,9 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // THE ARRAY, OR THE HOST.
         //
         // The flag is a question about where the run happens, and it is
-        // answered here and nowhere else: the convolutions go to the array,
-        // the depthwise and the transposed ones stay on the host, and the
-        // run says how many it dispatched.
+        // answered here and nowhere else: dense and 3x3 depthwise convs go
+        // to their own designs when named; transposed ones stay on the host,
+        // and the run says how many it dispatched.
         let wants_dw = crate::npu::wants_op(args, "dwconv");
         let array = if crate::ocr::wants_conv(args) || wants_dw {
             let opened = if wants_dw {

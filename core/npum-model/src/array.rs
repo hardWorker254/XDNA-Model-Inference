@@ -318,10 +318,10 @@ pub struct PipelinedGemm<'a> {
 ///
 /// A family's dense convolution is an im2col on the host and a matrix
 /// multiplication on the array, and this trait is the second half. The
-/// depthwise convolutions, the transposed ones and the projections stay on
-/// the host: a depthwise filter reduces WITHIN one channel and has no
-/// `[M, N]` product in it at all, and a transposed convolution's output is
-/// a sum of shifted contributions, which is not a matrix product either.
+/// transposed convolutions and projections stay on the host: a transposed
+/// convolution's output is a sum of shifted contributions, not a matrix
+/// product. 3x3 depthwise has its own design and `ArrayConvs::dwconv`; it
+/// runs on the host unless that op is named and the handle carries the set.
 pub trait ArrayConvs {
     /// The backend's name, as it appears in the status block.
     fn name(&self) -> &'static str;
