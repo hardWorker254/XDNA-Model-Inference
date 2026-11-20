@@ -38,8 +38,9 @@ fn open_stt_xdna(
     args: &crate::flags::Args,
     geometry: &crate::stt::Geometry,
 ) -> std::result::Result<Option<npuembeddings_server::XdnaForStt>, String> {
-    let decode_dense =
-        crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let decode_dense = crate::npu::wants_op(args, "gemm")
+        || crate::npu::wants_op(args, "attn")
+        || crate::npu::wants_op(args, "logit");
     let dense = decode_dense
         || crate::npu::wants_op(args, "fft")
         || crate::npu::wants_op(args, "mproj");
@@ -87,6 +88,13 @@ fn open_stt_xdna(
     } else {
         None
     };
+    if let Some(dec) = dec.as_ref() {
+        if crate::npu::wants_op(args, "logit")
+            && !npum_model::array::ArrayLogits::logit_on_array(dec.as_ref())
+        {
+            return Err("--npu-ops logit: the decoder design set has no stream for it".to_string());
+        }
+    }
     let eltwise = crate::npu::open_eltwise(container, path, root, args)?;
     Ok(Some(npuembeddings_server::XdnaForStt { enc, dec, eltwise }))
 }
@@ -277,7 +285,7 @@ pub fn serve(
                 &["gemm", "attn", "layn", "gelu", "softm"]
             }
         }
-        npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm"],
+        npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit"],
         npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv"],
         // PoseDetector now takes the same ArrayConvs seam the CLI uses.
         // Hands/MpPose/Ocr have no HTTP engine in this tree, so they keep

@@ -378,7 +378,13 @@ pub fn open_array_text_specs(
     // panels generated and staged by the backend rather than named by a
     // `GemmSpec`. A run that asks only for `fft`/`mproj` still opens one.
     let frontend = wants_op(args, "fft") || wants_op(args, "mproj");
-    if !gemm && !attn && !frontend {
+    // The tied logit head's eight vocabulary-slice streams are in the same
+    // decoder set; the backend stages their B panels from embed_tokens.
+    // Only the decoder set carries the eight `logits_*` streams. The encoder
+    // set is opened by the same helper for a `logit`-only run and must not
+    // be asked to stage a panel it does not have.
+    let logit = wants_op(args, "logit") && set == "gemm_rtp_dec";
+    if !gemm && !attn && !frontend && !logit {
         return Err(format!(
             "{}: --npu-ops asks for no array work, so no design set should be opened",
             path.display()
@@ -398,14 +404,14 @@ pub fn open_array_text_specs(
         root,
         args.value("--artifacts"),
         set,
-        if gemm { "gemm" } else { "attn" },
+        if gemm { "gemm" } else if logit { "logit" } else { "attn" },
         "Pass --artifacts <dir> naming one, or build it with the exporter. The flag has no \
          default to fall back on, because this model's design is its own.",
     )?;
 
     check_layouts(&design, container, path, &specs)?;
 
-    let backend = ArrayGemms::open(path, design, &specs, attn).map_err(|e| e.to_string())?;
+    let backend = ArrayGemms::open(path, design, &specs, attn, logit).map_err(|e| e.to_string())?;
     Ok(Box::new(backend))
 }
 

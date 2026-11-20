@@ -225,6 +225,29 @@ fn gemm_seam(
     }
 }
 
+/// The tied-embedding logit projection: the array's eight vocabulary-slice
+/// streams when asked, the original host kernel otherwise. The host arm is
+/// the call this function replaced, byte for byte.
+fn logit_seam(
+    array: Option<&mut (dyn ArrayText + '_)>,
+    logit_on: bool,
+    h: &[f32],
+    embed_tokens: &[f32],
+    d: usize,
+    vocab: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    match array.filter(|_| logit_on) {
+        Some(backend) => backend
+            .logits(h, &mut out[..vocab])
+            .map_err(|e| e.to_string()),
+        None => {
+            logits_from_into(h, embed_tokens, d, vocab, out);
+            Ok(())
+        }
+    }
+}
+
 /// One LayerNorm with a separate destination: copy and normalise on the
 /// array, or the host's fused copy-and-normalise kernel.
 #[allow(clippy::too_many_arguments)]
@@ -1014,6 +1037,7 @@ impl Decoder {
         let sm_on = eltwise
             .as_deref()
             .is_some_and(|e| e.on_array(EltOp::Softmax));
+        let logit_on = array.as_deref().is_some_and(|a| a.logit_on_array());
 
         if self.scratch.scores.len() < g.heads * sc_cols {
             self.scratch.scores.resize(g.heads * sc_cols, 0.0);
@@ -1248,13 +1272,15 @@ impl Decoder {
         } else {
             layernorm_row(&mut h[..d], &self.final_gamma, &self.final_beta, g.ln_eps);
         }
-        logits_from_into(
+        logit_seam(
+            array.as_deref_mut(),
+            logit_on,
             &h[..d],
             &self.embed_tokens,
             d,
             g.vocab,
             &mut scratch_logits[..g.vocab],
-        );
+        )?;
         let next = Self::apply_policy(
             &mut scratch_logits[..g.vocab],
             &self.suppress,
@@ -2226,6 +2252,8 @@ mod tests {
     }
 
     impl ArrayText for MockText {}
+
+impl npum_model::array::ArrayLogits for MockText {}
 use npum_model::array::ArrayFrontend;
     impl ArrayFrontend for MockText {}
 

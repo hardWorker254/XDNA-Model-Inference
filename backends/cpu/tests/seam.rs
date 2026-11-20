@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use npum_model::array::{ArrayEltwise, ArrayGemm, ArrayText, AttentionShape, EltOp, };
+use npum_model::array::{ArrayEltwise, ArrayGemm, ArrayLogits, ArrayText, AttentionShape, EltOp, };
 
 /// The repository root, from this crate's manifest directory.
 fn repo_root() -> PathBuf {
@@ -282,6 +282,7 @@ impl npum_model::array::ArrayAttention for Dense {
 }
 
 impl ArrayText for Dense {}
+impl ArrayLogits for Dense {}
 use npum_model::array::ArrayFrontend;
 impl ArrayFrontend for Dense {}
 

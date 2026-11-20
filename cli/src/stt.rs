@@ -156,6 +156,7 @@ pub struct Places {
     pub layn: bool,
     pub gelu: bool,
     pub softm: bool,
+    pub logit: bool,
 }
 
 impl Places {
@@ -169,6 +170,7 @@ impl Places {
             layn: false,
             gelu: false,
             softm: false,
+            logit: false,
         }
     }
 
@@ -181,6 +183,7 @@ impl Places {
             || self.layn
             || self.gelu
             || self.softm
+            || self.logit
     }
 }
 
@@ -206,6 +209,11 @@ pub fn places(
             .map(|d| d.streams.iter().any(|s| s == op))
             .unwrap_or(false)
     };
+    let logit_present = |op: &str| {
+        decoder
+            .map(|d| d.streams.iter().any(|s| s == op))
+            .unwrap_or(false)
+    };
     Places {
         enc_gemm: gemm && enc,
         dec_gemm: gemm && dec,
@@ -215,6 +223,7 @@ pub fn places(
         layn: crate::npu::wants_op(args, "layn") && (elt("layernorm") || elt("rmsnorm")),
         gelu: crate::npu::wants_op(args, "gelu") && elt("gelu"),
         softm: crate::npu::wants_op(args, "softm") && elt("softmax"),
+        logit: crate::npu::wants_op(args, "logit") && logit_present("logits_0"),
     }
 }
 
@@ -431,7 +440,7 @@ pub fn print_block(
     );
     row(
         "logits + argmax",
-        "host",
+        if places.logit { "npu" } else { "host" },
         &format!(
             "tied embedding, {} x {} on the last row only",
             g.vocab, g.d_model
@@ -646,9 +655,11 @@ pub fn run(
     let dense = crate::npu::wants_op(args, "gemm")
         || crate::npu::wants_op(args, "attn")
         || crate::npu::wants_op(args, "fft")
-        || crate::npu::wants_op(args, "mproj");
-    let decode_dense =
-        crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+        || crate::npu::wants_op(args, "mproj")
+        || crate::npu::wants_op(args, "logit");
+    let decode_dense = crate::npu::wants_op(args, "gemm")
+        || crate::npu::wants_op(args, "attn")
+        || crate::npu::wants_op(args, "logit");
     let mut array_enc: Option<Box<dyn npum_model::array::ArrayText>> = None;
     let mut array_dec: Option<Box<dyn npum_model::array::ArrayText>> = None;
     if dense {
@@ -881,7 +892,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         if let Some(reason) = crate::families::refuse_array_not_ported(
             npum_families::Family::Stt,
             args,
-            &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm"],
+            &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm", "logit"],
         ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;

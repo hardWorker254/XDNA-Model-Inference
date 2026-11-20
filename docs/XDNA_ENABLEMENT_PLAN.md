@@ -18,7 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 | Embed (BERT) | Да: `gemm/layn/gelu/softm/attn` | Да (этап G): `Embedder::with_xdna`, тот же список кодов | есть | — |
 | GTE | Да (этап E): `gemm/attn/layn/softm` (без `gelu` — FFN гейтированный) | Да (этап G): общий с BERT путь `Embedder::with_xdna` | есть: экспортирован `gte-multilingual-base/artifacts_npu1`, упакован в `.npue` | — |
 | EmbeddingGemma | Да (этап F): `gemm/softm`, остальные коды отвергаются по имени | Да (этап F): `EmbedModel::Gemma`, тот же список | есть: `embeddinggemma-300m/artifacts_npu1`, упакован в `.npue` |Четыре RMSNorm и GeGLU — на хосте (нет дизайнов); MQA-attention считается на хосте, но QK/V — через `ArrayText` |
-| Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv`, conv1/conv2 и logit-голова считаются на хосте; GELU `erf` хоста против полинома дизайна |
+| Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm/logit`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G+F), `logit` через `ArrayLogits` в `XdnaForStt` | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv` и conv1/conv2 считаются на хосте; GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D): `gemm/attn/layn/gelu/softm/conv`; `conv` = patch-embed GEMM, `gemm` = 4 GEMM на слой | Да (этап D) | есть (`vit-base-patch16-224/...`) | head (1000) не кратен `tile_n*cols=192`; не-свёрточные узлы — на хосте. Хостовый path с bf16-контейнером починен общим `operand::read_operand` (де-tiling панелей) |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
 | Hands / MpPose / OCR | `conv` через `ArrayConvs` | нет HTTP-движков, отказ по имени | есть/частично | XDNA-инъекция в движки (движков нет); MpPose/OCR не имеют endpoint-а в эталоне |
@@ -33,6 +33,14 @@ SPDX-License-Identifier: Apache-2.0
 > так что `conv` в списке serve для Pose теперь честный. Оставшиеся семейства
 > (Hands/MpPose/OCR) не имеют HTTP-движков и продолжают отказываться по имени.
 > Gemma (этап F): `backends/cpu/src/pipelines/gemma.rs` — отдельный forward для `gemma3_mqa_rope_geglu` (MQA 3:1, RoPE с двумя базами, четыре RMSNorm, GeGLU tanh, mean-pooling + две Dense + L2). Важный момент: контейнер хранит СЫРОЙ вес RMSNorm, а эталонный ONNX — уже `1+w`, поэтому `+1` складывается при загрузке весов, а не в ядре. Дизайны `gemm_rtp` и `softmax/` дают честные коды `gemm` и `softm`; `layn`, `gelu`, `attn` отвергаются по имени. Паритет на плате: 1−cos = 4.7e-3 / 3.1e-3 (допуск 1e-2), `cli/tests/gemma_array_parity.rs`; CLI и `/v1/embeddings` через `serve` работают с `--npu-ops gemm,softm`.
+> Whisper `logit` (этап F): восемь потоков `logits_0..7` в `gemm_rtp_dec` — это
+> не 8 batch-тиров, а 8 срезов словаря по 6656 колонок (51865 = 7×6656 + 5273).
+> `ArrayGemms::open` при `--npu-ops logit` транспонирует `decoder.embed_tokens`
+> в восемь bf16-панелей [512,6656] и тилирует их через `stage_frontend_b`;
+> `ArrayLogits::logits` диспатчит все восемь и собирает плоский `[vocab]`.
+> Хостовый `logits_from_into` остался побайтно прежним, а `logit` теперь в
+> честных списках CLI и `serve`. На плате: 1−cos = 1.7e-6, argmax совпадает,
+> 8 диспатчей на шаг; `--npu-ops logit` даёт тот же транскрипт ` you`.
 > G — device-gated (`cli/tests/text_array_parity.rs`) прогоняет BERT и GTE через
 > `ArrayText`/`ArrayEltwise` и сравнивает 1−cos и счётчик диспатчей; пропускается
 > без `/dev/accel/accel0` и без контейнера с панелями (переменные
@@ -120,8 +128,8 @@ SPDX-License-Identifier: Apache-2.0
 > проверки ширины — `SoftmaxTooNarrow` / `SoftmaxWidthMismatch`. `fix_width`
 > и бюджет контекстов включены и для GTE. Mock-тест подтверждает 4 GEMM +
 > attention + 3 LN + 1 GELU, host-путь побайтно прежний. Stage G закрыт,
-Stage F частично закрыт (fft/mproj — см. выше); остаются conv/FFT-аналоги
-других семей, logit и depthwise.
+Stage F частично закрыт (fft/mproj и logit — см. выше); остаются conv1/conv2,
+`cross_kv`, depthwise conv инекратные head-проекции.
 
 ### Этап A. Общая инфраструктура открытия дизайнов и спеков
 

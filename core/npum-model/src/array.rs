@@ -455,6 +455,35 @@ pub trait ArrayFrontend {
     }
 }
 
+/// The Whisper decoder's tied-embedding logit head.
+///
+/// The eight `logits_*` streams live in the decoder design set and compute
+/// eight vocabulary slices of one step. They are not `ArrayGemm` calls: the
+/// B operands are the tied embedding table, staged as host-generated panels,
+/// and the caller wants one flat `[vocab]` vector back.
+///
+/// The defaults fail closed: a backend that has not staged these panels must
+/// refuse the operation, not silently answer from the host and report the
+/// flag as honoured.
+pub trait ArrayLogits {
+    /// Whether this backend really dispatches the tied logit head.
+    fn logit_on_array(&self) -> bool {
+        false
+    }
+
+    /// How many logit chunks have been dispatched.
+    fn logit_dispatches(&self) -> usize {
+        0
+    }
+
+    /// `logits = h @ embed_tokens.T`, for one decoder step.
+    fn logits(&mut self, _h: &[f32], _out: &mut [f32]) -> Result<()> {
+        Err(ArrayError(
+            "this array backend cannot dispatch the tied logit head".to_string(),
+        ))
+    }
+}
+
 /// The attention's own shape.
 ///
 /// The family knows it and the array's side needs it, and it is one struct
@@ -558,4 +587,4 @@ pub trait ArrayAttention {
 ///
 /// So the family holds ONE handle, and this trait is it: the two traits'
 /// operations, on one object.
-pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend {}
+pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend + ArrayLogits {}

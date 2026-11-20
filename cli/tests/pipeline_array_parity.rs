@@ -244,3 +244,50 @@ fn whisper_array_path_dispatches_and_transcribes_the_same_audio() {
     assert_eq!(fe.n_chunks, host.n_chunks);
     assert_eq!(fe.text.trim(), host.text.trim(), "the array front end changed the transcript");
 }
+
+/// The decoder's tied logit head, alone, against the host's dot-product tree.
+///
+/// `--npu-ops logit` stages eight [512, 6656] panels from `embed_tokens` and
+/// dispatches one per vocabulary chunk. The host's `logits_from` is the
+/// oracle; the array uses bf16 panels, so compare with a bf16-sized tolerance
+/// AND check that argmax -- the only thing the greedy decoder consumes --
+/// survives it.
+#[test]
+fn whisper_logit_streams_match_the_host() {
+    use npum_model::array::ArrayLogits;
+
+    if !board_present() {
+        eprintln!("skipping: no NPU device node");
+        return;
+    }
+    let Some(path) = container("NPUEMBEDDINGS_WHISPER_NPU") else {
+        eprintln!("skipping: set NPUEMBEDDINGS_WHISPER_NPU");
+        return;
+    };
+    let file = npum_format::Container::open(&path).expect("the container opens");
+    let d = file.config().get_i64("d_model").expect("d_model") as usize;
+    let vocab = file.config().get_i64("vocab_size").expect("vocab_size") as usize;
+    let bytes = file.tensor_bytes("decoder.embed_tokens").expect("decoder.embed_tokens");
+    let embed: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let h: Vec<f32> = (0..d).map(|i| ((i as f64 * 0.017).sin() * 0.25) as f32).collect();
+    let want = npum_cpu::whisper::logits_from(&h, &embed, d, vocab);
+
+    let root = std::env::var("NPU_ARTIFACTS").ok().map(PathBuf::from);
+    let opts = args("logit", root.as_deref());
+    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut dec = npu::open_array_text_specs(&file, &path, &root_dir, &opts, Vec::new(), "gemm_rtp_dec")
+        .expect("the decoder's logit design opens");
+    assert!(ArrayLogits::logit_on_array(dec.as_ref()));
+    let mut got = vec![0.0f32; vocab];
+    ArrayLogits::logits(dec.as_mut(), &h, &mut got).expect("the array's logits");
+    assert_eq!(ArrayLogits::logit_dispatches(dec.as_ref()), 8);
+
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    assert_eq!(argmax(&want), argmax(&got), "the greedy decoder would choose another token");
+    let dist = cos_distance(&want, &got);
+    eprintln!("logits: 1 - cos = {dist:.4e}, argmax {} / {}", argmax(&want), argmax(&got));
+    assert!(dist <= 2e-2, "1 - cos = {dist:.4e}");
+}

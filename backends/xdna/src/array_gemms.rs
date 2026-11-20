@@ -135,6 +135,22 @@ struct FrontendStreams {
     mel: Option<BakedStream>,
 }
 
+/// One vocabulary slice of the Whisper decoder's tied logit head.
+#[derive(Debug, Clone, Copy)]
+struct LogitChunk {
+    stream: BakedStream,
+    first_id: usize,
+    n_real: usize,
+}
+
+/// The eight `logits_*` streams of the decoder design set, if requested.
+#[derive(Debug, Default)]
+struct LogitStreams {
+    chunks: Vec<LogitChunk>,
+    out: Vec<f32>,
+    dispatches: usize,
+}
+
 /// One projection the array will run.
 #[derive(Debug, Clone)]
 pub struct GemmSpec {
@@ -260,6 +276,8 @@ pub struct ArrayGemms<T: Transport> {
     frontend: FrontendStreams,
     /// How many front-end streams have been dispatched.
     frontend_dispatches: usize,
+    /// The tied embedding's eight vocabulary-slice streams.
+    logits: LogitStreams,
 }
 
 /// Stage a host-generated B operand (twiddles or the mel bank) in the
@@ -379,6 +397,7 @@ impl<T: Transport> ArrayGemms<T> {
         mut design: ArrayDesign<T>,
         specs: &[GemmSpec],
         attention: bool,
+        logit: bool,
     ) -> Result<Self, DesignError> {
         let file = Container::open(container).map_err(|e| {
             DesignError::Design(format!("cannot open {}: {e}", container.display()))
@@ -542,7 +561,84 @@ impl<T: Transport> ArrayGemms<T> {
             }
         }
 
-        if panels.is_empty() && !attention && frontend.dft.is_none() && frontend.mel.is_none() {
+        // THE DECODER'S TIED LOGIT HEAD.
+        //
+        // Eight streams of N=6656 cover the 51865-id vocabulary. The B
+        // operand is the tied embedding table, transposed and tiled here;
+        // it is NOT baked into the xclbin. Nothing is staged unless the run
+        // actually named `logit`, so a plain projection run pays no 54 MB
+        // device-memory bill and cannot claim a dispatch it did not make.
+        let mut logits = LogitStreams::default();
+        if logit {
+            let embed = read_f32_tensor(&file, "decoder.embed_tokens", container)?;
+            let vocab = file.config().get_i64("vocab_size").ok_or_else(|| {
+                DesignError::Design(
+                    "the container has no vocab_size for the logit head".to_string(),
+                )
+            })? as usize;
+            let mut found: Vec<(usize, BakedStream)> = Vec::new();
+            for stream in streams.iter() {
+                if !stream.op.starts_with("logits_") {
+                    continue;
+                }
+                // The host-generated panel is staged like the front end's;
+                // the slot belongs to this same design and context.
+                let k = stream.k as usize;
+                let n = stream.n as usize;
+                if embed.len() < vocab * k {
+                    return Err(DesignError::Design(format!(
+                        "decoder.embed_tokens holds {} floats; the logit head needs {}",
+                        embed.len(),
+                        vocab * k
+                    )));
+                }
+                let first_id = found.len() * n;
+                if first_id >= vocab {
+                    continue;
+                }
+                let n_real = n.min(vocab - first_id);
+                let mut dense = vec![0.0f32; k * n];
+                for col in 0..n_real {
+                    for row in 0..k {
+                        dense[row * n + col] = embed[(first_id + col) * k + row];
+                    }
+                }
+                let weight_slot = stage_frontend_b(&mut design, &dense, k, n)?;
+                found.push((
+                    stream.slot as usize,
+                    BakedStream {
+                        slot: stream.slot as usize,
+                        m: stream.m as usize,
+                        k,
+                        n,
+                        weight_slot,
+                    },
+                ));
+                logits.chunks.push(LogitChunk {
+                    stream: found.last().unwrap().1,
+                    first_id,
+                    n_real,
+                });
+            }
+            if logits.chunks.is_empty() {
+                return Err(DesignError::Design(format!(
+                    "{}: --npu-ops logit was asked for but the design has no logits_* streams",
+                    container.display()
+                )));
+            }
+            let last = logits.chunks.last().unwrap();
+            if last.first_id + last.n_real < vocab {
+                return Err(DesignError::Design(format!(
+                    "the design's {} logit chunks cover {} ids, and the vocabulary has {}",
+                    logits.chunks.len(),
+                    last.first_id + last.n_real,
+                    vocab
+                )));
+            }
+            logits.out = vec![0.0f32; logits.chunks[0].stream.m * logits.chunks[0].stream.n];
+        }
+
+        if panels.is_empty() && !attention && frontend.dft.is_none() && frontend.mel.is_none() && logits.chunks.is_empty() {
             return Err(DesignError::Design(format!(
                 "{}: the array was asked for and no projection could be staged.",
                 container.display()
@@ -577,6 +673,7 @@ impl<T: Transport> ArrayGemms<T> {
             quant,
             frontend,
             frontend_dispatches: 0,
+            logits,
         })
     }
 
@@ -1244,6 +1341,49 @@ impl<T: Transport> npum_model::array::ArrayFrontend for ArrayGemms<T> {
     }
 }
 
+impl<T: Transport> npum_model::array::ArrayLogits for ArrayGemms<T> {
+    fn logit_on_array(&self) -> bool {
+        !self.logits.chunks.is_empty()
+    }
+
+    fn logit_dispatches(&self) -> usize {
+        self.logits.dispatches
+    }
+
+    fn logits(&mut self, h: &[f32], out: &mut [f32]) -> npum_model::array::Result<()> {
+        let chunks = self.logits.chunks.clone();
+        if chunks.is_empty() {
+            return Err(npum_model::array::ArrayError(
+                "this design has no logit streams -- --npu-ops logit must be refused by name"
+                    .to_string(),
+            ));
+        }
+        let d = chunks[0].stream.k;
+        if h.len() < d || out.len() < chunks.last().unwrap().first_id + chunks.last().unwrap().n_real {
+            return Err(npum_model::array::ArrayError(format!(
+                "the logit head needs {} input and {} output floats, got {} and {}",
+                d,
+                chunks.last().unwrap().first_id + chunks.last().unwrap().n_real,
+                h.len(),
+                out.len()
+            )));
+        }
+        let mut a = vec![0.0f32; chunks[0].stream.m * d];
+        a[..d].copy_from_slice(&h[..d]);
+        // Take the scratch C tile out so `baked` can borrow the backend.
+        let mut c = std::mem::take(&mut self.logits.out);
+        for chunk in &chunks {
+            self.baked(chunk.stream, &a, 1, &mut c)
+                .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+            out[chunk.first_id..chunk.first_id + chunk.n_real]
+                .copy_from_slice(&c[..chunk.n_real]);
+            self.logits.dispatches += 1;
+        }
+        self.logits.out = c;
+        Ok(())
+    }
+}
+
 impl<T: Transport> npum_model::array::ArrayText for ArrayGemms<T> {}
 
 #[cfg(test)]
@@ -1454,6 +1594,7 @@ mod int8_tests {
                 k: 4,
                 n: 2,
             }],
+            false,
             false,
         )
         .unwrap();
@@ -1681,6 +1822,7 @@ mod async_tests {
                 quant: Vec::new(),
                 frontend: FrontendStreams::default(),
                 frontend_dispatches: 0,
+                logits: LogitStreams::default(),
             },
             log,
         )
