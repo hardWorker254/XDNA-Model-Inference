@@ -41,7 +41,7 @@ use crate::kernels;
 use crate::parallel;
 use crate::whisper_features::{gelu_erf_exact, MelSpec};
 use npum_format::Container;
-use npum_model::array::{ArrayEltwise, ArrayText, ArrayTextRef, AttentionShape, EltOp};
+use npum_model::array::{ArrayEltwise, ArrayText, ArrayTextRef, AttentionShape, EltOp, };
 use std::path::Path;
 
 /// The model's geometry, as the container states it.
@@ -2226,6 +2226,8 @@ mod tests {
     }
 
     impl ArrayText for MockText {}
+use npum_model::array::ArrayFrontend;
+    impl ArrayFrontend for MockText {}
 
     struct MockEltwise {
         log: Rc<RefCell<SeamLog>>,

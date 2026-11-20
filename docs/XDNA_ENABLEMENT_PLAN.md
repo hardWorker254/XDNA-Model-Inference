@@ -17,7 +17,7 @@ SPDX-License-Identifier: Apache-2.0
 |---|---|---|---|---|
 | Embed (BERT) | Да: `gemm/layn/gelu/softm/attn` | Да (этап G): `Embedder::with_xdna`, тот же список кодов | есть | — |
 | GTE | Да (этап E): `gemm/attn/layn/softm` (без `gelu` — FFN гейтированный) | Да (этап G): общий с BERT путь `Embedder::with_xdna` | есть: экспортирован `gte-multilingual-base/artifacts_npu1`, упакован в `.npue` | MQA/banded — отдельная архитектура `gemma3_mqa_rope_geglu`, не `gte.rs` |
-| Whisper STT | Да (этапы B–D + G): `gemm/attn/layn/gelu/softm`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этап D) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv` и logit-голова считаются на хосте; GELU `erf` хоста против полинома дизайна |
+| Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv`, conv1/conv2 и logit-голова считаются на хосте; GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D): `gemm/attn/layn/gelu/softm/conv`; `conv` = patch-embed GEMM, `gemm` = 4 GEMM на слой | Да (этап D) | есть (`vit-base-patch16-224/...`) | head (1000) не кратен `tile_n*cols=192`; не-свёрточные узлы — на хосте. Хостовый path с bf16-контейнером починен общим `operand::read_operand` (де-tiling панелей) |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
 | Hands / MpPose / OCR | `conv` через `ArrayConvs` | нет HTTP-движков, отказ по имени | есть/частично | XDNA-инъекция в движки (движков нет); MpPose/OCR не имеют endpoint-а в эталоне |
@@ -73,6 +73,19 @@ SPDX-License-Identifier: Apache-2.0
 > был нулём) — теперь `max(batch, tier_rows/seq)`; (4) `ensure_run` обрезал
 > `a_q` по `seq`, хотя буфер держит только один tier, — индекс зажат. Плюс
 > `Transcript::n_dispatches` перестал быть заглушкой и читается из бэкендов.
+>
+> Stage F (фронтэнд Whisper) закрыт для `fft` и `mproj`: потоки `dft400` и
+> `mel_proj` уже были в экспортированном `gemm_rtp`, но их B-операнды НЕ
+> вшиты в xclbin — бэкенд сам генерирует матрицу twiddle и Slaney-банк,
+> тайлит их в `b_layout` дизайна и стейджит как обычный panel (`pipelines/
+> operand`-подход для GEMM, `stage_frontend_b` для фронтэнда). Добавлен
+> `ArrayFrontend` (`dft400`/`mproj`) в `core/npum-model/src/array.rs`; он
+> супертрейт `ArrayText`, поэтому один хэндл энкодера обслуживает и GEMM, и
+> фронтэнд. Эпилог `log10` после mel-проекции теперь общий для хоста и массива
+> (без него транскрипт превращался в «and and and»). Замер на плате: DFT
+> max rel err 1.76e-2 (bf16 twiddles, как и обещал экспортер), mel 2.24e-3;
+> транскрипт `fft,mproj` совпадает с хостом, dispatching подтверждён.
+> `npuaudio serve --npu-ops fft,mproj` тоже проверен по HTTP: `/v1/audio/transcriptions` на `tone.wav` вернул тот же транскрипт, что и хост. Полный `cargo test --workspace` с платой: exit 0, 51 `test result: ok`.
 > A — добавлен `cli/src/npu.rs`: общий поиск дизайнов (`--artifacts` учитывается
 > и при открытии, и в статус-блоке), открытие GEMM/eltwise/conv, проверки
 > BF16-панелей и `b_layout_hash`, сборка спеков из геометрии (`TextGeometry`:
@@ -104,7 +117,9 @@ SPDX-License-Identifier: Apache-2.0
 > при Array-softmax пишутся с шагом `sc_cols`, хвост заполняется `-1e30`;
 > проверки ширины — `SoftmaxTooNarrow` / `SoftmaxWidthMismatch`. `fix_width`
 > и бюджет контекстов включены и для GTE. Mock-тест подтверждает 4 GEMM +
-> attention + 3 LN + 1 GELU, host-путь побайтно прежний. Stage F–G — впереди.
+> attention + 3 LN + 1 GELU, host-путь побайтно прежний. Stage G закрыт,
+Stage F частично закрыт (fft/mproj — см. выше); остаются conv/FFT-аналоги
+других семей, logit и depthwise.
 
 ### Этап A. Общая инфраструктура открытия дизайнов и спеков
 

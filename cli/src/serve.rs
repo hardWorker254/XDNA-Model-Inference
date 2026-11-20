@@ -38,7 +38,11 @@ fn open_stt_xdna(
     args: &crate::flags::Args,
     geometry: &crate::stt::Geometry,
 ) -> std::result::Result<Option<npuembeddings_server::XdnaForStt>, String> {
-    let dense = crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let decode_dense =
+        crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let dense = decode_dense
+        || crate::npu::wants_op(args, "fft")
+        || crate::npu::wants_op(args, "mproj");
     let elt = ["layn", "gelu", "softm"]
         .iter()
         .any(|code| crate::npu::wants_op(args, code));
@@ -57,7 +61,21 @@ fn open_stt_xdna(
     } else {
         None
     };
-    let dec = if dense {
+    // Fail closed: a design without dft400/mel_proj must not run that pass
+    // on the host while the flag says "array".
+    if let Some(enc) = enc.as_ref() {
+        for (code, on_array) in [
+            ("fft", npum_model::array::ArrayFrontend::dft_on_array(enc.as_ref())),
+            ("mproj", npum_model::array::ArrayFrontend::mproj_on_array(enc.as_ref())),
+        ] {
+            if crate::npu::wants_op(args, code) && !on_array {
+                return Err(format!(
+                    "--npu-ops {code}: the encoder design set has no stream for it"
+                ));
+            }
+        }
+    }
+    let dec = if decode_dense {
         Some(crate::npu::open_array_text_specs(
             container,
             path,
@@ -245,7 +263,7 @@ pub fn serve(
                 &["gemm", "attn", "layn", "gelu", "softm"]
             }
         }
-        npum_families::Family::Stt => &["gemm", "attn", "layn", "gelu", "softm"],
+        npum_families::Family::Stt => &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm"],
         npum_families::Family::Cls => &["gemm", "attn", "layn", "gelu", "softm", "conv"],
         // PoseDetector now takes the same ArrayConvs seam the CLI uses.
         // Hands/MpPose/Ocr have no HTTP engine in this tree, so they keep

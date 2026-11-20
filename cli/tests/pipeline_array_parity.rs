@@ -210,4 +210,37 @@ fn whisper_array_path_dispatches_and_transcribes_the_same_audio() {
     // Текст дискретен: bf16 может заменить одно слово. Проверяем, что прогон
     // остался тем же по числу окон; полный численный паритет — за платой.
     assert_eq!(host.n_chunks, got.n_chunks, "different number of windows");
+
+    // The front end's two matrix passes ALONE: dft400/mel_proj are streams
+    // inside the encoder set, generated and staged by the backend. With only
+    // `fft,mproj` asked for, the encoder's GEMMs and the decoder stay on the
+    // host, so any difference in the transcript is the front end's.
+    let fe_opts = args("fft,mproj", root.as_deref());
+    let mut fe_enc = npu::open_array_text_specs(
+        &container,
+        &path,
+        &root_dir,
+        &fe_opts,
+        Vec::new(),
+        "gemm_rtp",
+    )
+    .expect("the front-end design opens without GEMM panels");
+    assert!(fe_enc.dft_on_array() && fe_enc.mproj_on_array());
+    let mut fe_decoder =
+        npum_cpu::whisper::Decoder::open(&path).expect("the front-end decoder opens");
+    let fe = npum_cpu::whisper_session::transcribe_samples(
+        &encoder,
+        &mut fe_decoder,
+        &tokenizer,
+        &samples,
+        &options,
+        &weights,
+        Some(&mut *fe_enc),
+        None,
+        None,
+    )
+    .expect("the front-end array run");
+    assert!(fe_enc.frontend_dispatches() > 0, "no front-end dispatch");
+    assert_eq!(fe.n_chunks, host.n_chunks);
+    assert_eq!(fe.text.trim(), host.text.trim(), "the array front end changed the transcript");
 }

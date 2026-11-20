@@ -6,7 +6,7 @@
 
 use crate::kernels;
 use crate::parallel;
-use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape, EltOp};
+use npum_model::array::{ArrayEltwise, ArrayTextRef, AttentionShape, EltOp, };
 use npum_model::Ops;
 use std::path::Path;
 
@@ -1291,6 +1291,8 @@ mod array_seam_tests {
         }
     }
     impl ArrayText for MockText {}
+use npum_model::array::ArrayFrontend;
+    impl ArrayFrontend for MockText {}
 
     struct MockEltwise {
         log: Rc<RefCell<Log>>,

@@ -359,7 +359,11 @@ pub fn open_array_text_specs(
 ) -> Result<Box<dyn ArrayText + Send>, String> {
     let gemm = !specs.is_empty();
     let attn = wants_op(args, "attn");
-    if !gemm && !attn {
+    // The front end's two matrix passes live in this SAME set, with their B
+    // panels generated and staged by the backend rather than named by a
+    // `GemmSpec`. A run that asks only for `fft`/`mproj` still opens one.
+    let frontend = wants_op(args, "fft") || wants_op(args, "mproj");
+    if !gemm && !attn && !frontend {
         return Err(format!(
             "{}: --npu-ops asks for no array work, so no design set should be opened",
             path.display()

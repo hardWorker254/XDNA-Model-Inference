@@ -289,13 +289,23 @@ fn run_window(
     options: &Options,
     weights: &FrontEndWeights,
     transcript: &mut Transcript,
-    array_enc: npum_model::array::ArrayTextRef<'_, '_>,
+    mut array_enc: npum_model::array::ArrayTextRef<'_, '_>,
     array_dec: npum_model::array::ArrayTextRef<'_, '_>,
     mut eltwise: Option<&mut (dyn npum_model::array::ArrayEltwise + '_)>,
 ) -> Result<Segment, String> {
     let geometry = encoder.geometry();
     let mel_start = std::time::Instant::now();
-    let (mel, _used) = crate::whisper_features::log_mel_30s(window, geometry.mel_bins);
+    // The front end's two matrix-shaped passes are streams INSIDE the
+    // encoder's design set. The same handle serves both; a design without
+    // them leaves the pass on the host (the codes were refused by name
+    // before this run if the user asked for them).
+    let frontend: Option<&mut (dyn npum_model::array::ArrayFrontend + '_)> =
+        array_enc.as_deref_mut().map(|a| a as &mut dyn npum_model::array::ArrayFrontend);
+    let (mel, _used) = crate::whisper_features::log_mel_30s_with_frontend(
+        window,
+        geometry.mel_bins,
+        frontend,
+    )?;
     transcript.mel_seconds += mel_start.elapsed().as_secs_f64();
 
     let conv_start = std::time::Instant::now();

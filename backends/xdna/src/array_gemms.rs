@@ -116,6 +116,25 @@ fn read_f32_tensor(
         .collect())
 }
 
+/// A stream whose B operand is BAKED into the xclbin, not staged from the
+/// container: the DFT's twiddle matrix and the mel filter bank.
+#[derive(Debug, Clone, Copy)]
+struct BakedStream {
+    slot: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    /// The staged, pre-tiled B panel: twiddles for dft400, bank for mel_proj.
+    weight_slot: usize,
+}
+
+/// The front-end streams the design set carries, if any.
+#[derive(Debug, Default, Clone, Copy)]
+struct FrontendStreams {
+    dft: Option<BakedStream>,
+    mel: Option<BakedStream>,
+}
+
 /// One projection the array will run.
 #[derive(Debug, Clone)]
 pub struct GemmSpec {
@@ -237,6 +256,106 @@ pub struct ArrayGemms<T: Transport> {
     /// Read once at `open`, shared with each submitted ticket as an `Arc`, and
     /// never looked up again in the dispatch loop.
     quant: Vec<Arc<QuantScales>>,
+    /// The DFT and mel streams, when the design set carries them.
+    frontend: FrontendStreams,
+    /// How many front-end streams have been dispatched.
+    frontend_dispatches: usize,
+}
+
+/// Stage a host-generated B operand (twiddles or the mel bank) in the
+/// design's own bf16 panel order, exactly as a container operand would be.
+fn stage_frontend_b<T: Transport>(
+    design: &mut ArrayDesign<T>,
+    dense: &[f32],
+    k: usize,
+    n: usize,
+) -> Result<usize, DesignError> {
+    let layout = design.info().b_layout.as_ref().ok_or_else(|| {
+        DesignError::Design("the design carries no B layout for the front end".to_string())
+    })?;
+    let mut raw = vec![0u8; dense.len() * 2];
+    npum_format::bf16::f32_to_bf16_bytes(dense, &mut raw);
+    let tiled = npum_format::tiling::tile_b(
+        &raw,
+        k,
+        n,
+        layout.tile_k as usize,
+        layout.tile_n as usize,
+        2,
+        Some(layout.mac_s as usize),
+        Some(layout.mac_t as usize),
+        npum_format::tiling::TileOrder::Kn,
+    )
+    .map_err(|e| DesignError::Design(format!("the front end's B panel does not tile: {e}")))?;
+    design.stage(BUFFER_WEIGHTS, &tiled)
+}
+
+/// The 400-point DFT as a `[448, 512]` GEMM operand: 201 cosine columns,
+/// then 201 sine columns, both zero beyond input row 400.
+fn dft_b(k: usize, n: usize) -> Vec<f32> {
+    const NFFT: usize = 400;
+    let half = n / 2;
+    let mut b = vec![0.0f32; k * n];
+    for row in 0..NFFT {
+        for j in 0..half {
+            let angle = 2.0 * std::f64::consts::PI * row as f64 * j as f64 / NFFT as f64;
+            b[row * n + j] = angle.cos() as f32;
+            b[row * n + half + j] = -(angle.sin() as f32);
+        }
+    }
+    b
+}
+
+/// Slaney's mel scale and its inverse, as used by Whisper's feature extractor.
+fn hz_to_mel(hz: f64) -> f64 {
+    const MIN_LOG_HZ: f64 = 1000.0;
+    const MIN_LOG_MEL: f64 = 15.0;
+    let logstep = 27.0 / 6.4f64.ln();
+    if hz < MIN_LOG_HZ {
+        return 3.0 * hz / 200.0;
+    }
+    MIN_LOG_MEL + (hz / MIN_LOG_HZ).ln() * logstep
+}
+
+fn mel_to_hz(mel: f64) -> f64 {
+    const MIN_LOG_HZ: f64 = 1000.0;
+    const MIN_LOG_MEL: f64 = 15.0;
+    let logstep = 6.4f64.ln() / 27.0;
+    if mel < MIN_LOG_MEL {
+        return 200.0 * mel / 3.0;
+    }
+    MIN_LOG_HZ * (logstep * (mel - MIN_LOG_MEL)).exp()
+}
+
+/// The `(201, n_mels)` Slaney bank as a `[K, N]` GEMM operand, zero padded.
+fn mel_b(k: usize, n: usize, n_mels: usize, sample_rate: usize) -> Vec<f32> {
+    const NFFT: usize = 400;
+    const N_BINS: usize = NFFT / 2 + 1;
+    let mut centre = vec![0.0f64; n_mels + 2];
+    let mel_min = hz_to_mel(0.0);
+    let mel_max = hz_to_mel(sample_rate as f64 / 2.0);
+    for (i, c) in centre.iter_mut().enumerate() {
+        *c = mel_to_hz(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64);
+    }
+    let mut b = vec![0.0f32; k * n];
+    for j in 0..n_mels.min(n) {
+        let (lo, mid, hi) = (centre[j], centre[j + 1], centre[j + 2]);
+        let enorm = 2.0 / (hi - lo);
+        for row in 0..N_BINS.min(k) {
+            let hz = sample_rate as f64 / 2.0 * row as f64 / (N_BINS - 1) as f64;
+            let w = if hz > lo && hz < hi {
+                if hz <= mid {
+                    (hz - lo) / (mid - lo)
+                } else {
+                    (hi - hz) / (hi - mid)
+                }
+            } else {
+                0.0
+            };
+            b[row * n + j] = (w * enorm) as f32;
+        }
+    }
+    b
 }
 
 impl<T: Transport> ArrayGemms<T> {
@@ -381,7 +500,49 @@ impl<T: Transport> ArrayGemms<T> {
             );
         }
 
-        if panels.is_empty() && !attention {
+        // The front end's baked streams share this design and this hardware
+        // context with the projections -- no second open, no second context.
+        let mut frontend = FrontendStreams::default();
+        let streams = design.info().streams.clone();
+        for stream in streams.iter() {
+            let (k, n) = (stream.k as usize, stream.n as usize);
+            // The B operand is NOT baked into the xclbin: the DFT's twiddles
+            // are generated here, tiled in the design's own order and staged
+            // into the weights buffer like any other panel.
+            let weight_slot = match stream.op.as_str() {
+                "dft400" => stage_frontend_b(&mut design, &dft_b(k, n), k, n)?,
+                "mel_proj" => {
+                    let n_mels = file.config().get_i64("num_mel_bins").ok_or_else(|| {
+                        DesignError::Design(
+                            "the container has no num_mel_bins for mel_proj".to_string(),
+                        )
+                    })? as usize;
+                    let sample_rate = file
+                        .config()
+                        .get_i64("sample_rate")
+                        .unwrap_or(16000) as usize;
+                    stage_frontend_b(&mut design, &mel_b(k, n, n_mels, sample_rate), k, n)?
+                }
+                _ => continue,
+            };
+            let baked = BakedStream {
+                slot: stream.slot as usize,
+                m: stream.m as usize,
+                k,
+                n,
+                weight_slot,
+            };
+            let target = match stream.op.as_str() {
+                "dft400" => &mut frontend.dft,
+                "mel_proj" => &mut frontend.mel,
+                _ => continue,
+            };
+            if target.map_or(true, |old| baked.m > old.m) {
+                *target = Some(baked);
+            }
+        }
+
+        if panels.is_empty() && !attention && frontend.dft.is_none() && frontend.mel.is_none() {
             return Err(DesignError::Design(format!(
                 "{}: the array was asked for and no projection could be staged.",
                 container.display()
@@ -414,6 +575,8 @@ impl<T: Transport> ArrayGemms<T> {
             resolved_buf: Vec::new(),
             resolved_cache: HashMap::new(),
             quant,
+            frontend,
+            frontend_dispatches: 0,
         })
     }
 
@@ -756,6 +919,26 @@ impl<T: Transport> ArrayGemms<T> {
             .and_then(|p| p.tiers.iter().map(|(rows, _)| *rows).max())
             .unwrap_or(0)
     }
+
+    /// Dispatch one baked stream against caller-owned A and C buffers.
+    /// No weights buffer is bound: the twiddles and the mel bank are part of
+    /// the xclbin, so there is no staged panel for them.
+    fn baked(
+        &mut self,
+        stream: BakedStream,
+        a: &[f32],
+        rows: usize,
+        out: &mut [f32],
+    ) -> Result<(), DesignError> {
+        let slot = self.free_slot()?;
+        self.design.bind(BUFFER_WEIGHTS, stream.weight_slot)?;
+        self.design.bind(0, slot)?;
+        self.design.bind(2, slot)?;
+        gemm_with_scratch(
+            &mut self.design, stream.slot, a, rows, stream.m, stream.k,
+            None, stream.n, out, &mut self.scratch,
+        )
+    }
 }
 
 impl<T: Transport> npum_model::array::ArrayGemm for ArrayGemms<T> {
@@ -921,6 +1104,143 @@ impl<T: Transport> npum_model::array::ArrayAttention for ArrayGemms<T> {
         })?;
         crate::attention::run(&mut self.design, attention, qkv, shape, mask, softmax, ctx)
             .map_err(|e| npum_model::array::ArrayError(e.to_string()))
+    }
+}
+
+impl<T: Transport> npum_model::array::ArrayFrontend for ArrayGemms<T> {
+    fn name(&self) -> &'static str {
+        "xrt"
+    }
+
+    fn frontend_on_array(&self) -> bool {
+        self.frontend.dft.is_some() || self.frontend.mel.is_some()
+    }
+
+    fn dft_on_array(&self) -> bool {
+        self.frontend.dft.is_some()
+    }
+
+    fn mproj_on_array(&self) -> bool {
+        self.frontend.mel.is_some()
+    }
+
+    fn frontend_dispatches(&self) -> usize {
+        self.frontend_dispatches
+    }
+
+    fn dft400(
+        &mut self,
+        frames: &[f32],
+        n_frames: usize,
+        n_bins: usize,
+        power: &mut [f32],
+    ) -> npum_model::array::Result<()> {
+        const NFFT: usize = 400;
+        let stream = self.frontend.dft.ok_or_else(|| {
+            npum_model::array::ArrayError(
+                "this design set has no dft400 stream -- the 400-point transform stays on the host, \
+                 and --npu-ops fft must be refused by name"
+                    .to_string(),
+            )
+        })?;
+        if frames.len() < n_frames * NFFT || power.len() < n_bins * n_frames {
+            return Err(npum_model::array::ArrayError(format!(
+                "dft400 needs {} input and {} output floats, got {} and {}",
+                n_frames * NFFT,
+                n_bins * n_frames,
+                frames.len(),
+                power.len()
+            )));
+        }
+        if 2 * n_bins > stream.n {
+            return Err(npum_model::array::ArrayError(format!(
+                "dft400's stream holds {} columns (two halves of {}), and the front end wants {}",
+                stream.n,
+                stream.n / 2,
+                n_bins
+            )));
+        }
+
+        let half = stream.n / 2;
+        let mut done = 0usize;
+        while done < n_frames {
+            let take = stream.m.min(n_frames - done);
+            // A padded to the design's own K: 400 real samples, then zeros.
+            let mut a = vec![0.0f32; stream.m * stream.k];
+            for i in 0..take {
+                a[i * stream.k..i * stream.k + NFFT]
+                    .copy_from_slice(&frames[(done + i) * NFFT..(done + i + 1) * NFFT]);
+            }
+            let mut c = vec![0.0f32; stream.m * stream.n];
+            self.baked(stream, &a, take, &mut c)
+                .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+            // The real half and the imaginary half sit side by side. Squaring
+            // is the array's epilogue substitute: the design cannot do it.
+            for i in 0..take {
+                for k in 0..n_bins {
+                    let re = c[i * stream.n + k];
+                    let im = c[i * stream.n + half + k];
+                    power[k * n_frames + done + i] = re * re + im * im;
+                }
+            }
+            self.frontend_dispatches += 1;
+            done += take;
+        }
+        Ok(())
+    }
+
+    fn mproj(
+        &mut self,
+        power: &[f32],
+        n_frames: usize,
+        n_bins: usize,
+        n_mels: usize,
+        mel: &mut [f32],
+    ) -> npum_model::array::Result<()> {
+        let stream = self.frontend.mel.ok_or_else(|| {
+            npum_model::array::ArrayError(
+                "this design set has no mel_proj stream -- the mel bank stays on the host, \
+                 and --npu-ops mproj must be refused by name"
+                    .to_string(),
+            )
+        })?;
+        if power.len() < n_bins * n_frames || mel.len() < n_mels * n_frames {
+            return Err(npum_model::array::ArrayError(format!(
+                "mel_proj needs {} input and {} output floats, got {} and {}",
+                n_bins * n_frames,
+                n_mels * n_frames,
+                power.len(),
+                mel.len()
+            )));
+        }
+        if n_bins > stream.k || n_mels > stream.n {
+            return Err(npum_model::array::ArrayError(format!(
+                "mel_proj's stream is {}x{} and the front end wants {}x{}",
+                stream.k, stream.n, n_bins, n_mels
+            )));
+        }
+
+        let mut done = 0usize;
+        while done < n_frames {
+            let take = stream.m.min(n_frames - done);
+            let mut a = vec![0.0f32; stream.m * stream.k];
+            for i in 0..take {
+                for k in 0..n_bins {
+                    a[i * stream.k + k] = power[k * n_frames + done + i];
+                }
+            }
+            let mut c = vec![0.0f32; stream.m * stream.n];
+            self.baked(stream, &a, take, &mut c)
+                .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+            for i in 0..take {
+                for j in 0..n_mels {
+                    mel[j * n_frames + done + i] = c[i * stream.n + j];
+                }
+            }
+            self.frontend_dispatches += 1;
+            done += take;
+        }
+        Ok(())
     }
 }
 
@@ -1359,6 +1679,8 @@ mod async_tests {
                 resolved_buf: Vec::new(),
                 resolved_cache: HashMap::new(),
                 quant: Vec::new(),
+                frontend: FrontendStreams::default(),
+                frontend_dispatches: 0,
             },
             log,
         )

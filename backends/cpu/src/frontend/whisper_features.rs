@@ -51,6 +51,7 @@
 //! FLIPPED and starting AFTER the data.
 
 use crate::parallel;
+use npum_model::array::ArrayFrontend;
 use std::path::Path;
 
 /// Whisper's own numbers. 30 s at 16 kHz is 480000 samples; / 160 is
@@ -221,6 +222,18 @@ impl MelSpec {
 /// `samples_used` receives how many samples were real, so a caller can
 /// tell a 5 s file from a 30 s one instead of assuming.
 pub fn log_mel_30s(samples: &[f32], n_mels: usize) -> (MelSpec, usize) {
+    log_mel_30s_with_frontend(samples, n_mels, None).expect("the host front end cannot fail")
+}
+
+/// The same front end, with the two matrix-shaped passes optionally on the
+/// array. A backend that has not ported a pass leaves THAT pass on the host --
+/// requested codes are refused by name before this function is called, so a
+/// `None` here always means "not asked for", never "asked and lost".
+pub fn log_mel_30s_with_frontend(
+    samples: &[f32],
+    n_mels: usize,
+    mut frontend: Option<&mut (dyn ArrayFrontend + '_)>,
+) -> Result<(MelSpec, usize), String> {
     // 1. 30 s of audio, zero-padded. The encoder is fixed at 1500
     //    positions, so a short file is padded rather than given a
     //    shorter feature tensor.
@@ -244,18 +257,50 @@ pub fn log_mel_30s(samples: &[f32], n_mels: usize) -> (MelSpec, usize) {
         *w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / NFFT as f64).cos();
     }
 
-    // 4. frames -> windowed samples, and then the power spectrum.
-    let power = power_30s(&padded, num_frames, &window);
-    let mut mel = project_and_log(&power, n_mels);
+    // 4. frames -> windowed samples, and then the power spectrum. The DFT
+    // reads the SAME rounded float32 frames the host transform does; the
+    // design's B panel is generated and staged in the array backend.
+    let dft_on = frontend.as_deref().is_some_and(ArrayFrontend::dft_on_array);
+    let mproj_on = frontend.as_deref().is_some_and(ArrayFrontend::mproj_on_array);
+    let power = if dft_on {
+        let mut wave_f32 = vec![0.0f32; MEL_FRAMES * NFFT];
+        for t in 0..MEL_FRAMES {
+            let src = &padded[t * HOP_LENGTH..t * HOP_LENGTH + NFFT];
+            for i in 0..NFFT {
+                wave_f32[t * NFFT + i] = (src[i] * window[i]) as f32;
+            }
+        }
+        let mut power = vec![0.0f32; MEL_FRAMES * (NFFT / 2 + 1)];
+        frontend
+            .as_deref_mut()
+            .unwrap()
+            .dft400(&wave_f32, MEL_FRAMES, NFFT / 2 + 1, &mut power)
+            .map_err(|e| e.to_string())?;
+        power
+    } else {
+        power_30s(&padded, num_frames, &window)
+    };
+    let mut mel = if mproj_on {
+        let mut mel = vec![0.0f32; n_mels * MEL_FRAMES];
+        frontend
+            .as_deref_mut()
+            .unwrap()
+            .mproj(&power, MEL_FRAMES, NFFT / 2 + 1, n_mels, &mut mel)
+            .map_err(|e| e.to_string())?;
+        log10_and_floor(&mut mel);
+        mel
+    } else {
+        project_and_log(&power, n_mels)
+    };
     mel_floor_scale(&mut mel);
-    (
+    Ok((
         MelSpec {
             n_mels,
             frames: MEL_FRAMES,
             data: mel,
         },
         n_used,
-    )
+    ))
 }
 
 /// numpy's `pad(..., mode="reflect")`.
@@ -537,13 +582,19 @@ fn project_and_log(power: &[f32], n_mels: usize) -> Vec<f32> {
             mel[j * MEL_FRAMES + t] = acc as f32;
         }
     }
-    // The 1e-10 floor BEFORE the log, not after: log10(0) is -inf, and
-    // an -inf in the tensor poisons the global max on the way to the
-    // floor.
+    log10_and_floor(&mut mel);
+    mel
+}
+
+/// The 1e-10 floor BEFORE the log, not after: log10(0) is -inf, and an
+/// -inf in the tensor poisons the global max on the way to the floor.
+/// Both the host projection and the array's mel GEMM end here -- the
+/// GEMM produces the linear projection, and this is the epilogue the
+/// design does not have.
+fn log10_and_floor(mel: &mut [f32]) {
     for v in mel.iter_mut() {
         *v = (*v as f64).max(1e-10).log10() as f32;
     }
-    mel
 }
 
 /// transformers' floor and scale, over a FINISHED tensor.

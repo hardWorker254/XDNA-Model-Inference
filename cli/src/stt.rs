@@ -151,6 +151,8 @@ pub struct Places {
     pub enc_gemm: bool,
     pub dec_gemm: bool,
     pub attn: bool,
+    pub fft: bool,
+    pub mproj: bool,
     pub layn: bool,
     pub gelu: bool,
     pub softm: bool,
@@ -162,6 +164,8 @@ impl Places {
             enc_gemm: false,
             dec_gemm: false,
             attn: false,
+            fft: false,
+            mproj: false,
             layn: false,
             gelu: false,
             softm: false,
@@ -169,7 +173,14 @@ impl Places {
     }
 
     pub fn any(&self) -> bool {
-        self.enc_gemm || self.dec_gemm || self.attn || self.layn || self.gelu || self.softm
+        self.enc_gemm
+            || self.dec_gemm
+            || self.attn
+            || self.fft
+            || self.mproj
+            || self.layn
+            || self.gelu
+            || self.softm
     }
 }
 
@@ -190,10 +201,17 @@ pub fn places(
     // will open, so it counts as present here.
     let enc = encoder.is_some() || crate::npu::has_own_design(container, "gemm_rtp");
     let dec = decoder.is_some() || crate::npu::has_own_design(container, "gemm_rtp_dec");
+    let stream_present = |op: &str| {
+        encoder
+            .map(|d| d.streams.iter().any(|s| s == op))
+            .unwrap_or(false)
+    };
     Places {
         enc_gemm: gemm && enc,
         dec_gemm: gemm && dec,
         attn: crate::npu::wants_op(args, "attn") && enc,
+        fft: crate::npu::wants_op(args, "fft") && stream_present("dft400"),
+        mproj: crate::npu::wants_op(args, "mproj") && stream_present("mel_proj"),
         layn: crate::npu::wants_op(args, "layn") && (elt("layernorm") || elt("rmsnorm")),
         gelu: crate::npu::wants_op(args, "gelu") && elt("gelu"),
         softm: crate::npu::wants_op(args, "softm") && elt("softmax"),
@@ -210,6 +228,8 @@ pub struct Design {
     pub c_type: String,
     /// The GEMM streams' names, in the design's order.
     pub gemm_ops: Vec<String>,
+    /// Every stream's op name, including the baked front-end ones.
+    pub streams: Vec<String>,
     /// The encoder's row count, or the decoder's tiers.
     pub rows: i64,
     /// The decoder's row count per tier.
@@ -237,6 +257,7 @@ pub fn read_design(dir: &Path, decoder: bool) -> Option<Design> {
         _ => "fp32".to_string(),
     };
     let mut gemm_ops: Vec<String> = Vec::new();
+    let mut all_ops: Vec<String> = Vec::new();
     // The decoder set repeats its streams once per batch tier, and the tier
     // row counts are the TIERS and not the batch numbers: the tiers are
     // 1, 2 and 4, and the rows are 64, 128 and 256.
@@ -246,6 +267,9 @@ pub fn read_design(dir: &Path, decoder: bool) -> Option<Design> {
             let Some(op) = stream.get("op").and_then(|v| v.as_str()) else {
                 continue;
             };
+            if !all_ops.iter().any(|o| o == op) {
+                all_ops.push(op.to_string());
+            }
             if code_for_stream(op) == "gemm" && !gemm_ops.iter().any(|o| o == op) {
                 gemm_ops.push(op.to_string());
             }
@@ -275,6 +299,7 @@ pub fn read_design(dir: &Path, decoder: bool) -> Option<Design> {
         datapath,
         c_type,
         gemm_ops,
+        streams: all_ops,
         rows,
         tier_rows,
     })
@@ -334,13 +359,21 @@ pub fn print_block(
     eprintln!("  ops        (npu = dispatched, host = this process)");
     row(
         "transform, 400 points",
-        "host",
-        "3001 mixed-radix transforms of 400 points, fp64",
+        if places.fft { "npu" } else { "host" },
+        if places.fft {
+            "3000 transforms as one GEMM against bf16 twiddles in gemm_rtp"
+        } else {
+            "3001 mixed-radix transforms of 400 points, fp64"
+        },
     );
     row(
         "slaney mel bank",
-        "host",
-        "the checkpoint's own filter bank, 201 x n_mels",
+        if places.mproj { "npu" } else { "host" },
+        if places.mproj {
+            "the bank as a GEMM against bf16 weights in gemm_rtp"
+        } else {
+            "the checkpoint's own filter bank, 201 x n_mels"
+        },
     );
     row(
         "conv1, conv2",
@@ -477,8 +510,13 @@ pub fn check_context_budget(args: &crate::flags::Args) -> bool {
     // is one more xclbin and one more hw_context. Count what this run will
     // actually open, so a five-context run cannot pass a two-context budget.
     let mut contexts = 0usize;
-    if crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn") {
+    let dense = crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    if dense {
         contexts += 2;
+    } else if crate::npu::wants_op(args, "fft") || crate::npu::wants_op(args, "mproj") {
+        // The front end lives in the ENCODER's set; with no dense work asked
+        // for, that is the only context this run opens.
+        contexts += 1;
     }
     for code in ["layn", "gelu", "softm"] {
         if crate::npu::wants_op(args, code) {
@@ -605,7 +643,12 @@ pub fn run(
     // `gemm_rtp_dec`. Both are opened when the flag asks for dense work,
     // because a decoder left on the host while the command line says "array"
     // would be a run that answered the flag with a lie.
-    let dense = crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
+    let dense = crate::npu::wants_op(args, "gemm")
+        || crate::npu::wants_op(args, "attn")
+        || crate::npu::wants_op(args, "fft")
+        || crate::npu::wants_op(args, "mproj");
+    let decode_dense =
+        crate::npu::wants_op(args, "gemm") || crate::npu::wants_op(args, "attn");
     let mut array_enc: Option<Box<dyn npum_model::array::ArrayText>> = None;
     let mut array_dec: Option<Box<dyn npum_model::array::ArrayText>> = None;
     if dense {
@@ -623,20 +666,22 @@ pub fn run(
                 return crate::EXIT_REFUSED;
             }
         };
-        array_dec = match crate::npu::open_array_text_specs(
-            container,
-            path,
-            root,
-            args,
-            decoder_specs(&geometry),
-            "gemm_rtp_dec",
-        ) {
-            Ok(a) => Some(a as Box<dyn npum_model::array::ArrayText>),
-            Err(reason) => {
-                eprintln!("error: {reason}");
-                return crate::EXIT_REFUSED;
-            }
-        };
+        if decode_dense {
+            array_dec = match crate::npu::open_array_text_specs(
+                container,
+                path,
+                root,
+                args,
+                decoder_specs(&geometry),
+                "gemm_rtp_dec",
+            ) {
+                Ok(a) => Some(a as Box<dyn npum_model::array::ArrayText>),
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return crate::EXIT_REFUSED;
+                }
+            };
+        }
     }
     // The elementwise passes are separate designs and separate contexts: only
     // the ones the flag named are opened, and a pass without a design stays on
@@ -743,7 +788,9 @@ pub fn run(
     // exists to prevent. Each handle reports the calls it actually made.
     transcript.n_dispatches = (array_enc
         .as_ref()
-        .map(|a| a.dispatches() + a.attn_dispatches())
+        .map(|a| {
+            a.dispatches() + a.attn_dispatches() + a.frontend_dispatches()
+        })
         .unwrap_or(0)
         + array_dec
             .as_ref()
@@ -834,7 +881,7 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         if let Some(reason) = crate::families::refuse_array_not_ported(
             npum_families::Family::Stt,
             args,
-            &["gemm", "attn", "layn", "gelu", "softm"],
+            &["gemm", "attn", "fft", "mproj", "layn", "gelu", "softm"],
         ) {
             eprintln!("error: {reason}");
             return crate::EXIT_REFUSED;

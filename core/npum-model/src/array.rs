@@ -384,6 +384,77 @@ pub trait ArrayConvs {
     ) -> Result<()>;
 }
 
+/// The Whisper front end's two passes that are matrix products on the array.
+///
+/// The 400-point DFT IS a matrix of twiddles and the Slaney mel bank IS a
+/// `[201, n_mels]` matrix. Both ship BAKED into the exported xclbin -- there is
+/// no weight panel to stage -- so they are not `ArrayGemm` calls against a
+/// container operand. They live in the encoder's design set, behind the same
+/// handle and the same hardware context. `--npu-ops fft` / `mproj` must refuse
+/// by name when the set does not carry their streams.
+///
+/// The defaults fail: a backend that has not ported these operations must not
+/// compute them on the host and report the flag as honoured.
+pub trait ArrayFrontend {
+    /// The backend's name, as it appears in the status block.
+    fn name(&self) -> &'static str {
+        "unavailable"
+    }
+
+    /// Whether this backend really dispatches the front end.
+    fn frontend_on_array(&self) -> bool {
+        false
+    }
+
+    /// Whether the 400-point transform has a stream on this array.
+    fn dft_on_array(&self) -> bool {
+        false
+    }
+
+    /// Whether the mel projection has a stream on this array.
+    fn mproj_on_array(&self) -> bool {
+        false
+    }
+
+    /// How many front-end streams this backend has dispatched.
+    fn frontend_dispatches(&self) -> usize {
+        0
+    }
+
+    /// 400-point DFT of `frames` windowed rows of 400 f32 samples.
+    ///
+    /// `power` receives the magnitude-squared spectrum in the front end's
+    /// channels-first layout, `[n_bins, frames]`. Squaring is done here because
+    /// the design has no epilogue for it -- it is not a matrix product.
+    fn dft400(
+        &mut self,
+        _frames: &[f32],
+        _n_frames: usize,
+        _n_bins: usize,
+        _power: &mut [f32],
+    ) -> Result<()> {
+        Err(ArrayError(
+            "this array backend cannot dispatch dft400".to_string(),
+        ))
+    }
+
+    /// Slaney mel projection of a channels-first power spectrum.
+    ///
+    /// `power` is `[n_bins, frames]`; `mel` receives `[n_mels, frames]`.
+    fn mproj(
+        &mut self,
+        _power: &[f32],
+        _n_frames: usize,
+        _n_bins: usize,
+        _n_mels: usize,
+        _mel: &mut [f32],
+    ) -> Result<()> {
+        Err(ArrayError(
+            "this array backend cannot dispatch mel_proj".to_string(),
+        ))
+    }
+}
+
 /// The attention's own shape.
 ///
 /// The family knows it and the array's side needs it, and it is one struct
@@ -487,4 +558,4 @@ pub trait ArrayAttention {
 ///
 /// So the family holds ONE handle, and this trait is it: the two traits'
 /// operations, on one object.
-pub trait ArrayText: ArrayGemm + ArrayAttention {}
+pub trait ArrayText: ArrayGemm + ArrayAttention + ArrayFrontend {}

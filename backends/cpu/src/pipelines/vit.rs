@@ -30,7 +30,7 @@ use crate::vit_image::Resample;
 use crate::whisper::attention_into;
 use crate::whisper::{gelu_erf_rows, layernorm_rows, layernorm_rows_inplace};
 use npum_format::Container;
-use npum_model::array::{ArrayEltwise, ArrayText, ArrayTextRef, AttentionShape, EltOp};
+use npum_model::array::{ArrayEltwise, ArrayText, ArrayTextRef, AttentionShape, EltOp, };
 use std::path::Path;
 
 /// The ViT's geometry, as the container states it.
@@ -303,6 +303,8 @@ mod array_seam_tests {
         }
     }
     impl ArrayText for MockText {}
+use npum_model::array::ArrayFrontend;
+    impl ArrayFrontend for MockText {}
 
     struct MockEltwise {
         log: Rc<RefCell<Log>>,
