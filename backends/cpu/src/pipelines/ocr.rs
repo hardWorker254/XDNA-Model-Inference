@@ -1385,6 +1385,8 @@ pub struct Cost {
     pub convs_array: i64,
     /// The depthwise convolutions that ran on the host.
     pub dwconvs_host: i64,
+    /// The depthwise convolutions dispatched on the array.
+    pub dwconvs_array: i64,
     /// The transposed convolutions that ran on the host.
     pub transposed_convs: i64,
     /// The elementwise passes.
@@ -1893,7 +1895,7 @@ impl Network {
         index: usize,
         l: &Layer,
         nl: &str,
-        array: ArrayRef<'_, '_>,
+        mut array: ArrayRef<'_, '_>,
         scratch: &mut ConvScratch,
     ) -> Result<Tensor, Refusal> {
         // The operands. -1 is the image, and every other index is an EARLIER
@@ -1920,7 +1922,7 @@ impl Network {
                 let w = self.conv_of(l, nl)?;
                 let inp = operand(0)?;
                 if w.depthwise() {
-                    self.dwconv(inp, l, w, nl, scratch)
+                    self.dwconv(inp, l, w, nl, scratch, array.as_deref_mut())
                 } else {
                     let table = self.wmat[l.conv as usize].as_deref();
                     self.conv(inp, l, w, table, nl, array, scratch)
@@ -2236,6 +2238,7 @@ impl Network {
         w: &ConvW,
         nl: &str,
         scratch: &mut ConvScratch,
+        array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, Refusal> {
         if input.rank() != 4 {
             return Err(format!(
@@ -2265,6 +2268,39 @@ impl Network {
             shape: vec![1, w.cout, oh, ow],
             d: kernels::scratch_f32((w.cout * oh * ow) as usize),
         };
+        // THE ARRAY PATH: only 3x3 depthwise fits dwconv9x3. The gather
+        // applies the layer's pad/stride; the kernel adds the bias; the
+        // fused activation is applied here, as on the host path.
+        if kh == 3 && kw == 3 && array.as_ref().is_some_and(|a| a.dwconv_on_array()) {
+            let array = array.unwrap();
+            let name = l.w.clone();
+            let t = std::time::Instant::now();
+            let values = super::dwconv_array::run(
+                array, &name, &input.d,
+                h as usize, width as usize,
+                w.cout as usize, oh as usize, ow as usize,
+                l.stride[0], l.stride[1], l.pad,
+            )
+            .map_err(|e| format!("{nl}: {e}"))?;
+            let mut out = Tensor {
+                shape: vec![1, w.cout, oh, ow],
+                d: kernels::scratch_f32(values.len()),
+            };
+            let plane = (oh * ow) as usize;
+            for c in 0..w.cout as usize {
+                for i in 0..plane {
+                    let v = values[c * plane + i];
+                    out.d[c * plane + i] = match l.act {
+                        Some(act) => act1(act, l.alpha, l.beta, v),
+                        None => v,
+                    };
+                }
+            }
+            scratch.cost.t_dwconv += t.elapsed().as_secs_f64();
+            scratch.cost.dwconvs_array += 1;
+            return Ok(out);
+        }
+
         let t0 = std::time::Instant::now();
         // One filter per channel. The weight is `[Cout, 1, kh, kw]` and the
         // input channel of filter co IS channel co -- a depthwise convolution

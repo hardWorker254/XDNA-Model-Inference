@@ -118,7 +118,7 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&ArrayI
                 "npu",
                 format!(
                     "person detector, {} nodes, on the array's {} padded (K, N) slots; \
-                     dwconv has no [M,N] GEMM to dispatch, so it stays here",
+                     3x3 dwconv uses the separate dwconv9x3 design when --npu-ops dwconv is named",
                     g.det_graph.len(),
                     info.streams
                 )
@@ -145,8 +145,8 @@ pub fn print_block(name: &str, g: &Geometry, setup_s: f64, array: Option<&ArrayI
                 format!("{} x conv + {} x dwconv", g.det_dense(), g.det_depthwise()),
                 "host",
                 format!(
-                    "person detector, {} nodes; dwconv has no [M,N] GEMM to dispatch, so it \
-                     would not move even with a design set",
+                    "person detector, {} nodes; 3x3 dwconv moves only with --npu-ops dwconv \
+                     and a dwconv9x3 design",
                     g.det_graph.len()
                 )
             );
@@ -478,9 +478,15 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // filter reduces WITHIN one channel and has no [M, N] product in it
         // at all. A container that cannot do it is refused HERE, before the
         // first image, with the reason.
-        let mut array = if crate::ocr::wants_conv(args) {
+        let wants_dw = crate::npu::wants_op(args, "dwconv");
+        let mut array = if crate::ocr::wants_conv(args) || wants_dw {
             let specs = npum_cpu::mppose::array_specs(network.geometry());
-            match crate::arrayconv::open(path, &specs, args, root) {
+            let opened = if wants_dw {
+                crate::arrayconv::open_with_dw(path, &specs, args, root)
+            } else {
+                crate::arrayconv::open(path, &specs, args, root)
+            };
+            match opened {
                 Ok(backend) => Some(backend),
                 Err(reason) => {
                     eprintln!("error: {reason}");

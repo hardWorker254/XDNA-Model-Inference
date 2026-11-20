@@ -382,6 +382,43 @@ pub trait ArrayConvs {
         n: usize,
         out: &mut [f32],
     ) -> Result<()>;
+
+    /// Whether this handle can dispatch 3x3 depthwise convolutions.
+    ///
+    /// False by default: a backend opened for `conv` alone must leave
+    /// depthwise on the host rather than refuse a layer the user never
+    /// asked to move.
+    fn dwconv_on_array(&self) -> bool {
+        false
+    }
+
+    /// Dispatch a 3x3 depthwise convolution on the array.
+    ///
+    /// `weight` names the container tensor (`<net>.conv.<i>.w`) whose
+    /// `[C,1,3,3]` weights and `[C]` bias were staged at open. `a` holds, for
+    /// every channel, three contiguous padded rows of `stride` f32 each --
+    /// the caller's gather, with the horizontal pad already applied and the
+    /// output row already chosen. `outputs` is the real width of one output
+    /// row; `out` receives `[C, outputs]` pre-activation f32, and the caller
+    /// applies the fused activation exactly as it does on the host path.
+    ///
+    /// Default: fail closed. A backend with no depthwise design set must
+    /// refuse by name, never silently compute this on the host.
+    fn dwconv(
+        &mut self,
+        _weight: &str,
+        _a: &[f32],
+        _channels: usize,
+        _outputs: usize,
+        _stride: usize,
+        _out: &mut [f32],
+    ) -> Result<()> {
+        Err(ArrayError(
+            "this array backend has no depthwise design set; --npu-ops dwconv \
+             cannot be honoured"
+                .to_string(),
+        ))
+    }
 }
 
 /// The Whisper front end's two passes that are matrix products on the array.

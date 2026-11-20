@@ -1531,8 +1531,10 @@ impl NetWeights {
 pub struct Cost {
     /// Dense convolutions that ran on the host.
     pub convs_host: i64,
-    /// Depthwise convolutions, which no array can take.
+    /// Depthwise convolutions which ran on the host.
     pub dwconvs_host: i64,
+    /// Depthwise convolutions dispatched on the array.
+    pub dwconvs_array: i64,
     /// add, maxpool, resize and d2s.
     pub elementwise_ops: i64,
     /// Seconds in im2col.
@@ -1962,7 +1964,7 @@ impl MpPose {
         label: &str,
         cost: &mut Cost,
         host: &mut ConvHostScratch,
-        array: ArrayRef<'_, '_>,
+        mut array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let operand = |idx: i32| -> Result<&Tensor, String> {
             if idx == -1 {
@@ -2019,7 +2021,7 @@ impl MpPose {
                         layer.conv
                     ));
                 };
-                self.dwconv(first, layer, conv, slope, label, cost)
+                self.dwconv(first, layer, conv, slope, label, cost, array.as_deref_mut())
             }
             Op::Add => {
                 if layer.inputs.len() != 2 {
@@ -2191,6 +2193,7 @@ impl MpPose {
         slope: Option<&[f32]>,
         label: &str,
         cost: &mut Cost,
+        array: ArrayRef<'_, '_>,
     ) -> Result<Tensor, String> {
         let (oh, ow) = check_extent(layer, input.h, input.w, w.kh, w.kw, label)?;
         if w.cout != input.c {
@@ -2209,6 +2212,33 @@ impl MpPose {
                 w.index, input.c, layer.out_c
             ));
         }
+        if w.kh == 3 && w.kw == 3 && array.as_ref().is_some_and(|a| a.dwconv_on_array()) {
+            let array = array.unwrap();
+            let name = format!("{}.conv.{}.w", layer.net, w.index);
+            let t = std::time::Instant::now();
+            let values = super::dwconv_array::run(
+                array, &name, &input.d,
+                input.h as usize, input.w as usize,
+                w.cout as usize, oh as usize, ow as usize,
+                layer.stride_h, layer.stride_w, layer.pad,
+            )
+            .map_err(|e| format!("{label}: {e}"))?;
+            let mut out = Tensor {
+                c: layer.out_c, h: oh, w: ow,
+                d: kernels::scratch_f32(values.len()),
+            };
+            for c in 0..w.cout as usize {
+                let sl = slope.and_then(|s| s.get(c).copied()).unwrap_or(0.0);
+                for i in 0..(oh * ow) as usize {
+                    out.d[c * (oh * ow) as usize + i] =
+                        act1(layer.act, values[c * (oh * ow) as usize + i], sl);
+                }
+            }
+            cost.t_dwconv += t.elapsed().as_secs_f64();
+            cost.dwconvs_array += 1;
+            return Ok(out);
+        }
+
         let t = std::time::Instant::now();
         let h = input.h;
         let wd = input.w;

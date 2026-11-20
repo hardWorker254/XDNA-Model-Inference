@@ -399,8 +399,15 @@ pub fn command(args: &Args, root: &Path) -> crate::families::Outcome {
         // answered here and nowhere else: the convolutions go to the array,
         // the depthwise and the transposed ones stay on the host, and the
         // run says how many it dispatched.
-        let array = if crate::ocr::wants_conv(args) {
-            match crate::ocr::open_array(path, session.geometry(), args, root) {
+        let wants_dw = crate::npu::wants_op(args, "dwconv");
+        let array = if crate::ocr::wants_conv(args) || wants_dw {
+            let opened = if wants_dw {
+                let specs = npum_cpu::ocr::array_specs(session.geometry());
+                crate::arrayconv::open_with_dw(path, &specs, args, root)
+            } else {
+                crate::ocr::open_array(path, session.geometry(), args, root)
+            };
+            match opened {
                 Ok(backend) => Some(backend),
                 Err(reason) => {
                     eprintln!("error: {reason}");

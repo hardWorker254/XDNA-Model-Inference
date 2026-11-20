@@ -198,10 +198,16 @@ fn open_conv_array(
     args: &crate::flags::Args,
     root: &std::path::Path,
 ) -> std::result::Result<Option<Box<dyn npum_model::array::ArrayConvs + Send>>, String> {
-    if !crate::ocr::wants_conv(args) {
+    let conv = crate::ocr::wants_conv(args);
+    let dw = crate::npu::wants_op(args, "dwconv");
+    if !conv && !dw {
         return Ok(None);
     }
-    let backend = crate::npu::open_convs(path, specs, args, root, "gemm_rtp")?;
+    let backend = if dw {
+        crate::npu::open_convs_with_dw(path, specs, args, root, "gemm_rtp")?
+    } else {
+        crate::npu::open_convs(path, specs, args, root, "gemm_rtp")?
+    };
     Ok(Some(backend))
 }
 
@@ -311,7 +317,7 @@ pub fn serve(
         npum_families::Family::Pose
         | npum_families::Family::Hands
         | npum_families::Family::MpPose
-        | npum_families::Family::Ocr => &["conv"],
+        | npum_families::Family::Ocr => &["conv", "dwconv"],
     };
     if let Some(reason) = crate::families::refuse_array_not_ported(family, args, honoured) {
         eprintln!("error: {reason}");

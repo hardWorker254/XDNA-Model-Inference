@@ -276,6 +276,29 @@ depthwise conv Pose.
   последовательности, которые тайлинг не снимает. Паритет 1.60e-3 сохраняется
   во всех конфигурациях. Хост NumPy в том же прогоне — 194.5 мкс median.
 
+### Production-опция (этап F)
+
+Depthwise теперь **есть в продакшене как отдельный `dwconv9x3` design set** —
+не research-флаг:
+
+* `tools/export/export_dwconv.py` собирает xclbin (16 каналов × 1024 выхода,
+  `sliding_mul_ops<16,3>`, bf16) в `<artifacts>/artifacts_npu1/dwconv9x3/`;
+  сеты собраны для mediapipe-hands / mediapipe-pose / paddleocr-onnx.
+* `ArrayConvs::dwconv` + `dwconv_on_array()` в `core/npum-model/src/array.rs`;
+  бэкенд `backends/xdna/src/dwconv.rs` строит `[C,10]`-таблицы taps+bias из
+  уже лежащих в контейнере `[C,1,3,3]` весов (пакер не менялся).
+* Хост-gather `backends/cpu/src/pipelines/dwconv_array.rs` применяет pad/stride,
+  активация — вызывающей стороной. `--npu-ops dwconv` открывает ВТОРОЙ hw-context;
+  если сета нет, открытие отказывается по имени, без молчаливого хоста.
+* Проверено на плате: Hands детектит ту же руку (score 0.7077 против 0.7079 на
+  хосте), OCR читает те же три строки (`Hello OCR Worlo` — одна буква
+  испорчена bf16-округлением). MpPose теряет все детекты: глубина сети усиливает
+  bf16-ошибку 1.6e-3 до рассхождения в score; для него опция включается, но
+  практически непригодна. Тайминг тоже хуже хоста (15 c против 2.6 c на Hands).
+
+**Решение по умолчанию:** `dwconv` не входит в обычные honour-списки; это
+опция, которую надо назвать явно. fail-closed по умолчанию сохранён.
+
 **Решение:** оставляем depthwise fail-closed. Не потому что «нельзя» — ядро
 работает и считает верно — а потому что измерено: ускорения нет, а цена
 интеграции (kernel → IRON → exporter → xclbin → ConvSpec → trait → runtime →

@@ -45,6 +45,20 @@ pub fn open(
     Ok(backend as Box<dyn npum_model::array::ArrayConvs>)
 }
 
+/// Open the array's convolutions AND the depthwise design set.
+///
+/// Both are needed when `--npu-ops` names `dwconv`: a dense panel set
+/// without the second xclbin would refuse dwconv at the first layer.
+pub fn open_with_dw(
+    path: &Path,
+    specs: &[ConvSpec],
+    args: &crate::flags::Args,
+    root: &Path,
+) -> Result<Box<dyn npum_model::array::ArrayConvs>, String> {
+    let backend = crate::npu::open_convs_with_dw(path, specs, args, root, "gemm_rtp")?;
+    Ok(backend as Box<dyn npum_model::array::ArrayConvs>)
+}
+
 /// The convolution design set's directory, if one can be found.
 ///
 /// The opener resolves the set from the container or from `--artifacts`; this

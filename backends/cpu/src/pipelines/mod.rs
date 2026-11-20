@@ -5,6 +5,7 @@
 //! tensor flows and postprocessing helpers). They are not low-level ISA kernels.
 
 pub mod bert;
+pub mod dwconv_array;
 pub mod gemma;
 pub mod gte;
 pub mod hands;

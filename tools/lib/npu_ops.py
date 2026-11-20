@@ -50,6 +50,7 @@ OPS: dict[str, tuple[str, str]] = {
     "layn": ("layernorm", "LayerNorm"),
     "softm": ("softmax", "softmax"),
     "conv": ("", "conv1d (Whisper's audio front end)"),
+    "dwconv": ("dwconv9x3", "3x3 depthwise convolutions"),
     # The name is model-neutral on purpose. It used to read "Whisper's
     # attention, as GEMMs", which was true while only Whisper had an array
     # branch; the same NpuAttention now serves BERT, ViT and gemma too, and a

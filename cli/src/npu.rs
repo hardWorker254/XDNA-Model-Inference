@@ -68,6 +68,11 @@ pub fn wants_op(args: &crate::flags::Args, code: &str) -> bool {
 pub fn check_array_budget(args: &crate::flags::Args, dense_sets: usize) -> bool {
     let dense = wants_op(args, "gemm") || wants_op(args, "attn") || wants_op(args, "conv");
     let mut contexts = if dense { dense_sets } else { 0 };
+    // Depthwise is a SEPARATE xclbin, and therefore a second hardware
+    // context, not another stream of gemm_rtp.
+    if wants_op(args, "dwconv") {
+        contexts += 1;
+    }
     for code in ["layn", "gelu", "softm"] {
         if wants_op(args, code) {
             contexts += 1;
@@ -579,6 +584,47 @@ pub fn open_convs(
     )?;
 
     let backend = ArrayConvs::open(path, design, specs).map_err(|e| e.to_string())?;
+    Ok(Box::new(backend))
+}
+
+/// Open dense convolutions AND the separate depthwise design set.
+///
+/// The depthwise set is a different core program and therefore a
+/// different xclbin/context. The container's own copy wins, then
+/// `--artifacts`; a missing set is a refusal, never a host fallback.
+pub fn open_convs_with_dw(
+    path: &Path,
+    specs: &[ConvSpec],
+    args: &crate::flags::Args,
+    root: &Path,
+    set: &str,
+) -> Result<Box<dyn ArrayConvs + Send>, String> {
+    use npum_xdna::array_convs::ArrayConvs;
+
+    let container =
+        npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if container.config_str("npu_streams").unwrap_or_default().is_empty() {
+        return Err(format!(
+            "{}: --npu-ops dwconv needs the container's dense panels too (packed with --npu).",
+            path.display()
+        ));
+    }
+    if specs.is_empty() {
+        return Err(format!(
+            "{}: no convolution in this graph runs on the array.",
+            path.display()
+        ));
+    }
+    let dense = open_design(
+        &container, path, root, args.value("--artifacts"), set, "conv",
+        "Build the dense conv design with export_gemm_rtp.py --stream-set <family>.",
+    )?;
+    let dw = open_design(
+        &container, path, root, args.value("--artifacts"), "dwconv9x3", "dwconv",
+        "Build it with export_dwconv.py --arch 1 --out <model artifacts root>.",
+    )?;
+    let backend = ArrayConvs::open_with_dw(path, dense, specs, dw)
+        .map_err(|e| e.to_string())?;
     Ok(Box::new(backend))
 }
 

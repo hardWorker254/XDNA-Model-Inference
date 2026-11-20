@@ -242,6 +242,7 @@ pub const NPU_OP_CODES: &[(&str, &str)] = &[
     ("layn", "LayerNorm"),
     ("softm", "softmax"),
     ("conv", "conv1d (Whisper's audio front end)"),
+    ("dwconv", "3x3 depthwise convolution"),
     ("attn", "attention, as two GEMMs"),
     ("mproj", "Whisper's mel filter bank, as a GEMM"),
     ("fft", "Whisper's 400-point transform, as a GEMM"),

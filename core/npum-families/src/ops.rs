@@ -45,9 +45,9 @@ pub fn refuse_op_not_in_arch(family: Family, listing: &str, codes: &[&str]) -> O
         return None;
     }
     match family {
-        Family::Ocr => first_missing(codes, &["conv"], OCR_TAIL),
-        Family::Hands => first_missing(codes, &["conv"], HANDS_TAIL),
-        Family::MpPose => first_missing(codes, &["conv"], MPPOSE_TAIL),
+        Family::Ocr => first_missing(codes, &["conv", "dwconv"], OCR_TAIL),
+        Family::Hands => first_missing(codes, &["conv", "dwconv"], HANDS_TAIL),
+        Family::MpPose => first_missing(codes, &["conv", "dwconv"], MPPOSE_TAIL),
         Family::Pose => pose_refusal(listing, codes),
         Family::Cls => vit_refusal(codes),
         // The text family and the speech one have every code this build
@@ -102,7 +102,7 @@ fn pose_refusal(listing: &str, codes: &[&str]) -> Option<String> {
 /// does honour, so the reader can fix the command line instead of
 /// guessing.
 fn vit_refusal(codes: &[&str]) -> Option<String> {
-    const DEAD: &[&str] = &["mproj", "fft"];
+    const DEAD: &[&str] = &["mproj", "fft", "dwconv"];
     const KEPT: &[&str] = &["layn", "gelu", "attn", "softm", "conv", "gemm", "logit"];
     let refused: Vec<&str> = codes.iter().copied().filter(|c| DEAD.contains(c)).collect();
     if refused.is_empty() {

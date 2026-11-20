@@ -45,6 +45,7 @@ use npum_model::array::ConvSpec;
 
 use crate::array::{ArrayDesign, ArrayError as DesignError};
 use crate::conv::{ConvScratch, ConvShape, conv};
+use crate::dwconv::Dwconv;
 use crate::transport::Transport;
 
 /// The data buffer the weight panels live in.
@@ -80,6 +81,9 @@ pub struct ArrayConvs<T: Transport> {
     staged: usize,
     /// The dispatch's scratch, reused across the convolutions.
     scratch: ConvScratch,
+    /// Depthwise 3x3 convs live in a SEPARATE design set (different core
+    /// program). None means --npu-ops dwconv was not named.
+    dw: Option<Dwconv<T>>,
 }
 
 impl<T: Transport> ArrayConvs<T> {
@@ -251,12 +255,27 @@ impl<T: Transport> ArrayConvs<T> {
             dispatches: 0,
             staged,
             scratch: ConvScratch::default(),
+            dw: None,
         })
     }
 
     /// The design this backend runs on.
     pub fn design(&self) -> &ArrayDesign<T> {
         &self.design
+    }
+
+    /// Open BOTH convolution design sets. The caller has already opened the
+    /// two designs from their own directories; opening them here would let a
+    /// wrong generation or a wrong model's set be swapped in silently.
+    pub fn open_with_dw(
+        container: &Path,
+        design: ArrayDesign<T>,
+        convs: &[ConvSpec],
+        dw: ArrayDesign<T>,
+    ) -> std::result::Result<Self, DesignError> {
+        let mut this = Self::open(container, design, convs)?;
+        this.dw = Some(Dwconv::open(container, dw).map_err(DesignError::Design)?);
+        Ok(this)
     }
 }
 
@@ -370,6 +389,31 @@ impl<T: Transport> npum_model::ArrayConvs for ArrayConvs<T> {
             &mut self.scratch,
         )
         .map_err(|e| npum_model::array::ArrayError(e.to_string()))?;
+        self.dispatches += dispatched;
+        Ok(())
+    }
+
+    fn dwconv_on_array(&self) -> bool {
+        self.dw.is_some()
+    }
+
+    fn dwconv(
+        &mut self,
+        weight: &str,
+        a: &[f32],
+        channels: usize,
+        outputs: usize,
+        stride: usize,
+        out: &mut [f32],
+    ) -> npum_model::array::Result<()> {
+        let Some(dw) = self.dw.as_mut() else {
+            return Err(npum_model::array::ArrayError(
+                "this convolution handle has no depthwise design set; \
+                 --npu-ops dwconv was not named".to_string(),
+            ));
+        };
+        let _ = stride;
+        let dispatched = dw.run(weight, a, channels, outputs, out)?;
         self.dispatches += dispatched;
         Ok(())
     }
