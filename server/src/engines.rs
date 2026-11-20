@@ -4,11 +4,14 @@
 //! families exposed by the server. Route handlers and HTTP DTO/error mapping live
 //! in `routes`; this layer focuses on turning requests into model outputs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use npum_model::array::{ArrayConvs, ArrayEltwise, ArrayText};
+use npum_tokenizers::gemma::Gemma;
+use npum_tokenizers::Tokenizer;
 
 /// The array handles one `serve` process opened at startup.
 ///
@@ -642,6 +645,7 @@ fn tensor_f32(
 enum EmbedTokenizer {
     WordPiece(npum_tokenizers::wordpiece::WordPiece),
     Xlmr(npum_tokenizers::xlmr::XlmrTokenizer),
+    Gemma(Gemma),
 }
 
 impl EmbedTokenizer {
@@ -653,14 +657,56 @@ impl EmbedTokenizer {
         match self {
             EmbedTokenizer::WordPiece(t) => t.encode_padded(text, max_len),
             EmbedTokenizer::Xlmr(t) => t.encode_padded(text, max_len),
+            EmbedTokenizer::Gemma(t) => {
+                let enc = t.encode(text)?;
+                let mut ids = vec![2u32];
+                ids.extend_from_slice(&enc.ids);
+                ids.push(1u32);
+                let truncated = ids.len() > max_len;
+                ids.truncate(max_len);
+                let mut mask = vec![1u32; ids.len()];
+                let mut types = vec![0u32; ids.len()];
+                ids.resize(max_len, 0);
+                mask.resize(max_len, 0);
+                types.resize(max_len, 0);
+                Ok((npum_tokenizers::Encoding { ids, mask, types }, truncated))
+            }
         }
     }
+}
+
+/// Read the GEMATOK1 table the packer embeds in a Gemma container.
+fn gemma_vocab(blob: &[u8]) -> std::result::Result<HashMap<String, u32>, String> {
+    if blob.len() < 56 || &blob[..8] != b"GEMATOK1" {
+        return Err("the Gemma tokenizer table has no GEMATOK1 header".to_string());
+    }
+    let count = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+    let mut vocab = HashMap::new();
+    let mut pos = 56usize;
+    for id in 0..count {
+        let len = u16::from_le_bytes(
+            blob.get(pos..pos + 2)
+                .ok_or_else(|| "the Gemma tokenizer table is cut short".to_string())?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        pos += 2;
+        let piece = std::str::from_utf8(
+            blob.get(pos..pos + len)
+                .ok_or_else(|| "the Gemma tokenizer table is cut short".to_string())?,
+        )
+        .map_err(|e| format!("the Gemma tokenizer table is not UTF-8: {e}"))?;
+        pos += len;
+        vocab.insert(piece.to_string(), id as u32);
+    }
+    Ok(vocab)
 }
 
 #[derive(Clone)]
 enum EmbedModel {
     Bert(npum_cpu::bert::BertModel),
     Gte(npum_cpu::gte::GteModel),
+    Gemma(Arc<npum_cpu::gemma::GemmaModel>),
 }
 
 /// The embedding endpoint's engine.
@@ -749,7 +795,12 @@ impl Embedder {
         let container =
             npum_format::Container::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let arch = container.config_str("arch").unwrap_or_default().to_string();
-        let tokenizer = if arch.contains("gte_new_rope")
+        let tokenizer = if arch.contains("gemma") {
+            let blob = container
+                .tensor_bytes("tokenizer.gemma_table")
+                .map_err(|_| "the container holds no Gemma tokenizer table".to_string())?;
+            EmbedTokenizer::Gemma(Gemma::new(gemma_vocab(blob)?))
+        } else if arch.contains("gte_new_rope")
             || (arch.contains("gte") && arch.contains("rope"))
         {
             let blob = container
@@ -771,7 +822,12 @@ impl Embedder {
             )
         };
         let model =
-            if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
+            if arch.contains("gemma") {
+                EmbedModel::Gemma(Arc::new(
+                    npum_cpu::gemma::GemmaModel::open(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?,
+                ))
+            } else if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
                 EmbedModel::Gte(
                     npum_cpu::gte::GteModel::open(path)
                         .map_err(|e| format!("{}: {e}", path.display()))?,
@@ -838,6 +894,7 @@ impl Embedder {
         match &self.model {
             EmbedModel::Bert(m) => m.spec.vocab,
             EmbedModel::Gte(m) => m.spec.vocab,
+            EmbedModel::Gemma(m) => m.spec.vocab,
         }
     }
 
@@ -891,6 +948,7 @@ impl Embedder {
         let hidden = match &self.model {
             EmbedModel::Bert(model) => model.spec.hidden,
             EmbedModel::Gte(model) => model.spec.hidden,
+            EmbedModel::Gemma(model) => model.spec.hidden,
         };
 
         // Bound workspace/activation growth for large requests while still
@@ -976,6 +1034,23 @@ impl Embedder {
                                     .map_err(|e| e.to_string())?,
                             )
                         }
+                        EmbedModel::Gemma(model) => {
+                            let mut timings = npum_cpu::gemma::Timings::default();
+                            Some(
+                                model
+                                    .embed_timed_with(
+                                        ops,
+                                        &mut timings,
+                                        &ids,
+                                        &mask,
+                                        batch,
+                                        eff_seq,
+                                        array,
+                                        eltwise,
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                            )
+                        }
                     };
                     match gte {
                         Some(out) => {
@@ -1036,6 +1111,23 @@ impl Embedder {
                                         array,
                                         eltwise,
                                         &mut scratch,
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                            )
+                        }
+                        EmbedModel::Gemma(model) => {
+                            let mut timings = npum_cpu::gemma::Timings::default();
+                            Some(
+                                model
+                                    .embed_timed_with(
+                                        &mut ops,
+                                        &mut timings,
+                                        &ids,
+                                        &mask,
+                                        batch,
+                                        eff_seq,
+                                        array,
+                                        eltwise,
                                     )
                                     .map_err(|e| e.to_string())?,
                             )

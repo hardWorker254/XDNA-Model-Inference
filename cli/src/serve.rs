@@ -145,11 +145,20 @@ fn open_embed_xdna(
     if !dense && !elt {
         return Ok(None);
     }
-    let is_gte = container
-        .config_str("arch")
-        .is_some_and(|a| a == "gte_new_rope_geglu" || (a.contains("gte") && a.contains("rope")));
+    let arch = container.config_str("arch").unwrap_or("");
+    let is_gte = arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope"));
+    let is_gemma = arch.contains("gemma");
     let array = if dense {
-        let geometry = if is_gte {
+        let geometry = if is_gemma {
+            let model = npum_cpu::gemma::GemmaModel::from_container(container)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            crate::npu::TextGeometry::gemma(
+                model.spec.layers,
+                model.spec.hidden,
+                model.spec.ffn,
+                model.spec.qkv_n,
+            )
+        } else if is_gte {
             let model = npum_cpu::gte::GteModel::from_container(container)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             crate::npu::TextGeometry::gte(model.spec.layers, model.spec.hidden, model.spec.ffn)
@@ -257,7 +266,12 @@ pub fn serve(
         // engines -- so this list must match the one the `embed` verb honours.
         // GTE's gated FFN has no standalone `gelu/` design; BERT does.
         npum_families::Family::Embed => {
-            if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
+            if arch.contains("gemma") {
+                // Gemma's four RMSNorms and GeGLU have no array designs, and
+                // its MQA needs its own attention seam: only projections and
+                // softmax really dispatch here.
+                &["gemm", "softm"]
+            } else if arch == "gte_new_rope_geglu" || (arch.contains("gte") && arch.contains("rope")) {
                 &["gemm", "attn", "layn", "softm"]
             } else {
                 &["gemm", "attn", "layn", "gelu", "softm"]

@@ -16,7 +16,8 @@ SPDX-License-Identifier: Apache-2.0
 | Семейство | CLI | `serve` | Дизайн-сеты | Что не хватает |
 |---|---|---|---|---|
 | Embed (BERT) | Да: `gemm/layn/gelu/softm/attn` | Да (этап G): `Embedder::with_xdna`, тот же список кодов | есть | — |
-| GTE | Да (этап E): `gemm/attn/layn/softm` (без `gelu` — FFN гейтированный) | Да (этап G): общий с BERT путь `Embedder::with_xdna` | есть: экспортирован `gte-multilingual-base/artifacts_npu1`, упакован в `.npue` | MQA/banded — отдельная архитектура `gemma3_mqa_rope_geglu`, не `gte.rs` |
+| GTE | Да (этап E): `gemm/attn/layn/softm` (без `gelu` — FFN гейтированный) | Да (этап G): общий с BERT путь `Embedder::with_xdna` | есть: экспортирован `gte-multilingual-base/artifacts_npu1`, упакован в `.npue` | — |
+| EmbeddingGemma | Да (этап F): `gemm/softm`, остальные коды отвергаются по имени | Да (этап F): `EmbedModel::Gemma`, тот же список | есть: `embeddinggemma-300m/artifacts_npu1`, упакован в `.npue` |Четыре RMSNorm и GeGLU — на хосте (нет дизайнов); MQA-attention считается на хосте, но QK/V — через `ArrayText` |
 | Whisper STT | Да (этапы B–D + G + F): `gemm/attn/fft/mproj/layn/gelu/softm`, два набора `gemm_rtp` + `gemm_rtp_dec` | Да (этапы D+G) | есть: `gemm_rtp_dec` экспортирован (35 потоков), контейнер упакован | decoder `cross_kv`, conv1/conv2 и logit-голова считаются на хосте; GELU `erf` хоста против полинома дизайна |
 | ViT Cls | Да (этапы B–D): `gemm/attn/layn/gelu/softm/conv`; `conv` = patch-embed GEMM, `gemm` = 4 GEMM на слой | Да (этап D) | есть (`vit-base-patch16-224/...`) | head (1000) не кратен `tile_n*cols=192`; не-свёрточные узлы — на хосте. Хостовый path с bf16-контейнером починен общим `operand::read_operand` (де-tiling панелей) |
 | Pose | `conv` через `ArrayConvs` | Да (этап G): `PoseDetector::with_xdna`, список `conv` | есть/частично | depthwise conv и не-свёрточные узлы остаются на хосте |
@@ -31,6 +32,7 @@ SPDX-License-Identifier: Apache-2.0
 > `PoseDetector` получил `with_xdna` и диспатчит свёртки через `ArrayConvs`,
 > так что `conv` в списке serve для Pose теперь честный. Оставшиеся семейства
 > (Hands/MpPose/OCR) не имеют HTTP-движков и продолжают отказываться по имени.
+> Gemma (этап F): `backends/cpu/src/pipelines/gemma.rs` — отдельный forward для `gemma3_mqa_rope_geglu` (MQA 3:1, RoPE с двумя базами, четыре RMSNorm, GeGLU tanh, mean-pooling + две Dense + L2). Важный момент: контейнер хранит СЫРОЙ вес RMSNorm, а эталонный ONNX — уже `1+w`, поэтому `+1` складывается при загрузке весов, а не в ядре. Дизайны `gemm_rtp` и `softmax/` дают честные коды `gemm` и `softm`; `layn`, `gelu`, `attn` отвергаются по имени. Паритет на плате: 1−cos = 4.7e-3 / 3.1e-3 (допуск 1e-2), `cli/tests/gemma_array_parity.rs`; CLI и `/v1/embeddings` через `serve` работают с `--npu-ops gemm,softm`.
 > G — device-gated (`cli/tests/text_array_parity.rs`) прогоняет BERT и GTE через
 > `ArrayText`/`ArrayEltwise` и сравнивает 1−cos и счётчик диспатчей; пропускается
 > без `/dev/accel/accel0` и без контейнера с панелями (переменные
@@ -204,8 +206,7 @@ Stage F частично закрыт (fft/mproj — см. выше); остаю
 - int8 attention отвергнут в `attention.rs:268-275`; conv-панели — bf16; `array_convs.rs` не проверяет `Datapath::of`.
 - Таймаут диспатча требует переоткрытия контекста (`direct.rs:1260-1265`, `NPU_DISPATCH_TIMEOUT_MS`).
 - Известные неполные места после A–E (не «тихие» отказы по коду, а отсутствующие потоки в наличных дизайнах): `cross_kv` декодера Whisper считается на хосте при `set_source` — в набор `gemm_rtp_dec` нет потока для этого кэша, и его нужно добавить в этапе F; хостовый GELU Whisper — точный `erf`, а дизайн `gelu/` — полином, поэтому численное сближение для `stt/gelu` проверяется отдельно в этапе G.
-- **GTE-дизайн не экспортирован.** `TextGeometry::gte` строит спекы под веса `gte_new_rope_geglu` (qkv 3×hidden, ffn_up 2×inter), но в `runtime/artifacts` набора для этой модели нет: `bge-base` не подходит (ffn_up в нём 1×inter), `embeddinggemma` — другая архитектура (qkv 2×hidden, MQA, sliding window 512). Поэтому `npuembeddings embed <gte> … --npu-ops …` на текущих артефактах корректно откажется по имени набора, не переключившись молча на хост. Для проверки паритета нужен экспорт дизайна под GTE (этап G, device-gated).
-- **MQA и banded attention** из строки этапа E относятся к `gemma3_mqa_rope_geglu`, а не к `gte_new_rope_geglu`: `pipelines/gte.rs` реализует только обычное multi-head внимание GTE с 12 головами и head_dim 64. Отдельного Gemma-forward-path в этом дереве нет, поэтому этот пункт остаётся за рамками этапа E.
+- **Gemma: MQA attention** (QK^T и softmax·V) по-прежнему на хосте: `ArrayAttention` не умеет Q/K-нормы и RoPE перед оценкой. Проекции и softmax идут на массив; коды `layn/gelu/attn` честно отвергаются. Маска sliding window точна только до 512 токенов (дальше модель отвергается), как и оговорено в контейнере.
 
 ---
 

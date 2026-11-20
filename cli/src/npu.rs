@@ -272,6 +272,8 @@ pub struct TextGeometry {
     pub ffn: usize,
     /// `ffn_up`'s output is `ffn` times this factor: 1 for BERT, 2 for GTE.
     pub ffn_up_factor: usize,
+    /// Gemma's fused QKV is wider than `3 * hidden`; `None` means BERT's.
+    pub qkv_n: Option<usize>,
 }
 
 impl TextGeometry {
@@ -282,6 +284,7 @@ impl TextGeometry {
             hidden,
             ffn,
             ffn_up_factor: 1,
+            qkv_n: None,
         }
     }
 
@@ -292,6 +295,18 @@ impl TextGeometry {
             hidden,
             ffn,
             ffn_up_factor: 2,
+            qkv_n: None,
+        }
+    }
+
+    /// The Gemma shape: fused QKV padded to `qkv_n`, gated `ffn_up`.
+    pub fn gemma(layers: usize, hidden: usize, ffn: usize, qkv_n: usize) -> Self {
+        Self {
+            layers,
+            hidden,
+            ffn,
+            ffn_up_factor: 2,
+            qkv_n: Some(qkv_n),
         }
     }
 
@@ -300,7 +315,7 @@ impl TextGeometry {
         let mut specs = Vec::with_capacity(self.layers * 4);
         for layer in 0..self.layers {
             for (op, k, n) in [
-                ("qkv", self.hidden, 3 * self.hidden),
+                ("qkv", self.hidden, self.qkv_n.unwrap_or(3 * self.hidden)),
                 ("attn_out", self.hidden, self.hidden),
                 ("ffn_up", self.hidden, self.ffn * self.ffn_up_factor),
                 ("ffn_down", self.ffn, self.hidden),

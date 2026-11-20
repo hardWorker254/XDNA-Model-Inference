@@ -56,7 +56,7 @@ pub mod pipelines;
 // Backward-compatible module paths.
 pub use frontend::{vit_image, whisper_features};
 pub use pipelines::{
-    bert, gte, hands, hands_decode, mppose, mppose_decode, ocr, ocr_decode, ocr_session, pose,
+    bert, gemma, gte, hands, hands_decode, mppose, mppose_decode, ocr, ocr_decode, ocr_session, pose,
     pose_decode, vit, whisper, whisper_session, whisper_tokenizer,
 };
 

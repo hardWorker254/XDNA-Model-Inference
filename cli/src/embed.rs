@@ -27,8 +27,12 @@
 use crate::flags::Args;
 use npum_cpu::bert::BertModel;
 use npum_cpu::gte::GteModel;
+use npum_cpu::gemma::GemmaModel;
+use npum_tokenizers::gemma::Gemma;
+use npum_tokenizers::{Encoding, Tokenizer};
 use npum_tokenizers::wordpiece::WordPiece;
 use npum_tokenizers::xlmr::XlmrTokenizer;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The reference encodes in tiers of at most sixteen sequences, and the NPU
@@ -41,6 +45,7 @@ const BATCH: usize = 16;
 pub enum EmbedTokenizer {
     WordPiece(WordPiece),
     Xlmr(XlmrTokenizer),
+    Gemma(Gemma),
 }
 
 impl EmbedTokenizer {
@@ -48,6 +53,7 @@ impl EmbedTokenizer {
         match self {
             EmbedTokenizer::WordPiece(t) => npum_tokenizers::Tokenizer::vocab_size(t),
             EmbedTokenizer::Xlmr(t) => npum_tokenizers::Tokenizer::vocab_size(t),
+            EmbedTokenizer::Gemma(t) => npum_tokenizers::Tokenizer::vocab_size(t),
         }
     }
 
@@ -59,6 +65,23 @@ impl EmbedTokenizer {
         match self {
             EmbedTokenizer::WordPiece(t) => t.encode_padded(text, max_len),
             EmbedTokenizer::Xlmr(t) => t.encode_padded(text, max_len),
+            EmbedTokenizer::Gemma(t) => {
+                // Gemma's embedding model expects BOS + text + EOS. Its own
+                // tokenizer only splits the text; the frame is ours to add.
+                let enc = t.encode(text)?;
+                let mut ids = Vec::with_capacity(enc.ids.len() + 2);
+                ids.push(2); // <bos>
+                ids.extend_from_slice(&enc.ids);
+                ids.push(1); // <eos>
+                let truncated = ids.len() > max_len;
+                ids.truncate(max_len);
+                let mut mask = vec![1u32; ids.len()];
+                let mut types = vec![0u32; ids.len()];
+                ids.resize(max_len, 0);
+                mask.resize(max_len, 0);
+                types.resize(max_len, 0);
+                Ok((Encoding { ids, mask, types }, truncated))
+            }
         }
     }
 }
@@ -315,6 +338,114 @@ pub fn run(
         return Ok(vectors);
     }
 
+    // EmbeddingGemma has its own architecture: MQA, RoPE with two bases,
+    // four RMSNorms per layer and a GeGLU FFN. Only the projections and the
+    // softmax have array designs here; `layn`, `gelu` and `attn` are refused
+    // by name rather than silently left on the host.
+    if arch.contains("gemma") {
+        if let Some(reason) = crate::families::refuse_array_not_ported(
+            npum_families::Family::Embed,
+            args,
+            &["gemm", "softm"],
+        ) {
+            return Err(Refusal {
+                code: crate::EXIT_REFUSED,
+                message: reason,
+            });
+        }
+        let model = GemmaModel::from_container(container).map_err(|e| Refusal {
+            code: crate::EXIT_REFUSED,
+            message: format!("{}: {e}", path.display()),
+        })?;
+        let mut array: Option<Box<dyn npum_model::array::ArrayText>> = None;
+        if crate::npu::wants_op(args, "gemm") {
+            array = Some(crate::npu::open_array_text(
+                container,
+                path,
+                root,
+                args,
+                crate::npu::TextGeometry::gemma(
+                    model.spec.layers,
+                    model.spec.hidden,
+                    model.spec.ffn,
+                    model.spec.qkv_n,
+                ),
+            )
+            .map_err(|reason| Refusal {
+                code: crate::EXIT_REFUSED,
+                message: reason,
+            })?);
+        }
+        let mut eltwise: Option<Box<dyn npum_model::array::ArrayEltwise>> =
+            crate::npu::open_eltwise(container, path, root, args)
+                .map_err(|reason| Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: reason,
+                })?
+                .map(|e| e as Box<dyn npum_model::array::ArrayEltwise>);
+        let artifacts =
+            crate::npu::find_artifacts(root, &container_name(path), args.value("--artifacts"));
+        let seq = sequence_length(path, container, root, artifacts.as_deref());
+        crate::status::print_tokenizer(tokenizer.vocab_size());
+        println!("  input      {} texts", texts.len());
+        let (all_ids, all_mask, lengths) =
+            tokenize_all(&tokenizer, texts, prefix, seq, allow_truncation)?;
+        let started = std::time::Instant::now();
+        let mut timings = npum_cpu::gemma::Timings::default();
+        let hidden = model.spec.hidden;
+        let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * hidden);
+        let fix_width = array.is_some() || eltwise.is_some();
+        let mut offset = 0usize;
+        while offset < texts.len() {
+            let count = (texts.len() - offset).min(BATCH);
+            let eff_seq = batch_seq(seq, &lengths[offset..offset + count], fix_width);
+            let (ids, mask) = pack_batch(&all_ids, &all_mask, seq, offset, count, eff_seq);
+            let chunk = model
+                .embed_timed_with(
+                    ops.as_mut(),
+                    &mut timings,
+                    &ids,
+                    &mask,
+                    count,
+                    eff_seq,
+                    array.as_deref_mut(),
+                    eltwise.as_deref_mut(),
+                )
+                .map_err(|e| Refusal {
+                    code: crate::EXIT_REFUSED,
+                    message: e.to_string(),
+                })?;
+            vectors.extend_from_slice(&chunk);
+            offset += count;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "  embedded   {} texts in {:.2} s  ->  {:.1} seq/s",
+            texts.len(),
+            elapsed,
+            texts.len() as f64 / elapsed.max(1e-6)
+        );
+        if let Some(path) = out_path {
+            let mut bytes = Vec::with_capacity(vectors.len() * 4);
+            for v in &vectors {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(path, bytes).map_err(|e| Refusal {
+                code: crate::EXIT_REFUSED,
+                message: format!("{path}: {e}"),
+            })?;
+        }
+        println!("  output     {} dims x {} texts", hidden, vectors.len() / hidden);
+        for b in 0..texts.len().min(4) {
+            print!("  [{b}]");
+            for c in 0..6 {
+                print!(" {:+.4}", vectors[b * hidden + c]);
+            }
+            println!(" ...");
+        }
+        return Ok(vectors);
+    }
+
     let model = BertModel::from_container(container).map_err(|e| Refusal {
         code: crate::EXIT_REFUSED,
         message: format!("{}: {e}", path.display()),
@@ -455,11 +586,39 @@ fn load_tokenizer(
     container: &npum_format::Container,
     arch: &str,
 ) -> Result<EmbedTokenizer, String> {
-    if arch.contains("whisper") || arch.contains("gemma") {
+    if arch.contains("whisper") {
         return Err(format!(
             "the {arch} family has its own tokenizer, and this command does not \
              run it yet"
         ));
+    }
+    if arch.contains("gemma") {
+        let blob = container
+            .tensor_bytes("tokenizer.gemma_table")
+            .map_err(|_| "the container holds no Gemma tokenizer table".to_string())?;
+        let mut vocab = HashMap::new();
+        if blob.len() < 56 || &blob[..8] != b"GEMATOK1" {
+            return Err("the Gemma tokenizer table has no GEMATOK1 header".to_string());
+        }
+        let count = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+        let mut pos = 56usize;
+        for id in 0..count {
+            let len = u16::from_le_bytes(
+                blob.get(pos..pos + 2)
+                    .ok_or_else(|| "the Gemma tokenizer table is cut short".to_string())?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            pos += 2;
+            let piece = std::str::from_utf8(
+                blob.get(pos..pos + len)
+                    .ok_or_else(|| "the Gemma tokenizer table is cut short".to_string())?,
+            )
+            .map_err(|e| format!("the Gemma tokenizer table is not UTF-8: {e}"))?;
+            pos += len;
+            vocab.insert(piece.to_string(), id as u32);
+        }
+        return Ok(EmbedTokenizer::Gemma(Gemma::new(vocab)));
     }
     if arch.contains("gte_new_rope") || arch.contains("gte") && arch.contains("rope") {
         let blob = container

@@ -32,6 +32,7 @@ use std::collections::HashMap;
 pub const BYTE_PREFIX: &str = "<0x";
 
 /// The Gemma tokenizer.
+#[derive(Clone)]
 pub struct Gemma {
     vocab: HashMap<String, u32>,
     unk: u32,
